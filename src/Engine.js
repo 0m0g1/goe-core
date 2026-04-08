@@ -19,7 +19,7 @@ import { OSMLayerRenderer }  from './render/OSMLayerRenderer.js';
 import { VoxelRenderer }     from './render/VoxelRenderer.js';
 import {
   worldToScreen, screenToWorld, tileHalfWidth, tileHalfHeight,
-  getElevOffset, zoomToTilt,
+  getElevOffset, zoomToTilt, tileDepth,
 } from './math/projection.js';
 import {
   geoToTile, tileToGeo, lonToGlobalX, latToGlobalY,
@@ -99,6 +99,12 @@ export class Engine extends EventEmitter {
       features:    true,
       player:      true,
     };
+
+    this._tileCache       = [];
+    this._lastTileCamX    = null;
+    this._lastTileCamY    = null;
+    this._lastTileZoom    = null;
+    this._lastTileRot     = null;
   }
 
   // ── MOUNT ──────────────────────────────────────────────────────────────────
@@ -331,8 +337,6 @@ export class Engine extends EventEmitter {
 
     Promise.all(fetches).then(results => {
       for (const result of results) {
-        console.log('Loader result keys:', Object.keys(result));                          // ← ADD
-        console.log('terrainUpdates size:', result.terrainUpdates?.size);                 // ← ADD
         if (result.terrainUpdates) this.terrainCache.merge(result.terrainUpdates);
         if (result.buildingWays)   this._buildings = preprocessBuildings(result.buildingWays);
         if (result.features)       for (const f of result.features) this.addFeature(f);
@@ -349,48 +353,49 @@ export class Engine extends EventEmitter {
     if (!this._running) return;
     this._raf = requestAnimationFrame(ts2 => this._frame(ts2));
 
-    const dt  = Math.min((ts - this._lastT) / 1000, 0.05);
+    const dt = Math.min((ts - this._lastT) / 1000, 0.05);
     this._lastT = ts;
 
     const cam    = this.camera;
     const canvas = this._canvas;
     const ctx    = this._ctx;
-    const { x: pGX, y: pGY } = this._pGlobal();
+    const W      = canvas.width;
+    const H      = canvas.height;
 
-    // ── Physics ─────────────────────────────────────────────────────────────
+    // ── Physics ───────────────────────────────────────────────────────────────
     cam.updateTilt(dt);
     cam.updateRotation(dt, this.player.x, this.player.y, worldToScreen);
 
     if (this._input.isRotatingLeft())  cam.rotVel -= 2.2 * dt;
     if (this._input.isRotatingRight()) cam.rotVel += 2.2 * dt;
 
-    // ── Player movement ──────────────────────────────────────────────────────
-    const mv = this._input.getMovementVector();
+    // ── Player movement ───────────────────────────────────────────────────────
+    const mv    = this._input.getMovementVector();
     const pElev = this._playerElev();
 
     if (mv) {
-      this.player.isMoving  = true;
+      this.player.isMoving   = true;
       this.player.walkCycle += dt * 15;
       this.player.faceAngle  = Math.atan2(-mv.dy, mv.dx);
 
       const hw = tileHalfWidth(cam.zoom, cam.tileW);
       const hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
       const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
-      const rx = (mv.dx/hw + mv.dy/hh)*0.5, ry = (mv.dy/hh - mv.dx/hw)*0.5;
-      const wx = rx*cr - ry*sr, wy = rx*sr + ry*cr;
-      const spd = PLAYER_SPEED * dt * 60 / (Math.hypot(wx,wy) || 1);
+      const rx = (mv.dx / hw + mv.dy / hh) * 0.5;
+      const ry = (mv.dy / hh - mv.dx / hw) * 0.5;
+      const wx = rx * cr - ry * sr, wy = rx * sr + ry * cr;
+      const spd = PLAYER_SPEED * dt * 60 / (Math.hypot(wx, wy) || 1);
 
-      this.player.x = Math.max(0.5, Math.min(this._mapW-0.5, this.player.x + wx*spd));
-      this.player.y = Math.max(0.5, Math.min(this._mapH-0.5, this.player.y + wy*spd));
+      this.player.x = Math.max(0.5, Math.min(this._mapW - 0.5, this.player.x + wx * spd));
+      this.player.y = Math.max(0.5, Math.min(this._mapH - 0.5, this.player.y + wy * spd));
 
       if (cam.tilt > 0.08) {
-        // Use camX/Y = 0 as reference so px/py are world-origin-relative screen coords
         const { x: px, y: py } = worldToScreen(
           this.player.x, this.player.y, pElev,
-          { ...cam, camX: 0, camY: 0 }   // ← the fix
+          { ...cam, camX: 0, camY: 0 }
         );
-        cam.camX += (px - canvas.width  / 2 - cam.camX) * 0.08;
-        cam.camY += (py - canvas.height / 2 - cam.camY) * 0.08;
+        cam.camX += (px - W / 2 - cam.camX) * 0.08;
+        cam.camY += (py - H / 2 - cam.camY) * 0.08;
       }
 
       this.emit('player:move', {
@@ -402,94 +407,144 @@ export class Engine extends EventEmitter {
       this.player.walkCycle = 0;
     }
 
-    // ── World re-centre ──────────────────────────────────────────────────────
-    const distFromCtr = Math.hypot(this.player.x - this._mapW/2, this.player.y - this._mapH/2);
+    // ── World re-centre ───────────────────────────────────────────────────────
+    const distFromCtr = Math.hypot(
+      this.player.x - this._mapW / 2,
+      this.player.y - this._mapH / 2
+    );
     if (distFromCtr > REFETCH_DIST && !this._fetching) {
-      const newGeo = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+      const newGeo    = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
       const oldScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
-      this.geoCenter = newGeo;
-      this.player.x  = this._mapW / 2;
-      this.player.y  = this._mapH / 2;
+      this.geoCenter  = newGeo;
+      this.player.x   = this._mapW / 2;
+      this.player.y   = this._mapH / 2;
       const newScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
       cam.camX += newScreen.x - oldScreen.x;
       cam.camY += newScreen.y - oldScreen.y;
+      // Invalidate tile cache so it rebuilds at new centre
+      this._lastTileCamX = null;
       this._rebuildFeatures();
       this._doFetch(this.geoCenter);
       this.emit('center:changed', this.geoCenter);
     }
 
-    // ── Draw ─────────────────────────────────────────────────────────────────
-    ctx.fillStyle = '#04060a';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    // ── Compute pGlobal once — used by terrain, buildings, features ───────────
+    const { x: pGX, y: pGY } = this._pGlobal();
 
-    // Global slippy tiles (background)
+    // ── Draw: clear ───────────────────────────────────────────────────────────
+    ctx.fillStyle = '#04060a';
+    ctx.fillRect(0, 0, W, H);
+
+    // ── Draw: OSM slippy tiles (far zoom only) ────────────────────────────────
     if (this.debugLayers.osmTiles) {
-      // Only show slippy tiles when zoomed out far enough that voxels aren't visible
-      // At high zoom the voxel terrain fully covers the map anyway
-      const osmAlpha      = Math.max(0, Math.min(1, (0.035 - cam.zoom) / 0.02));
+      const osmAlpha = Math.max(0, Math.min(1, (0.035 - cam.zoom) / 0.02));
       if (osmAlpha > 0) {
         ctx.globalAlpha = osmAlpha;
         this._osmLayer.draw(canvas, this.geoCenter);
         ctx.globalAlpha = 1;
       }
-    } 
+    }
 
-    // Overpass terrain overlay (fades in on zoom)
-    // In Engine._frame(), replace the visible tiles loop:
-    const overpassAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02)  / 0.015));
+    // ── Draw: overpass terrain ────────────────────────────────────────────────
+    const overpassAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
     if (overpassAlpha > 0 && this.debugLayers.overpass) {
-      ctx.globalAlpha = overpassAlpha;
-      const lod = 1;
-      if (lod === 1) {
-        // original per‑tile drawing
-        const tiles = [];
-        const halfW = Math.ceil(this._mapW / 2);
-        const halfH = Math.ceil(this._mapH / 2);
-       for (let gy = pGY - halfH; gy < pGY + halfH; gy++) {
-          for (let gx = pGX - halfW; gx < pGX + halfW; gx++) {
-            const tx = gx - pGX + this._mapW / 2;
-            const ty = gy - pGY + this._mapH / 2;
-            tiles.push({ 
-              tx, ty, 
-              terrainId: this.terrainCache.get(gx, gy) ?? TerrainType.GRASS 
-            });
+
+      const hw  = tileHalfWidth(cam.zoom, cam.tileW);
+      const hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+      const lod = cam.zoom > 0.25 ? 1
+                : cam.zoom > 0.10 ? 2
+                : cam.zoom > 0.04 ? 4 : 8;
+
+      if (lod > 1) {
+        // ── LOD merged blocks — renderer handles its own culling ──────────────
+        ctx.globalAlpha = overpassAlpha;
+        this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overpassAlpha);
+        ctx.globalAlpha = 1;
+
+      } else {
+        // ── Full detail tiles — rebuild cache only when camera actually moves ─
+        const camMoved = (
+          Math.abs(cam.camX    - this._lastTileCamX)  > 1   ||
+          Math.abs(cam.camY    - this._lastTileCamY)  > 1   ||
+          Math.abs(cam.zoom    - this._lastTileZoom)  > 0.0005 ||
+          Math.abs(cam.rotation - this._lastTileRot)  > 0.005  ||
+          this._lastTileCamX === null
+        );
+
+        if (camMoved) {
+          this._lastTileCamX = cam.camX;
+          this._lastTileCamY = cam.camY;
+          this._lastTileZoom = cam.zoom;
+          this._lastTileRot  = cam.rotation;
+
+          // How many tiles fit on screen — never more than 80 in each direction
+          // hh can be near-zero in flat mode, guard against divide-by-zero
+          const rotScale = 1 + Math.abs(Math.sin(2 * cam.rotation)) * 0.5;  // 1.0 → 1.5
+          const tilesX   = Math.min(120, Math.ceil(W / Math.max(1, hw) * rotScale) + 4);
+          const tilesY   = Math.min(120, Math.ceil(H / Math.max(1, hh) * rotScale) + 4);
+
+          const viewCenter = screenToWorld(W / 2, H / 2, cam);
+          const cx = Math.round(Math.max(0, Math.min(this._mapW, viewCenter.x)));
+          const cy = Math.round(Math.max(0, Math.min(this._mapH, viewCenter.y)));
+
+          const minTX = Math.max(0,          cx - tilesX);
+          const maxTX = Math.min(this._mapW, cx + tilesX);
+          const minTY = Math.max(0,          cy - tilesY);
+          const maxTY = Math.min(this._mapH, cy + tilesY);
+
+          // Reuse the cached array — clear and refill in place
+          this._tileCache.length = 0;
+          for (let ty = minTY; ty < maxTY; ty++) {
+            for (let tx = minTX; tx < maxTX; tx++) {
+              const gx = tx - this._mapW / 2 + pGX;
+              const gy = ty - this._mapH / 2 + pGY;
+              this._tileCache.push({
+                tx, ty,
+                terrainId: this.terrainCache.get(gx, gy) ?? TerrainType.GRASS,
+              });
+            }
           }
         }
 
-        this._tileR.drawLayer(tiles, this.player.x, this.player.y);
-      } else {
-        this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overpassAlpha);
+        ctx.globalAlpha = overpassAlpha;
+        this._tileR.drawLayer(this._tileCache, this.player.x, this.player.y);
+        ctx.globalAlpha = 1;
       }
-      ctx.globalAlpha = 1;
     }
 
-    // Buildings
-    if (this.debugLayers.buildings) {
+    // ── Draw: buildings (ISO only, skip when flat) ────────────────────────────
+    if (this.debugLayers.buildings && cam.tilt > 0.05) {
       this._drawBuildings(pGX, pGY);
     }
 
-    // Parcels
+    // ── Draw: parcels ─────────────────────────────────────────────────────────
     for (const parcel of this._parcels) this._featR.drawParcel(parcel);
 
-    // Features (events, POIs)
-    if (this.debugLayers.player && this._showPlayer) {
+    // ── Draw: features / POIs ─────────────────────────────────────────────────
+    if (this.debugLayers.features) {
       this._featR.drawAll(this._features, this._selectedId, this.terrainCache, pGX, pGY);
     }
 
-    // Player
+    // ── Draw: player ──────────────────────────────────────────────────────────
     if (this._showPlayer) {
       this._playerR.draw(this.player.x, this.player.y, pElev, this.player, this._mPerTile);
     }
 
-    // HUD data
-    const geo = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+    // ── HUD ───────────────────────────────────────────────────────────────────
+    const geo = tileToGeo(
+      this.player.x, this.player.y,
+      this.geoCenter, this._mPerTile, this._mapW, this._mapH
+    );
     this.emit('hud', {
       lat:     geo.lat,
       lon:     geo.lon,
       zoom:    cam.zoom.toFixed(3),
       tilt:    cam.tilt,
       terrain: this.terrainRegistry.names[
-        this.terrainCache.getLocal(this.player.x, this.player.y, pGX, pGY, this._mapW, this._mapH)
+        this.terrainCache.getLocal(
+          this.player.x, this.player.y,
+          pGX, pGY, this._mapW, this._mapH
+        )
       ] ?? 'Unknown',
     });
   }
@@ -500,32 +555,51 @@ export class Engine extends EventEmitter {
     if (!this._buildings.length) return;
     const cam = this.camera;
 
+    // ── 1. Project all buildings and compute depth ─────────────────────────
+    const drawList = [];
     for (const b of this._buildings) {
-      // Get tile position relative to current geo center
-      const p = geoToTile(b.centroid.lat, b.centroid.lon,
-                          this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-
-      // Skip if outside visible chunk
+      const p = geoToTile(
+        b.centroid.lat, b.centroid.lon,
+        this.geoCenter, this._mPerTile, this._mapW, this._mapH
+      );
       if (p.x < 0 || p.x >= this._mapW || p.y < 0 || p.y >= this._mapH) continue;
-
-      // Only draw in iso mode — buildings are invisible when flat anyway
       if (cam.tilt < 0.05) continue;
 
-      const gx = Math.round(p.x) - this._mapW/2 + pGX;
-      const gy = Math.round(p.y) - this._mapH/2 + pGY;   // ← was Math.floor, causing off-by-one
+      // Use the back corner (furthest from camera) for more accurate sorting
+      // of buildings whose footprint spans multiple tiles
+      const VU       = 8;
+      const tileSize = this._mPerTile;
+      const halfSideM = Math.sqrt(Math.max(1, b.areaM2));
+      const r         = Math.max(VU, Math.min(VU * 20, (halfSideM / tileSize / 2) * VU));
+      const footprintTiles = r / VU;
+
+      // Back corner varies with rotation snap — approximate with centroid offset
+      const cr    = Math.cos(cam.rotation);
+      const sr    = Math.sin(cam.rotation);
+      const backX = p.x - footprintTiles * Math.abs(cr);
+      const backY = p.y - footprintTiles * Math.abs(sr);
+      const depth = tileDepth(backX, backY, cam.rotation);
+
+      const gx          = Math.round(p.x) - this._mapW / 2 + pGX;
+      const gy          = Math.round(p.y) - this._mapH / 2 + pGY;
       const terrainType = this.terrainCache.get(gx, gy) ?? TerrainType.GRASS;
-      const elev = getElevOffset(
+      const elev        = getElevOffset(
         this.terrainRegistry.heights[terrainType] ?? 1,
         cam.tilt, cam.zoom
       );
+      const engineH = Math.max(VU, Math.min(VU * 60, (b.heightM / tileSize) * VU));
+      const tc      = this.terrainRegistry.colors[TerrainType.BUILDING];
 
-      const VU = 8;
-      const engineH = Math.max(VU, (b.heightM / this._mPerTile) * VU);
-      const r = Math.max(VU * 0.5, (Math.sqrt(b.areaM2) / this._mPerTile / 2) * VU);
-      const tc = this.terrainRegistry.colors[TerrainType.BUILDING];
+      drawList.push({ p, elev, r, engineH, tc, depth });
+    }
 
-      this._voxelR.beginTile(p.x, p.y, elev);   // ← was Math.floor(p.x/y), use float
-      this._voxelR.box(-r, 0, -r, r*2, engineH, r*2, tc.top, tc.right, tc.left);
+    // ── 2. Sort back-to-front ──────────────────────────────────────────────
+    drawList.sort((a, b) => a.depth - b.depth);
+
+    // ── 3. Draw in correct order ───────────────────────────────────────────
+    for (const { p, elev, r, engineH, tc } of drawList) {
+      this._voxelR.beginTile(p.x, p.y, elev);
+      this._voxelR.box(-r, 0, -r, r * 2, engineH, r * 2, tc.top, tc.right, tc.left);
     }
   }
 

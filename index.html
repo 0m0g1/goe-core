@@ -469,9 +469,6 @@
         
         const cache = engine.terrainCache;
         const allKeys = cache._map ? [...cache._map.keys()] : [];
-        console.log('Total cache entries:', allKeys.length);
-        console.log('TerrainCache object:', cache);          // ← ADD THIS
-        console.log('TerrainCache keys:', Object.keys(cache)); // ← AND THIS
     });
 
     setInterval(() => {
