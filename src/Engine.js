@@ -224,11 +224,27 @@ export class Engine extends EventEmitter {
   }
 
   /** Pan to a geographic coordinate. */
+  // Engine.js — replace panTo()
   panTo(lat, lon) {
-    const p = geoToTile(lat, lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-    this.player.x = Math.max(0.5, Math.min(this._mapW-0.5, p.x));
-    this.player.y = Math.max(0.5, Math.min(this._mapH-0.5, p.y));
+    // 1. Shift the world anchor to the new location
+    this.geoCenter = { lat, lon };
+    
+    // 2. Reset player to map center (since world re-centred)
+    this.player.x = this._mapW / 2;
+    this.player.y = this._mapH / 2;
+    
+    // 3. Invalidate fetch cache so _doFetch actually runs
+    this._lastFetchPos = { lat: 0, lon: 0 };
+    this._fetching = false; // clear any stuck fetch state
+    
+    // 4. Re-project existing features against new center
+    this._rebuildFeatures();
+    
+    // 5. Centre camera
     this._centreCameraOnPlayer();
+    
+    // 6. Fire fetch for the new location
+    this._doFetch(this.geoCenter);
   }
 
   /** Fly + zoom to a geographic coordinate. */

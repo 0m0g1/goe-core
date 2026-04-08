@@ -7,8 +7,11 @@
  *   • Nextzen Terrarium:  (R×256 + G + B/256) − 32768
  *   • Mapbox Terrain-RGB: −10000 + (R×65536 + G×256 + B) × 0.1
  *   • AWS Terrarium (S3 elevation-tiles-prod) — same formula as Nextzen
+ *
+ * Persistent cache stores raw pixel data in IndexedDB to avoid re-downloading.
  */
 import { latLonToSlippy } from '../../math/geo.js';
+import { PersistentCache } from '../../core/PersistentCache.js';
 
 export const ElevationFormat = Object.freeze({
   TERRARIUM: 'terrarium',
@@ -17,32 +20,14 @@ export const ElevationFormat = Object.freeze({
 
 const TILE_ZOOM   = 13;   // ~10 m/px resolution
 const PRE_RADIUS  = 1;    // pre-warm N tiles in each direction
-const _tileCache  = new Map();
+
+// In‑memory promise cache (for concurrent requests)
+const _inFlight = new Map();
 
 // ─── DECODE ──────────────────────────────────────────────────────────────────
 
 export function decodeTerr(r, g, b) { return r*256 + g + b/256 - 32768; }
 export function decodeMapbox(r, g, b) { return -10000 + (r*65536 + g*256 + b)*0.1; }
-
-// ─── LOAD ─────────────────────────────────────────────────────────────────────
-
-function loadImageData(url) {
-  const key = url;
-  if (_tileCache.has(key)) return _tileCache.get(key);
-  const p = new Promise((resolve, reject) => {
-    const img = new Image(); img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      const c = document.createElement('canvas');
-      c.width = c.height = 256;
-      c.getContext('2d').drawImage(img, 0, 0, 256, 256);
-      resolve(c.getContext('2d').getImageData(0, 0, 256, 256));
-    };
-    img.onerror = reject;
-    img.src = url;
-  });
-  _tileCache.set(key, p);
-  return p;
-}
 
 // ─── LOADER CLASS ─────────────────────────────────────────────────────────────
 
@@ -56,9 +41,10 @@ export class ElevationLoader {
     this._urlFn    = urlFn;
     this._format   = format;
     this._mPerTile = mPerTile;
-    this._resolved = new Map(); // key → ImageData (resolved)
-    this._status   = 'idle';    // 'idle'|'loading'|'ready'|'error'
+    this._resolved = new Map(); // key → ImageData (in‑memory)
+    this._status   = 'idle';
     this._lastCenter = null;
+    this._persistCache = new PersistentCache('GOE_Elevation', 'tiles');
   }
 
   get status() { return this._status; }
@@ -66,6 +52,68 @@ export class ElevationLoader {
   /** Decode an RGB pixel to elevation metres. */
   _decode(r, g, b) {
     return this._format === ElevationFormat.MAPBOX ? decodeMapbox(r,g,b) : decodeTerr(r,g,b);
+  }
+
+  /**
+   * Load a single tile from network or cache.
+   * @param {string} url
+   * @param {string} key   e.g. "13/123/456"
+   * @returns {Promise<ImageData>}
+   */
+  async _loadTile(url, key) {
+    // 1. In‑memory cache (fast)
+    if (this._resolved.has(key)) return this._resolved.get(key);
+    // 2. Prevent duplicate concurrent requests
+    if (_inFlight.has(key)) return _inFlight.get(key);
+
+    const promise = (async () => {
+      // 3. Persistent cache (IndexedDB)
+      try {
+        const cached = await this._persistCache.get(key);
+        if (cached && cached.data && cached.width && cached.height) {
+          const imageData = new ImageData(
+            new Uint8ClampedArray(cached.data),
+            cached.width,
+            cached.height
+          );
+          this._resolved.set(key, imageData);
+          return imageData;
+        }
+      } catch (err) {
+        console.warn(`[ElevationLoader] Cache read failed for ${key}:`, err);
+      }
+
+      // 4. Fetch from network
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => {
+          const c = document.createElement('canvas');
+          c.width = c.height = 256;
+          const ctx = c.getContext('2d');
+          ctx.drawImage(img, 0, 0, 256, 256);
+          const imageData = ctx.getImageData(0, 0, 256, 256);
+          // Store in persistent cache (convert typed array to plain array)
+          const toStore = {
+            data: Array.from(imageData.data),
+            width: imageData.width,
+            height: imageData.height
+          };
+          this._persistCache.set(key, toStore).catch(err => {
+            console.warn(`[ElevationLoader] Failed to cache ${key}:`, err);
+          });
+          this._resolved.set(key, imageData);
+          resolve(imageData);
+        };
+        img.onerror = reject;
+        img.src = url;
+      });
+    })();
+
+    _inFlight.set(key, promise);
+    const result = await promise;
+    _inFlight.delete(key);
+    return result;
   }
 
   /**
@@ -91,9 +139,7 @@ export class ElevationLoader {
         if (this._resolved.has(key)) continue;
         const url = this._urlFn(TILE_ZOOM, x, y);
         fetches.push(
-          loadImageData(url)
-            .then(id => this._resolved.set(key, id))
-            .catch(() => {}) // missing tile → silent
+          this._loadTile(url, key).catch(() => {}) // missing tile → silent
         );
       }
     }
@@ -136,9 +182,11 @@ export class ElevationLoader {
     return this.toTileHeight(this.sampleElevation(lat, lon));
   }
 
-  clearCache() {
+  /** Clear both in‑memory and persistent caches. */
+  async clearCache() {
     this._resolved.clear();
-    _tileCache.clear();
+    _inFlight.clear(); // clear pending promise cache
+    await this._persistCache.clear();
     this._lastCenter = null;
     this._status = 'idle';
   }

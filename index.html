@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>GOE Core – Exploration Demo</title>
+    <title>GOE Core – Exploration Demo (Test Locations)</title>
     <style>
         * {
             margin: 0;
@@ -23,7 +23,6 @@
             height: 100%;
             image-rendering: crisp-edges;
         }
-        /* UI overlays – same style as ExplorationView */
         .ui-panel {
             position: absolute;
             pointer-events: none;
@@ -153,13 +152,64 @@
             white-space: nowrap;
             pointer-events: none;
         }
+        /* Test spot panel */
+        .test-panel {
+            position: absolute;
+            bottom: 120px;
+            left: 14px;
+            background: rgba(0,0,0,0.7);
+            border: 1px solid #504030;
+            border-radius: 4px;
+            padding: 8px;
+            pointer-events: auto;
+            font-family: monospace;
+            font-size: 10px;
+            z-index: 200;
+        }
+        .test-panel button {
+            background: #201e1c;
+            border: 1px solid #706050;
+            color: #e0d0b0;
+            margin: 2px;
+            padding: 4px 8px;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 10px;
+        }
+        .test-panel button:hover {
+            background: #403830;
+        }
+        .debug-panel {
+            position: absolute;
+            bottom: 120px;
+            right: 14px;
+            background: rgba(0,0,0,0.7);
+            border: 1px solid #504030;
+            border-radius: 4px;
+            padding: 8px;
+            pointer-events: auto;
+            font-family: monospace;
+            font-size: 9px;
+            color: #c0b898;
+            z-index: 200;
+        }
+        .debug-panel button {
+            background: #201e1c;
+            border: 1px solid #706050;
+            color: #e0d0b0;
+            margin-top: 4px;
+            padding: 2px 6px;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 9px;
+        }
     </style>
 </head>
 <body>
 
 <canvas id="game-canvas"></canvas>
 
-<!-- UI overlays (identical to ExplorationView) -->
+<!-- UI overlays -->
 <div class="ui-panel badge" id="mode-badge">◉ GLOBAL MAP</div>
 
 <div class="ui-panel hud">
@@ -194,15 +244,31 @@
     <div class="tilt-indicator"><div class="tilt-fill" id="tilt-fill"></div></div>
 </div>
 
+<!-- Test spots panel -->
+<div class="test-panel">
+    <div style="color:#e0d0b0; margin-bottom:4px;">📍 TEST SPOTS</div>
+    <button data-lat="40.7580" data-lon="-73.9855">🗽 NYC Times Sq</button>
+    <button data-lat="51.5074" data-lon="-0.1278">🇬🇧 London Trafalgar</button>
+    <button data-lat="48.8589" data-lon="2.2945">🗼 Paris Eiffel</button>
+    <button data-lat="35.6586" data-lon="139.7454">🇯🇵 Tokyo Shibuya</button>
+    <button data-lat="52.5200" data-lon="13.4050">🇩🇪 Berlin Alex</button>
+</div>
+
+<!-- Debug panel -->
+<div class="debug-panel" id="debug-panel">
+    <div>🐞 DEBUG</div>
+    <div id="debug-stats">Buildings: 0<br>POIs: 0<br>Cache: 0</div>
+    <button id="clear-cache-btn">🗑️ Clear Cache & Reload</button>
+</div>
+
 <div id="event-card" class="card" style="display: none;"></div>
 <div id="loading-toast" class="loading-toast" style="display: none;">⟳ Fetching local 3D terrain…</div>
 
 <script type="module">
-    // Import the GOE Core library (adjust path to your actual build)
     import { Engine, OSMTerrainLoader, ElevationLoader, ElevationFormat } from './src/GOECore.js';
 
     // --------------------------------------------------------------
-    // 1. Sample events (replace with your real data)
+    // Sample events (optional, you can add more)
     // --------------------------------------------------------------
     const sampleEvents = [
         { id: 'evt1', title: 'Battle of Hastings', category: 'war', latitude: 50.886, longitude: 0.488, year: 1066, description: 'Norman conquest of England.' },
@@ -210,7 +276,6 @@
         { id: 'evt3', title: 'Fall of Berlin Wall', category: 'politics', latitude: 52.516, longitude: 13.382, year: 1989, description: 'End of Cold War division.' }
     ];
 
-    // Colour mapping (same as ExplorationView)
     const categoryColors = {
         war: '#ef4444', battle: '#ef4444', conflict: '#ef4444',
         politics: '#f59e0b', government: '#f59e0b',
@@ -228,7 +293,6 @@
         return '#60a5fa';
     }
 
-    // Format features for Engine
     function buildFeatures(events, geoCenter) {
         return events.map(ev => ({
             id: ev.id,
@@ -241,10 +305,9 @@
     }
 
     // --------------------------------------------------------------
-    // 2. Setup Engine
+    // Setup Engine
     // --------------------------------------------------------------
     const canvas = document.getElementById('game-canvas');
-    // Initial centre (first event or fallback)
     const initialGeo = sampleEvents.length
         ? { lat: sampleEvents[0].latitude, lon: sampleEvents[0].longitude }
         : { lat: 51.505, lon: -0.09 };
@@ -252,25 +315,25 @@
     const engine = new Engine({
         geoCenter: initialGeo,
         showPlayer: true,
-        // OSM slippy tiles (background)
         tileURLFn: (z, x, y) => `https://a.tile.openstreetmap.org/${z}/${x}/${y}.png`,
-        // Optional: tweak camera behaviour
         cameraOpts: {
+            zoom: 0.35,          // Higher initial zoom to see details
             zoomFlat: 0.18,
             zoomIso: 0.58,
             zoomSpeed: 0.0014
         }
     });
 
-    // Add terrain loader (Overpass)
+    // Add terrain loader (enhanced version that fetches POIs)
     const terrainLoader = new OSMTerrainLoader({
         mPerTile: 2,
         mapW: 80,
-        mapH: 80
+        mapH: 80,
+        fetchRadiusM: 800 
     });
     engine.use(terrainLoader);
 
-    // Add elevation loader (public terrarium tiles)
+    // Add elevation loader
     const elevationLoader = new ElevationLoader(
         (z, x, y) => `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`,
         ElevationFormat.TERRARIUM,
@@ -285,7 +348,37 @@
     engine.mount(canvas);
 
     // --------------------------------------------------------------
-    // 3. UI updates using Engine events
+    // Helper: Jump to location and optionally clear cache
+    // --------------------------------------------------------------
+    async function jumpTo(lat, lon, clearCache = false) {
+    if (clearCache) {
+        await terrainLoader.clearCache();
+        alert('Cache cleared. Reloading page...');
+        location.reload();
+        return;
+    }
+    engine.camera.zoom = 0.5;  // set zoom BEFORE panTo so centering uses it
+    engine.panTo(lat, lon);
+    }
+
+    // Attach test spot buttons
+    document.querySelectorAll('.test-panel button').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const lat = parseFloat(btn.dataset.lat);
+            const lon = parseFloat(btn.dataset.lon);
+            jumpTo(lat, lon, false);
+        });
+    });
+
+    // Clear cache button
+    document.getElementById('clear-cache-btn').addEventListener('click', async () => {
+        await terrainLoader.clearCache();
+        alert('Cache cleared. Reloading page...');
+        location.reload();
+    });
+
+    // --------------------------------------------------------------
+    // UI updates
     // --------------------------------------------------------------
     const modeBadge = document.getElementById('mode-badge');
     const hudCoords = document.getElementById('hud-coords');
@@ -296,10 +389,17 @@
     const tiltFill = document.getElementById('tilt-fill');
     const eventCard = document.getElementById('event-card');
     const loadingToast = document.getElementById('loading-toast');
+    const debugStats = document.getElementById('debug-stats');
 
     let currentCardTimeout = null;
 
-    // Helper: count nearby events (within 10 tiles)
+    function updateDebugStats() {
+        const buildings = engine._buildings?.length || 0;
+        const pois = engine._features?.length || 0;
+        const cacheSize = engine.terrainCache?._map?.size ?? 0;
+        debugStats.innerHTML = `Buildings: ${buildings}<br>POIs: ${pois}<br>Cache: ${cacheSize}`;
+    }
+
     function updateNearbyCount() {
         if (!engine.player) return;
         const px = engine.player.x, py = engine.player.y;
@@ -316,16 +416,15 @@
         hudCoords.innerText = `${lat.toFixed(5)}° N &nbsp; ${lon.toFixed(5)}° E`;
         hudZoom.innerText = `zoom: ${zoom}× &nbsp; tilt: ${(tilt * 100).toFixed(0)}%`;
         hudTerrain.innerText = terrain;
-        // Update badge style based on tilt
         if (tilt < 0.05) modeBadge.style.color = '#3a70a8';
         else if (tilt > 0.95) modeBadge.style.color = '#e8db9b';
         else modeBadge.style.color = '#a07830';
         tiltFill.style.height = `${tilt * 100}%`;
         updateNearbyCount();
+        updateDebugStats();
     });
 
     engine.on('feature:click', ({ id, data, feature }) => {
-        // Show card
         const ev = data;
         const color = eventColor(ev);
         eventCard.style.display = 'block';
@@ -349,15 +448,12 @@
     });
 
     engine.on('map:click', () => {
-        // Hide card when clicking empty space
         eventCard.style.display = 'none';
         if (currentCardTimeout) clearTimeout(currentCardTimeout);
     });
 
     engine.on('map:rightclick', ({ lat, lon }) => {
-        // Example: you can open a form to add an event here
-        console.log(`Right-click at ${lat}, ${lon} – ready to add event`);
-        // In a real app you'd show a modal with lat/lon pre-filled
+        console.log(`Right-click at ${lat}, ${lon}`);
         alert(`Add event at ${lat.toFixed(5)}, ${lon.toFixed(5)}`);
     });
 
@@ -367,10 +463,9 @@
     });
     engine.on('fetch:done', () => {
         loadingToast.style.display = 'none';
-        // Terrain name will update via 'hud' event after fetch
+        updateDebugStats();
     });
 
-    // Elevation loader status (polling or event – simple interval)
     setInterval(() => {
         if (elevationLoader.status === 'ready') {
             hudElevation.innerText = '▲ elevation ready';
@@ -384,12 +479,9 @@
         }
     }, 500);
 
-    // Update nearby events when player moves
     engine.on('player:move', () => updateNearbyCount());
 
-    // --------------------------------------------------------------
-    // 4. Connect UI buttons to Engine API
-    // --------------------------------------------------------------
+    // UI buttons
     document.getElementById('zoom-in').addEventListener('click', () => {
         engine.camera.zoomIn(canvas.width / 2, canvas.height / 2);
     });
@@ -403,7 +495,7 @@
         engine.camera.rotateRight();
     });
 
-    // Optional: initial centre camera on player
+    // Initial centre
     setTimeout(() => {
         engine._centreCameraOnPlayer();
     }, 100);
