@@ -17,6 +17,7 @@ import { FeatureRenderer }   from './render/FeatureRenderer.js';
 import { PlayerRenderer }    from './render/PlayerRenderer.js';
 import { OSMLayerRenderer }  from './render/OSMLayerRenderer.js';
 import { VoxelRenderer }     from './render/VoxelRenderer.js';
+import { ShadowSystem } from './render/ShadowSystem.js';
 import {
   worldToScreen, screenToWorld, tileHalfWidth, tileHalfHeight,
   getElevOffset, zoomToTilt, tileDepth,
@@ -83,6 +84,13 @@ export class Engine extends EventEmitter {
     this._buildings      = [];   // preprocessed building features
     this._selectedId     = null;
     this._loaders        = [];
+    this._shadowOpts = {
+      sunAngle:     opts.sunAngle     ?? Math.PI * 1.25,
+      sunElevation: opts.sunElevation ?? Math.PI / 5,
+      shadowAlpha:  opts.shadowAlpha  ?? 0.22,
+      aoStrength:   opts.aoStrength   ?? 0.28,
+      enabled:      opts.shadows      ?? true,
+    };
 
     // Slippy tile URL
     this._tileURLFn = opts.tileURLFn ??
@@ -128,6 +136,7 @@ export class Engine extends EventEmitter {
     this._featR    = new FeatureRenderer(this._ctx, cam, this.terrainRegistry, this._voxelR);
     this._playerR  = new PlayerRenderer(this._ctx, cam);
     this._osmLayer = new OSMLayerRenderer(this._ctx, cam, this._tileURLFn);
+     this._shadows = new ShadowSystem(this._ctx, this.camera, this._shadowOpts);
 
     const resize = () => {
       canvas.width  = canvas.offsetWidth  || window.innerWidth;
@@ -327,7 +336,10 @@ export class Engine extends EventEmitter {
 
     Promise.all(fetches).then(results => {
       for (const result of results) {
-        if (result.terrainUpdates) this.terrainCache.merge(result.terrainUpdates);
+        if (result.terrainUpdates) {
+          // New: BlockTerrainCache instance
+          this.terrainCache.merge(result.terrainUpdates);
+        }
         if (result.buildingWays)   this._buildings = preprocessBuildings(result.buildingWays);
         if (result.features)       for (const f of result.features) this.addFeature(f);
       }
@@ -414,8 +426,18 @@ export class Engine extends EventEmitter {
       const newScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
       cam.camX += newScreen.x - oldScreen.x;
       cam.camY += newScreen.y - oldScreen.y;
-      // Invalidate tile cache so it rebuilds at new centre
+
+      // Invalidate ALL tile cache sentinels — not just camX
       this._lastTileCamX = null;
+      this._lastTileCamY = null;   // ← add
+      this._lastTileZoom = null;   // ← add
+      this._lastTileRot  = null;   // ← add
+      this._tileCache.length = 0;  // ← force immediate rebuild next frame
+
+      // Also invalidate building draw list since geoCenter changed
+      this._lastBuildingRot = null;  // ← add
+      this._cachedDrawList  = [];    // ← add
+
       this._rebuildFeatures();
       this._doFetch(this.geoCenter);
       this.emit('center:changed', this.geoCenter);
@@ -427,23 +449,9 @@ export class Engine extends EventEmitter {
     // ── Draw: clear ───────────────────────────────────────────────────────────
     ctx.fillStyle = '#04060a';
     ctx.fillRect(0, 0, W, H);
-    // TEMP DEBUG — paste after ctx.fillRect(0,0,W,H)
-console.log({
-  camX: this.camera.camX,
-  camY: this.camera.camY,
-  zoom: this.camera.zoom,
-  tilt: this.camera.tilt,
-  rotation: this.camera.rotation,
-  _cr: this.camera._cr,
-  _sr: this.camera._sr,
-  playerX: this.player.x,
-  playerY: this.player.y,
-  tileCount: this._tileCache.length,
-  buildingCount: this._buildings.length,
-  featureCount: this._features.length,
-});
 
     this._voxelR.beginFrame();
+    this._shadows.beginFrame();
 
     // ── Draw: OSM slippy tiles (far zoom only) ────────────────────────────────
     if (this.debugLayers.osmTiles) {
@@ -612,6 +620,10 @@ console.log({
       this._cachedDrawList.sort((a, b) => a.depth - b.depth);
     }
 
+    if (this._shadows.enabled) {
+      this._shadows.drawBuildingShadows(this._cachedDrawList);
+    }
+
     for (const { p, elev, r, engineH, tc } of this._cachedDrawList) {
       this._voxelR.beginTile(p.x, p.y, elev);
       this._voxelR.box(-r, 0, -r, r * 2, engineH, r * 2, tc.top, tc.right, tc.left);
@@ -660,4 +672,21 @@ console.log({
       this.debugLayers[name] = value ?? !this.debugLayers[name];
     }
   }
+
+  /** Toggle shadow + AO rendering. */
+  toggleShadows(value) {
+    if (this._shadows) this._shadows.enabled = value ?? !this._shadows.enabled;
+  }
+ 
+  /**
+   * Change sun direction at runtime.
+   * @param {number} angle      Compass radians (0 = +X right, PI/2 = +Y down)
+   * @param {number} [elevation] 0 = horizon, PI/2 = zenith
+   */
+  setSunAngle(angle, elevation) {
+    if (!this._shadows) return;
+    this._shadows.sunAngle     = angle;
+    if (elevation != null) this._shadows.sunElevation = elevation;
+  }
+ 
 }

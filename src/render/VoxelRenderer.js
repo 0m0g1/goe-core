@@ -1,94 +1,82 @@
 /**
  * GOE Core — VoxelRenderer
- * Draws isometric voxel boxes (the building block of all 3D objects).
- * Ported from the Garden of Eden engine.
- *
- * Usage:
- *   const vr = new VoxelRenderer(ctx, cam);
- *   vr.beginTile(tx, ty, baseElevPx);
- *   vr.box(x, y, z, w, h, d, topColor, rightColor, frontColor);
- *   vr.proj(vx, vy, vz) → {x, y} screen point inside current tile
  */
-import { tileHalfWidth, tileHalfHeight } from '../math/projection.js';
+import { tileHalfWidth, tileHalfHeight, shadeHex } from '../math/projection.js';
 
-export const VOXEL_UNITS = 8; // sub-tile resolution
+export const VOXEL_UNITS = 8; 
 
 export class VoxelRenderer {
-  constructor(ctx, cam) {
+  constructor(ctx, cam, shadowSystem = null) {
     this.ctx   = ctx;
     this.cam   = cam;
-    // Per-tile state (set in beginTile)
+    this._shadows = shadowSystem;
     this._tx   = 0;
     this._ty   = 0;
-    this._base = 0; // base elevation in pixels
+    this._base = 0; 
   }
 
-  /** Call before drawing voxels on a specific tile. */
   beginTile(tx, ty, baseElevPx) {
     this._tx   = tx;
     this._ty   = ty;
     this._base = baseElevPx;
   }
 
-    // Add this method:
+  /** Cache common projection constants once per frame for performance. */
   beginFrame() {
     const cam = this.cam;
-    this._hw   = tileHalfWidth(cam.zoom, cam.tileW);
-    this._hh   = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-    this._cr   = cam._cr;
-    this._sr   = cam._sr;
-    this._vu   = (this._hh * 2) / VOXEL_UNITS;
-    this._mw2  = cam.mapW / 2;
-    this._mh2  = cam.mapH / 2;
+    this._hw  = tileHalfWidth(cam.zoom, cam.tileW);
+    this._hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+    this._cr  = Math.cos(cam.rotation);
+    this._sr  = Math.sin(cam.rotation);
+    this._vu  = (this._hh * 2) / VOXEL_UNITS;
+    this._mw2 = cam.mapW / 2;
+    this._mh2 = cam.mapH / 2;
   }
 
-  /** Project a voxel-space point to screen coords. */
   proj(vx, vy, vz) {
     const cam = this.cam;
-    const hw  = tileHalfWidth(cam.zoom, cam.tileW);
-    const hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-    const cr  = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
     const tx  = this._tx + 0.5 + vx / VOXEL_UNITS;
     const tz  = this._ty + 0.5 + vz / VOXEL_UNITS;
-    const xw  = tx - cam.mapW / 2, zw = tz - cam.mapH / 2;
-    const xr  = xw * cr + zw * sr, zr = -xw * sr + zw * cr;
-    const vu  = (hh * 2) / VOXEL_UNITS;
+    const xw  = tx - this._mw2, zw = tz - this._mh2;
+    const xr  = xw * this._cr + zw * this._sr;
+    const zr  = -xw * this._sr + zw * this._cr;
     return {
-      x: (xr - zr) * hw - cam.camX,
-      y: (xr + zr) * hh - (this._base + vy * vu) - cam.camY,
+      x: (xr - zr) * this._hw - cam.camX,
+      y: (xr + zr) * this._hh - (this._base + vy * this._vu) - cam.camY,
     };
   }
 
-  /**
-   * Draw a single axis-aligned voxel box.
-   * @param {number} x,y,z   Origin in voxel units
-   * @param {number} w,h,d   Size in voxel units
-   * @param {string} top     Hex colour for top face
-   * @param {string} right   Hex colour for right face
-   * @param {string} front   Hex colour for front face
-   */
   box(x, y, z, w, h, d, top, right, front) {
     const vp   = (px, py, pz) => this.proj(px, py, pz);
     const cam  = this.cam;
+    const shadows = this._shadows;
+
+    // Apply lighting factors based on sun orientation
+    let cTop = top, cRight = right, cFront = front;
+    if (shadows?.enabled) {
+        cTop   = shadeHex(top, shadows.sunElevation / (Math.PI/2));
+        cRight = shadeHex(right, shadows.getLightFactor(0));         // Normal facing +X
+        cFront = shadeHex(front, shadows.getLightFactor(Math.PI/2)); // Normal facing +Y
+    }
+
     const snap = ((Math.round(cam.rotation / (Math.PI / 2)) % 4) + 4) % 4;
     let fA, fB, cA, cB;
 
     if (snap === 0) {
-      fA = [vp(x+w,y,z),vp(x+w,y+h,z),vp(x+w,y+h,z+d),vp(x+w,y,z+d)]; cA = right;
-      fB = [vp(x,y,z+d),vp(x+w,y,z+d),vp(x+w,y+h,z+d),vp(x,y+h,z+d)]; cB = front;
+      fA = [vp(x+w,y,z),vp(x+w,y+h,z),vp(x+w,y+h,z+d),vp(x+w,y,z+d)]; cA = cRight;
+      fB = [vp(x,y,z+d),vp(x+w,y,z+d),vp(x+w,y+h,z+d),vp(x,y+h,z+d)]; cB = cFront;
     } else if (snap === 1) {
-      fA = [vp(x,y,z+d),vp(x+w,y,z+d),vp(x+w,y+h,z+d),vp(x,y+h,z+d)]; cA = right;
-      fB = [vp(x,y,z),vp(x,y+h,z),vp(x,y+h,z+d),vp(x,y,z+d)]; cB = front;
+      fA = [vp(x,y,z+d),vp(x+w,y,z+d),vp(x+w,y+h,z+d),vp(x,y+h,z+d)]; cA = cRight;
+      fB = [vp(x,y,z),vp(x,y+h,z),vp(x,y+h,z+d),vp(x,y,z+d)]; cB = cFront;
     } else if (snap === 2) {
-      fA = [vp(x,y,z),vp(x,y+h,z),vp(x,y+h,z+d),vp(x,y,z+d)]; cA = right;
-      fB = [vp(x,y,z),vp(x+w,y,z),vp(x+w,y+h,z),vp(x,y+h,z)]; cB = front;
+      fA = [vp(x,y,z),vp(x,y+h,z),vp(x,y+h,z+d),vp(x,y,z+d)]; cA = cRight;
+      fB = [vp(x,y,z),vp(x+w,y,z),vp(x+w,y+h,z),vp(x,y+h,z)]; cB = cFront;
     } else {
-      fA = [vp(x,y,z),vp(x+w,y,z),vp(x+w,y+h,z),vp(x,y+h,z)]; cA = right;
-      fB = [vp(x+w,y,z),vp(x+w,y+h,z),vp(x+w,y+h,z+d),vp(x+w,y,z+d)]; cB = front;
+      fA = [vp(x,y,z),vp(x+w,y,z),vp(x+w,y+h,z),vp(x,y+h,z)]; cA = cRight;
+      fB = [vp(x+w,y,z),vp(x+w,y+h,z),vp(x+w,y+h,z+d),vp(x+w,y,z+d)]; cB = cFront;
     }
 
-    const topPts = [vp(x,y+h,z), vp(x+w,y+h,z), vp(x+w,y+h,z+d), vp(x,y+h,z+d)];
-    this._poly(topPts, top);
+    this._poly([vp(x,y+h,z), vp(x+w,y+h,z), vp(x+w,y+h,z+d), vp(x,y+h,z+d)], cTop);
     this._poly(fA, cA);
     this._poly(fB, cB);
   }
