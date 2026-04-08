@@ -46,6 +46,23 @@ export class VoxelRenderer {
     };
   }
 
+  // src/render/VoxelRenderer.js Update
+  _poly(pts, color, detailed = false) {
+    const ctx = this.ctx;
+    ctx.beginPath();
+    pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+
+    // Add subtle edge highlighting
+    if (detailed && this.cam.zoom > 0.4) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.15)'; // Highlight top edges
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+
   box(x, y, z, w, h, d, top, right, front) {
     const vp   = (px, py, pz) => this.proj(px, py, pz);
     const cam  = this.cam;

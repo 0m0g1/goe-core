@@ -11,7 +11,7 @@ const DEFAULT_ENDPOINTS = [
 
 function classifyOSM(tags) {
   if (!tags) return null;
-  const { highway:h, waterway:w, natural:n, landuse:l, leisure:le, building:b } = tags;
+  const { highway:h, surface:s, waterway:w, natural:n, landuse:l, leisure:le, building:b } = tags;
   if (n==='water'||n==='wetland'||l==='reservoir'||l==='basin'||w==='riverbank')
     return { terrain: TerrainType.DEEP_WATER, type:'polygon' };
   if (w==='river')
@@ -30,16 +30,36 @@ function classifyOSM(tags) {
       ['grassland','heath','scrub'].includes(n) ||
       ['pitch','playground'].includes(le))
     return { terrain: TerrainType.GRASS, type:'polygon' };
-  if (h==='motorway'||h==='trunk'||h==='primary')
-    return { terrain: TerrainType.ROAD, type:'line', width:3 };
-  if (h==='secondary'||h==='tertiary')
-    return { terrain: TerrainType.ROAD, type:'line', width:2 };
-  if (h==='residential'||h==='unclassified'||h==='service')
-    return { terrain: TerrainType.ROAD, type:'line', width:1 };
-  if (h==='footway'||h==='path'||h==='cycleway'||h==='pedestrian')
-    return { terrain: TerrainType.PATH, type:'line', width:1 };
-  if (h)
-    return { terrain: TerrainType.ROAD, type:'line', width:1 };
+  if (h) {
+    // 1. Identify Material
+    const pavedSurfaces = ['asphalt', 'paved', 'concrete', 'chipseal', 'paving_stones'];
+    const unpavedSurfaces = ['dirt', 'earth', 'ground', 'unpaved', 'mud', 'gravel', 'sand'];
+
+    let roadTerrain = TerrainType.ROAD_TARMAC; // Default
+    
+    // Check explicit surface tag
+    if (unpavedSurfaces.includes(s)) {
+      roadTerrain = TerrainType.ROAD_DIRT;
+    } else if (pavedSurfaces.includes(s)) {
+      roadTerrain = TerrainType.ROAD_TARMAC;
+    } else {
+      // Fallback: Guess based on highway importance if surface is missing
+      if (['track', 'path', 'bridleway'].includes(h)) roadTerrain = TerrainType.ROAD_DIRT;
+    }
+
+    // 2. Determine Width/Importance
+    if (h==='motorway'||h==='trunk'||h==='primary')
+      return { terrain: roadTerrain, type:'line', width:3 };
+    
+    if (h==='secondary'||h==='tertiary')
+      return { terrain: roadTerrain, type:'line', width:2 };
+
+    if (h==='footway'||h==='path'||h==='cycleway'||h==='pedestrian')
+      return { terrain: TerrainType.PATH, type:'line', width:1 };
+
+    // Residential, Service, Tracks, and generic fallbacks
+    return { terrain: roadTerrain, type:'line', width:1 };
+  }
   if (b)
     return { terrain: TerrainType.BUILDING, type:'polygon' };
   if (['residential','commercial','retail','industrial'].includes(l))
@@ -95,6 +115,17 @@ const POI_COLORS = {
 
 function classifyPOI(tags) {
   if (!tags) return null;
+
+  if (tags.natural === 'tree') {
+    return { 
+      color: '#2a8a2a', 
+      label: 'Tree', 
+      category: 'natural', 
+      value: 'tree',
+      renderMode: 'tree' // This tells FeatureRenderer to use TreeRenderer
+    };
+  }
+  
   const cats = ['amenity','shop','tourism','historic','leisure','office','natural'];
   for (const cat of cats) {
     const val = tags[cat];
@@ -124,7 +155,7 @@ function rasterizePolygon(cache, pts, terrain) {
     xs.sort((a, b) => a - b);
     for (let i = 0; i < xs.length - 1; i += 2)
       for (let x = Math.ceil(xs[i]); x <= Math.floor(xs[i + 1]); x++)
-        cache.set(`${x},${y}`, terrain);
+        cache.set((x << 16) | (y & 0xFFFF), terrain);
   }
 }
 
@@ -200,12 +231,13 @@ export class OSMTerrainLoader extends BaseLoader {
 
     // Split into two queries: terrain/buildings first, then POIs
     // Using a union query — all in one request to avoid rate limits
+    // Using a union query — all in one request to avoid rate limits
     const q = `[out:json][timeout:60];(
       way["natural"~"^(water|wetland|beach|wood|grassland|heath|scrub)$"]${around};
       way["landuse"~"^(reservoir|basin|grass|meadow|village_green|allotments|forest|park|commercial|residential|retail|industrial)$"]${around};
       way["leisure"~"^(park|garden|pitch|playground)$"]${around};
       way["waterway"~"^(river|stream|canal|drain|ditch|riverbank)$"]${around};
-      way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|pedestrian|footway|cycleway|path)$"]${around};
+      way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|pedestrian|footway|cycleway|path|track)$"]${around};
       way["building"]${around};
       node["amenity"]${around};
       node["shop"]${around};
@@ -214,6 +246,7 @@ export class OSMTerrainLoader extends BaseLoader {
       node["leisure"]${around};
       node["office"]${around};
       node["natural"~"^(peak|spring|cave_entrance)$"]${around};
+      node["natural"="tree"]${around};
     );out geom qt;`;
 
     // ── Try each endpoint ──────────────────────────────────────────────────

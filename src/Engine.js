@@ -13,7 +13,8 @@ import { InputManager }      from './core/InputManager.js';
 import { TerrainCache }      from './terrain/TerrainCache.js';
 import { createTerrainRegistry, TerrainType } from './terrain/types.js';
 import { TileRenderer }      from './render/TileRenderer.js';
-import { FeatureRenderer }   from './render/FeatureRenderer.js';
+import { FeatureRenderer, decorateBuildingFacade } from './render/FeatureRenderer.js';
+import { resolveFeatureType } from './terrain/FeatureTypes.js';
 import { PlayerRenderer }    from './render/PlayerRenderer.js';
 import { OSMLayerRenderer }  from './render/OSMLayerRenderer.js';
 import { VoxelRenderer }     from './render/VoxelRenderer.js';
@@ -30,7 +31,7 @@ import { preprocessBuildings } from './loaders/geo/BuildingPreprocessor.js';
 const MAP_W        = 80;
 const MAP_H        = 80;
 const REFETCH_DIST = 18;   // tiles from centre before re-fetch
-const PLAYER_SPEED = 0.11;
+const PLAYER_SPEED = 0.22;
 const M_PER_TILE   = 2;
 
 export class Engine extends EventEmitter {
@@ -269,13 +270,19 @@ export class Engine extends EventEmitter {
     const pos = (Number.isFinite(lat) && Number.isFinite(lon))
       ? geoToTile(lat, lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH)
       : { x: -999, y: -999 };
+  
+    // Resolve feature type from OSM tags for colour and render mode
+    const tags  = raw.tags ?? (raw.data?.tags ?? {});
+
+    const ftype = resolveFeatureType(raw?.title ?? (raw?.label ?? ""), tags, raw.color ?? raw.colour ?? null);
+  
     return {
       id:    raw.id ?? String(Math.random()),
       tx:    pos.x,
       ty:    pos.y,
-      color: raw.color ?? raw.colour ?? '#60a5fa',
-      label: raw.label ?? raw.title ?? raw.name ?? '',
-      data:  raw,
+      color: raw.color ?? raw.colour ?? ftype.color,
+      label: raw.label ?? raw.title ?? raw.name ?? tags.name ?? ftype.label ?? '',
+      data:  { ...raw, tags },   // keep full OSM data for type resolution at draw time
     };
   }
 
@@ -341,7 +348,7 @@ export class Engine extends EventEmitter {
           this.terrainCache.merge(result.terrainUpdates);
         }
         if (result.buildingWays)   this._buildings = preprocessBuildings(result.buildingWays);
-        if (result.features)       for (const f of result.features) this.addFeature(f);
+        if (result.features)       for (const f of result.features) {this.addFeature(f)};
       }
       this._elevation?.prefetch?.(center);
       this._fetching = false;
@@ -362,7 +369,8 @@ export class Engine extends EventEmitter {
       for (const b of this._cachedDrawList) {
         // b.r is in Voxel Units (8 per tile). 
         // We add a small player-radius buffer (0.2 tiles)
-        const hitRadius = (b.r / 8) + 0.2; 
+        const halfSideTiles = b.r / 8;           // b.r is in voxel units, 8 VU = 1 tile
+        const hitRadius = halfSideTiles * 1.42 + 0.15;
         const dx = tx - b.p.x;
         const dy = ty - b.p.y;
         
@@ -396,181 +404,257 @@ export class Engine extends EventEmitter {
     }
 
   _frame(ts) {
-    if (!this._running) return;
-    this._raf = requestAnimationFrame(ts2 => this._frame(ts2));
+      if (!this._running) return;
+      this._raf = requestAnimationFrame(ts2 => this._frame(ts2));
 
-    const dt = Math.min((ts - this._lastT) / 1000, 0.05);
-    this._lastT = ts;
+      const dt = Math.min((ts - this._lastT) / 1000, 0.05);
+      this._lastT = ts;
 
-    const cam    = this.camera;
-    const canvas = this._canvas;
-    const ctx    = this._ctx;
-    const W      = canvas.width;
-    const H      = canvas.height;
+      const cam    = this.camera;
+      const canvas = this._canvas;
+      const ctx    = this._ctx;
+      const W      = canvas.width;
+      const H      = canvas.height;
 
-    // ── 1. Update Camera Physics ──────────────────────────────────────────────
-    cam.updateTilt(dt);
-    cam.updateRotation(dt, this.player.x, this.player.y, worldToScreen);
+      // ── 1. Update Camera Physics ──────────────────────────────────────────────
+      cam.updateTilt(dt);
+      cam.updateRotation(dt, this.player.x, this.player.y, worldToScreen);
 
-    if (this._input.isRotatingLeft())  cam.rotVel -= 2.2 * dt;
-    if (this._input.isRotatingRight()) cam.rotVel += 2.2 * dt;
+      if (this._input.isRotatingLeft())  cam.rotVel -= 2.2 * dt;
+      if (this._input.isRotatingRight()) cam.rotVel += 2.2 * dt;
 
-    const { x: pGX, y: pGY } = this._pGlobal();
+      const { x: pGX, y: pGY } = this._pGlobal();
 
-    // ── 2. PREPARE BUILDING DATA (Critical for Collisions) ────────────────────
-    // We must project buildings to find their tile-positions BEFORE moving the player
-    if (this._buildings.length > 0) {
-      const rotChanged = this._lastBuildingRot === null || Math.abs(cam.rotation - this._lastBuildingRot) > 0.02;
-      const countChanged = this._cachedDrawList.length !== this._buildings.length;
+      // ── 2. Nature AI & Interaction ────────────────────────────────────────────
+      const DETECTION_RANGE = 8;
+      const FLEE_SPEED = 0.05;
 
-      if (rotChanged || countChanged) {
-        this._lastBuildingRot = cam.rotation;
-        this._cachedDrawList = [];
+      this._features.forEach(f => {
+        if (f.data?.category === 'nature') {
+          const dx = f.tx - this.player.x;
+          const dy = f.ty - this.player.y;
+          const distSq = dx * dx + dy * dy;
+          const dist = Math.sqrt(distSq);
 
-        for (const b of this._buildings) {
-          const p = geoToTile(b.centroid.lat, b.centroid.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-          if (p.x < 0 || p.x >= this._mapW || p.y < 0 || p.y >= this._mapH) continue;
-
-          const VU = 8;
-          const halfSideM = Math.sqrt(Math.max(1, b.areaM2));
-          const r = Math.max(VU, Math.min(VU * 20, (halfSideM / this._mPerTile / 2) * VU));
-          
-          const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
-          const backX = p.x - (r / VU) * Math.abs(cr);
-          const backY = p.y - (r / VU) * Math.abs(sr);
-          
-          this._cachedDrawList.push({
-            p, r,
-            engineH: Math.max(VU, Math.min(VU * 60, (b.heightM / this._mPerTile) * VU)),
-            tc: this.terrainRegistry.colors[TerrainType.BUILDING],
-            depth: tileDepth(backX, backY, cam.rotation),
-            elev: getElevOffset(1, cam.tilt, cam.zoom) // Ground-level elevation
-          });
-        }
-        this._cachedDrawList.sort((a, b) => a.depth - b.depth);
-      }
-    }
-
-    // ── 3. Movement & Collision Check ─────────────────────────────────────────
-    const mv = this._input.getMovementVector();
-    const pElev = this._playerElev();
-
-    if (mv) {
-      this.player.isMoving = true;
-      this.player.faceAngle = Math.atan2(-mv.dy, mv.dx);
-
-      const hw = tileHalfWidth(cam.zoom, cam.tileW), hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-      const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
-      const rx = (mv.dx / hw + mv.dy / hh) * 0.5, ry = (mv.dy / hh - mv.dx / hw) * 0.5;
-      const wx = rx * cr - ry * sr, wy = rx * sr + ry * cr;
-
-      const terrainState = this._getMovementState(this.player.x, this.player.y, pGX, pGY);
-      const spd = (PLAYER_SPEED * terrainState.speedMult) * dt * 60 / (Math.hypot(wx, wy) || 1);
-      this.player.walkCycle += dt * 15 * terrainState.speedMult;
-
-      const nextX = this.player.x + wx * spd;
-      const nextY = this.player.y + wy * spd;
-
-      // Wall Sliding
-      if (!this._getMovementState(nextX, nextY, pGX, pGY).isBlocked) {
-        this.player.x = nextX;
-        this.player.y = nextY;
-      } else if (!this._getMovementState(nextX, this.player.y, pGX, pGY).isBlocked) {
-        this.player.x = nextX;
-      } else if (!this._getMovementState(this.player.x, nextY, pGX, pGY).isBlocked) {
-        this.player.y = nextY;
-      }
-
-      this.player.x = Math.max(0.5, Math.min(this._mapW - 0.5, this.player.x));
-      this.player.y = Math.max(0.5, Math.min(this._mapH - 0.5, this.player.y));
-
-      // Camera Follow
-      if (cam.tilt > 0.08) {
-        const { x: px, y: py } = worldToScreen(this.player.x, this.player.y, pElev, { ...cam, camX: 0, camY: 0 });
-        cam.camX += (px - W / 2 - cam.camX) * 0.08;
-        cam.camY += (py - H / 2 - cam.camY) * 0.08;
-      }
-
-      this.emit('player:move', {
-        x: this.player.x, y: this.player.y,
-        geo: tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH),
-        isSwimming: terrainState.isSwimming
-      });
-    } else {
-      this.player.isMoving = false;
-      this.player.walkCycle = 0;
-    }
-
-    // ── 4. World Re-centre ────────────────────────────────────────────────────
-    const distFromCtr = Math.hypot(this.player.x - this._mapW / 2, this.player.y - this._mapH / 2);
-    if (distFromCtr > REFETCH_DIST && !this._fetching) {
-      const newGeo = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-      const oldScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
-      this.geoCenter = newGeo;
-      this.player.x = this._mapW / 2;
-      this.player.y = this._mapH / 2;
-      const newScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
-      cam.camX += newScreen.x - oldScreen.x;
-      cam.camY += newScreen.y - oldScreen.y;
-      this._lastTileCamX = null; this._tileCache.length = 0;
-      this._lastBuildingRot = null; this._cachedDrawList = [];
-      this._rebuildFeatures();
-      this._doFetch(this.geoCenter);
-      this.emit('center:changed', this.geoCenter);
-    }
-
-    // ── 5. FINAL DRAW PASS ────────────────────────────────────────────────────
-    ctx.fillStyle = '#04060a';
-    ctx.fillRect(0, 0, W, H);
-
-    this._voxelR.beginFrame();
-    this._shadows.beginFrame();
-
-    // Tiles
-    const overpassAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
-    if (overpassAlpha > 0 && this.debugLayers.overpass) {
-      const hw = tileHalfWidth(cam.zoom, cam.tileW), hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-      const lod = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
-      if (lod > 1) {
-        this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overpassAlpha);
-      } else {
-        // Tile cache logic (using existing camMoved pattern)
-        const camMoved = (this._lastTileCamX === null || Math.abs(cam.camX - this._lastTileCamX) > 3);
-        if (camMoved) {
-          this._lastTileCamX = cam.camX;
-          const tilesX = Math.min(120, Math.ceil(W / Math.max(1, hw)) + 4);
-          const tilesY = Math.min(120, Math.ceil(H / Math.max(1, hh)) + 4);
-          const viewCenter = screenToWorld(W / 2, H / 2, cam);
-          const cx = Math.round(Math.max(0, Math.min(this._mapW, viewCenter.x)));
-          const cy = Math.round(Math.max(0, Math.min(this._mapH, viewCenter.y)));
-          this._tileCache.length = 0;
-          for (let ty = Math.max(0, cy - tilesY); ty < Math.min(this._mapH, cy + tilesY); ty++) {
-            for (let tx = Math.max(0, cx - tilesX); tx < Math.min(this._mapW, cx + tilesX); tx++) {
-              const gx = tx - this._mapW / 2 + pGX, gy = ty - this._mapH / 2 + pGY;
-              this._tileCache.push({ tx, ty, terrainId: this.terrainCache.get(gx, gy) ?? TerrainType.GRASS });
+          if (f.data.subType === 'animal') {
+            if (dist < DETECTION_RANGE) {
+              // Skittish: Run away from player
+              const angle = Math.atan2(dy, dx);
+              f.tx += Math.cos(angle) * FLEE_SPEED;
+              f.ty += Math.sin(angle) * FLEE_SPEED;
+              f.tx += (Math.random() - 0.5) * 0.02; // Panic jitter
+            } else {
+              // Idle: Ambient wander
+              f.tx += Math.sin(ts * 0.001 + f.id) * 0.002;
+              f.ty += Math.cos(ts * 0.001 + f.id) * 0.002;
             }
+          } else if (f.data.subType === 'plant') {
+            // Reactive: Wiggle if player is standing on it
+            f.data.wiggle = (distSq < 1.5) ? Math.sin(ts * 0.02) * 0.2 : 0;
           }
         }
-        this._tileR.drawLayer(this._tileCache, this.player.x, this.player.y, this.terrainCache, pGX, pGY);
+      });
+
+      // ── 3. Building Projection (Collision & Depth Cache) ──────────────────────
+      if (this._buildings.length > 0) {
+        const rotChanged = this._lastBuildingRot === null || Math.abs(cam.rotation - this._lastBuildingRot) > 0.02;
+        const countChanged = this._cachedDrawList.length !== this._buildings.length;
+
+        if (rotChanged || countChanged) {
+          this._lastBuildingRot = cam.rotation;
+          this._cachedDrawList = [];
+
+          for (const b of this._buildings) {
+            const p = geoToTile(b.centroid.lat, b.centroid.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+            if (p.x < 0 || p.x >= this._mapW || p.y < 0 || p.y >= this._mapH) continue;
+
+            const VU = 8;
+            const halfSideM = Math.sqrt(Math.max(1, b.areaM2));
+            const r = Math.max(VU, Math.min(VU * 20, (halfSideM / this._mPerTile / 2) * VU));
+            
+            // Calculate depth from the "back" corner of the building relative to camera
+            const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
+            const backX = p.x - (r / VU) * Math.abs(cr);
+            const backY = p.y - (r / VU) * Math.abs(sr);
+
+            const gx = Math.round(p.x) - this._mapW / 2 + pGX;
+            const gy = Math.round(p.y) - this._mapH / 2 + pGY;
+            const terrainType = this.terrainCache.get(gx, gy) ?? TerrainType.GRASS;
+            const elev = getElevOffset(this.terrainRegistry.heights[terrainType] ?? 1, cam.tilt, cam.zoom);
+            
+            this._cachedDrawList.push({
+              p, r,
+              engineH: Math.max(VU, Math.min(VU * 60, (b.heightM / this._mPerTile) * VU)),
+              tc: this.terrainRegistry.colors[TerrainType.BUILDING],
+              depth: tileDepth(backX, backY, cam.rotation),
+              elev: elev
+            });
+          }
+        }
       }
+
+      // ── 4. Movement & Collision ───────────────────────────────────────────────
+      const mv = this._input.getMovementVector();
+      const pElev = this._playerElev();
+
+      if (mv) {
+        this.player.isMoving = true;
+        this.player.faceAngle = Math.atan2(-mv.dy, mv.dx);
+
+        const hw = tileHalfWidth(cam.zoom, cam.tileW), hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+        const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
+        const rx = (mv.dx / hw + mv.dy / hh) * 0.5, ry = (mv.dy / hh - mv.dx / hw) * 0.5;
+        const wx = rx * cr - ry * sr, wy = rx * sr + ry * cr;
+
+        const terrainState = this._getMovementState(this.player.x, this.player.y, pGX, pGY);
+        const spd = (PLAYER_SPEED * terrainState.speedMult) * dt * 60 / (Math.hypot(wx, wy) || 1);
+        this.player.walkCycle += dt * 15 * terrainState.speedMult;
+
+        const nextX = this.player.x + wx * spd;
+        const nextY = this.player.y + wy * spd;
+
+        if (!this._getMovementState(nextX, nextY, pGX, pGY).isBlocked) {
+          this.player.x = nextX; this.player.y = nextY;
+        } else if (!this._getMovementState(nextX, this.player.y, pGX, pGY).isBlocked) {
+          this.player.x = nextX;
+        } else if (!this._getMovementState(this.player.x, nextY, pGX, pGY).isBlocked) {
+          this.player.y = nextY;
+        }
+
+        this.player.x = Math.max(0.5, Math.min(this._mapW - 0.5, this.player.x));
+        this.player.y = Math.max(0.5, Math.min(this._mapH - 0.5, this.player.y));
+
+        if (cam.tilt > 0.08) {
+          const { x: px, y: py } = worldToScreen(this.player.x, this.player.y, pElev, { ...cam, camX: 0, camY: 0 });
+          cam.camX += (px - W / 2 - cam.camX) * 0.08;
+          cam.camY += (py - H / 2 - cam.camY) * 0.08;
+        }
+
+        this.emit('player:move', {
+          x: this.player.x, y: this.player.y,
+          geo: tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH),
+          isSwimming: terrainState.isSwimming
+        });
+      } else {
+        this.player.isMoving = false;
+        this.player.walkCycle = 0;
+      }
+
+      // ── 5. Construct Unified Depth-Sorted Render List ─────────────────────────
+      const renderList = [];
+
+      // Add buildings
+      if (this.debugLayers.buildings) {
+        for (const b of this._cachedDrawList) {
+          renderList.push({ type: 'building', depth: b.depth, data: b });
+        }
+      }
+
+      // Add features (Trees, POIs, Bio)
+      if (this.debugLayers.features) {
+        for (const f of this._features) {
+          renderList.push({ 
+            type: 'feature', 
+            depth: tileDepth(f.tx, f.ty, cam.rotation), 
+            data: f 
+          });
+        }
+      }
+
+      // Add player
+      if (this._showPlayer) {
+        renderList.push({ 
+          type: 'player', 
+          depth: tileDepth(this.player.x, this.player.y, cam.rotation), 
+          data: this.player 
+        });
+      }
+
+      // Sort back-to-front
+      renderList.sort((a, b) => a.depth - b.depth);
+
+      // ── 6. Final Draw Pass ────────────────────────────────────────────────────
+      ctx.fillStyle = '#04060a';
+      ctx.fillRect(0, 0, W, H);
+
+      this._voxelR.beginFrame();
+      this._shadows.beginFrame();
+
+      // 6a. Render Tiles (Bottom Layer)
+      const overpassAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
+      if (overpassAlpha > 0 && this.debugLayers.overpass) {
+        const lod = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
+        if (lod > 1) {
+          this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overpassAlpha);
+        } else {
+          const camMoved = (this._lastTileCamX === null || Math.abs(cam.camX - this._lastTileCamX) > 3);
+          if (camMoved) {
+            this._lastTileCamX = cam.camX;
+            const hw = tileHalfWidth(cam.zoom, cam.tileW), hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+            const tilesX = Math.min(120, Math.ceil(W / Math.max(1, hw)) + 4);
+            const tilesY = Math.min(120, Math.ceil(H / Math.max(1, hh)) + 4);
+            const viewCenter = screenToWorld(W / 2, H / 2, cam);
+            const cx = Math.round(Math.max(0, Math.min(this._mapW, viewCenter.x)));
+            const cy = Math.round(Math.max(0, Math.min(this._mapH, viewCenter.y)));
+            this._tileCache.length = 0;
+            for (let ty = Math.max(0, cy - tilesY); ty < Math.min(this._mapH, cy + tilesY); ty++) {
+              for (let tx = Math.max(0, cx - tilesX); tx < Math.min(this._mapW, cx + tilesX); tx++) {
+                const gx = tx - this._mapW / 2 + pGX, gy = ty - this._mapH / 2 + pGY;
+                this._tileCache.push({ tx, ty, terrainId: this.terrainCache.get(gx, gy) ?? TerrainType.GRASS });
+              }
+            }
+          }
+          this._tileR.drawLayer(this._tileCache, this.player.x, this.player.y, this.terrainCache, pGX, pGY);
+        }
+      }
+
+      // 6b. Render Sorted 3D Items (Buildings, Features, Player interleaved)
+      if (this._shadows.enabled && cam.tilt > 0.05) {
+        this._shadows.drawBuildingShadows(this._cachedDrawList);
+      }
+
+      this._featR.frameNow = ts;
+
+      for (const item of renderList) {
+        if (item.type === 'building') {
+          const b = item.data;
+          this._voxelR.beginTile(b.p.x, b.p.y, b.elev);
+          this._voxelR.box(-b.r, 0, -b.r, b.r * 2, b.engineH, b.r * 2, b.tc.top, b.tc.right, b.tc.left);
+          const seed = Math.abs(Math.round(b.p.x * 31 + b.p.y * 17)) % 10000;
+          decorateBuildingFacade(this._ctx, cam, b, this._voxelR, seed);
+        } else if (item.type === 'feature') {
+          this._featR.drawFeature(item.data, this._selectedId === item.data.id, this.terrainCache, pGX, pGY);
+        } else if (item.type === 'player') {
+          this._playerR.draw(this.player.x, this.player.y, pElev, this.player, this._mPerTile);
+        }
+      }
+
+      // ── 7. World Re-centre & HUD ──────────────────────────────────────────────
+      const distFromCtr = Math.hypot(this.player.x - this._mapW / 2, this.player.y - this._mapH / 2);
+      if (distFromCtr > REFETCH_DIST && !this._fetching) {
+        const newGeo = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+        const oldScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
+        this.geoCenter = newGeo;
+        this.player.x = this._mapW / 2; this.player.y = this._mapH / 2;
+        const newScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
+        cam.camX += newScreen.x - oldScreen.x; cam.camY += newScreen.y - oldScreen.y;
+        this._lastTileCamX = null; this._tileCache.length = 0;
+        this._lastBuildingRot = null; this._cachedDrawList = [];
+        this._rebuildFeatures();
+        this._doFetch(this.geoCenter);
+        this.emit('center:changed', this.geoCenter);
+      }
+
+      const geo = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+      this.emit('hud', { 
+        lat: geo.lat, 
+        lon: geo.lon, 
+        zoom: cam.zoom.toFixed(2), 
+        tilt: cam.tilt.toFixed(2),
+        terrain: this.terrainRegistry.names[this.terrainCache.getLocal(this.player.x, this.player.y, pGX, pGY, this._mapW, this._mapH)] ?? 'Unknown' 
+      });
     }
 
-    // Shadows & Buildings
-    if (this.debugLayers.buildings && cam.tilt > 0.05) {
-      if (this._shadows.enabled) this._shadows.drawBuildingShadows(this._cachedDrawList);
-      for (const { p, elev, r, engineH, tc } of this._cachedDrawList) {
-        this._voxelR.beginTile(p.x, p.y, elev);
-        this._voxelR.box(-r, 0, -r, r * 2, engineH, r * 2, tc.top, tc.right, tc.left);
-      }
-    }
-
-    if (this.debugLayers.features) this._featR.drawAll(this._features, this._selectedId, this.terrainCache, pGX, pGY);
-    if (this._showPlayer) this._playerR.draw(this.player.x, this.player.y, pElev, this.player, this._mPerTile);
-
-    // 6. HUD
-    const geo = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-    this.emit('hud', { lat: geo.lat, lon: geo.lon, terrain: this.terrainRegistry.names[this.terrainCache.getLocal(this.player.x, this.player.y, pGX, pGY, this._mapW, this._mapH)] ?? 'Unknown' });
-  }
   // ── BUILDING DRAW ─────────────────────────────────────────────────────────
 
   _drawBuildings(pGX, pGY) {

@@ -51,6 +51,7 @@ export { PlayerRenderer }  from './render/PlayerRenderer.js';
 export { OSMLayerRenderer } from './render/OSMLayerRenderer.js';
 export { BaseLoader, OSMTileURL, CartoDarkURL, ESRISatelliteURL, patternURL } from './loaders/BaseLoader.js';
 export { OSMTerrainLoader } from './loaders/geo/OSMTerrainLoader.js';
+export { BioLoader } from './loaders/geo/BioLoader.js';
 export { ElevationLoader, ElevationFormat } from './loaders/geo/ElevationLoader.js';
 export { preprocessBuildings } from './loaders/geo/BuildingPreprocessor.js';
 export { EventEmitter } from './core/EventEmitter.js';

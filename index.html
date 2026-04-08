@@ -265,7 +265,7 @@
 <div id="loading-toast" class="loading-toast" style="display: none;">⟳ Fetching local 3D terrain…</div>
 
 <script type="module">
-    import { Engine, OSMTerrainLoader, ElevationLoader, ElevationFormat } from './src/GOECore.js';
+    import { Engine, OSMTerrainLoader, BioLoader, ElevationLoader, ElevationFormat } from './src/GOECore.js';
 
     // --------------------------------------------------------------
     // Sample events (optional, you can add more)
@@ -334,6 +334,13 @@
         fetchRadiusM: 1500  // was 800 — covers the full tile area
     });
     engine.use(terrainLoader);
+
+
+    const bioLoader = new BioLoader({
+        limit: 50,         // Don't overwhelm the engine
+        fetchRadiusM: 800  // Match your visibility
+    });
+    engine.use(bioLoader); // <── THIS is what "does stuff"
 
     // Add elevation loader
     const elevationLoader = new ElevationLoader(

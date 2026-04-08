@@ -10,7 +10,9 @@ export const TerrainType = Object.freeze({
   DEEP_WATER:  0,
   WATER:       1,
   SHORE:       2,
-  ROAD:        3,
+  ROAD_TARMAC: 3,   // Standard asphalt
+  ROAD_DIRT:   11,  // New: Earthen/Dirt
+  ROAD_GRAVEL: 12,  // New: Loose stones
   PATH:        4,
   GRASS:       5,
   PARK:        6,
@@ -27,7 +29,9 @@ export const TERRAIN_COLORS = {
   [TerrainType.DEEP_WATER]:  { top:'#225599', left:'#113366', right:'#184488', flat:'#1a4a88' },
   [TerrainType.WATER]:       { top:'#3388cc', left:'#2266aa', right:'#2a77bb', flat:'#2b7abf' },
   [TerrainType.SHORE]:       { top:'#44aadd', left:'#3388bb', right:'#3b99cc', flat:'#3c9ccd' },
-  [TerrainType.ROAD]:        { top:'#b8a486', left:'#8a785d', right:'#a39073', flat:'#b09c7d' },
+  [TerrainType.ROAD_TARMAC]: { top:'#444444', left:'#222222', right:'#333333', flat:'#3d3d3d' },
+  [TerrainType.ROAD_DIRT]:   { top:'#9b7653', left:'#7a5d41', right:'#8a694a', flat:'#916f4e' },
+  [TerrainType.ROAD_GRAVEL]: { top:'#a0a0a0', left:'#707070', right:'#888888', flat:'#959595' },
   [TerrainType.PATH]:        { top:'#e8cd8e', left:'#c2a668', right:'#d5ba7b', flat:'#e0c686' },
   [TerrainType.GRASS]:       { top:'#66cc44', left:'#449922', right:'#55b333', flat:'#5bc23a' },
   [TerrainType.PARK]:        { top:'#88aa44', left:'#557722', right:'#668833', flat:'#779933' },
@@ -57,7 +61,6 @@ export const TERRAIN_NAMES = {
   [TerrainType.DEEP_WATER]:  'Deep Water',
   [TerrainType.WATER]:       'Water',
   [TerrainType.SHORE]:       'Shoreline',
-  [TerrainType.ROAD]:        'Road',
   [TerrainType.PATH]:        'Pathway',
   [TerrainType.GRASS]:       'Open Ground',
   [TerrainType.PARK]:        'Park',
@@ -65,6 +68,9 @@ export const TERRAIN_NAMES = {
   [TerrainType.BUILDING]:    'Building',
   [TerrainType.SAND]:        'Beach / Sand',
   [TerrainType.RESIDENTIAL]: 'Residential Area',
+  [TerrainType.ROAD_TARMAC]: 'Paved Road',
+  [TerrainType.ROAD_DIRT]:   'Earthen Road',
+  [TerrainType.ROAD_GRAVEL]: 'Gravel Path',
 };
 
 /**
