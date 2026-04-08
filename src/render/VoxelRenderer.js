@@ -30,6 +30,18 @@ export class VoxelRenderer {
     this._base = baseElevPx;
   }
 
+    // Add this method:
+  beginFrame() {
+    const cam = this.cam;
+    this._hw   = tileHalfWidth(cam.zoom, cam.tileW);
+    this._hh   = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+    this._cr   = cam._cr;
+    this._sr   = cam._sr;
+    this._vu   = (this._hh * 2) / VOXEL_UNITS;
+    this._mw2  = cam.mapW / 2;
+    this._mh2  = cam.mapH / 2;
+  }
+
   /** Project a voxel-space point to screen coords. */
   proj(vx, vy, vz) {
     const cam = this.cam;

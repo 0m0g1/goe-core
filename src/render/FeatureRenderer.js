@@ -240,7 +240,7 @@ export class FeatureRenderer {
 
     // ── Selection ring ────────────────────────────────────────────────────
     if (isSelected) {
-      const t = Date.now() * 0.002;
+      const t = this.frameNow * 0.002;
       ctx.beginPath();
       ctx.arc(center.x, center.y, Math.max(5, hw * (1.3 + Math.sin(t)*0.15)), 0, Math.PI*2);
       ctx.strokeStyle = color + '99'; ctx.lineWidth = 2; ctx.stroke();
@@ -249,7 +249,7 @@ export class FeatureRenderer {
     // ── Proximity aura ────────────────────────────────────────────────────
     if (cam.tilt < 0.4 && hw > 6) {
       const a = (1 - cam.tilt / 0.4) * 0.65;
-      const t = Date.now() * 0.002;
+      const t = this.frameNow * 0.002;
       ctx.globalAlpha = a;
       ctx.beginPath();
       ctx.arc(center.x, center.y, hw * (1.1 + Math.sin(t)*0.08), 0, Math.PI*2);

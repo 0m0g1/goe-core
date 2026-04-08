@@ -105,6 +105,9 @@ export class Engine extends EventEmitter {
     this._lastTileCamY    = null;
     this._lastTileZoom    = null;
     this._lastTileRot     = null;
+
+    this._lastBuildingRot = null;
+    this._cachedDrawList  = [];
   }
 
   // ── MOUNT ──────────────────────────────────────────────────────────────────
@@ -119,7 +122,6 @@ export class Engine extends EventEmitter {
     this._ctx     = canvas.getContext('2d');
     this._running = true;
 
-    // ── Renderers ──────────────────────────────────────────────────────────
     const cam = this.camera;
     this._voxelR   = new VoxelRenderer(this._ctx, cam);
     this._tileR    = new TileRenderer(this._ctx, cam, this.terrainRegistry);
@@ -127,45 +129,33 @@ export class Engine extends EventEmitter {
     this._playerR  = new PlayerRenderer(this._ctx, cam);
     this._osmLayer = new OSMLayerRenderer(this._ctx, cam, this._tileURLFn);
 
-    // ── Resize ─────────────────────────────────────────────────────────────
-    // Ensure we have a valid initial size immediately
     const resize = () => {
       canvas.width  = canvas.offsetWidth  || window.innerWidth;
       canvas.height = canvas.offsetHeight || window.innerHeight;
     };
     resize();
 
-    // Snapping center after a brief delay to account for layout reflow
-    requestAnimationFrame(() => {
-      this._centreCameraOnPlayer();
-    });
-    
-    resize();
     this._ro = new ResizeObserver(resize);
     this._ro.observe(canvas);
 
-    // ── Input ──────────────────────────────────────────────────────────────
     this._input = new InputManager(canvas, { zoomSpeed: cam.zoomSpeed });
-    this._input.on('wheel',     ({ delta, x, y }) =>
-      cam.zoom_at(cam.zoom - delta * cam.zoomSpeed * cam.zoom, x, y));
-    this._input.on('pinch',     ({ dist, lastDist, cx, cy }) =>
-      cam.zoom_at(cam.zoom * (dist / lastDist), cx, cy));
-    this._input.on('pan',       ({ dx, dy }) => { cam.camX -= dx; cam.camY -= dy; });
-    this._input.on('rotate',    ({ delta }) => { cam.rotVel += delta * 5; });
-    this._input.on('click',     (ev) => this._handleClick(ev));
+    this._input.on('wheel',  ({ delta, x, y }) =>
+      cam.zoom_at(cam.zoom - delta * cam.zoomSpeed * cam.zoom, x ?? 0, y ?? 0));
+    this._input.on('pinch',  ({ dist, lastDist, cx, cy }) =>
+      cam.zoom_at(cam.zoom * (dist / lastDist), cx ?? 0, cy ?? 0));
+    this._input.on('pan',    ({ dx, dy }) => { cam.camX -= dx; cam.camY -= dy; });
+    this._input.on('rotate', ({ delta }) => { cam.rotVel += delta * 5; });
+    this._input.on('click',  (ev) => this._handleClick(ev));
 
-    // Init loaders
     for (const loader of this._loaders) loader.init(this);
-
-    // Initial fetch
     this._doFetch(this.geoCenter);
 
-    // Centre camera on player
-    this._centreCameraOnPlayer();
-
-    // Start loop
     this._lastT = 0;
-    this._raf   = requestAnimationFrame(ts => this._frame(ts));
+    this._raf   = requestAnimationFrame(ts => {
+      // Centre ONCE after layout is stable, then start the loop
+      this._centreCameraOnPlayer();
+      this._frame(ts);
+    });
 
     return this;
   }
@@ -354,6 +344,9 @@ export class Engine extends EventEmitter {
     this._raf = requestAnimationFrame(ts2 => this._frame(ts2));
 
     const dt = Math.min((ts - this._lastT) / 1000, 0.05);
+
+    this._featR.frameNow = this._frameNow;
+
     this._lastT = ts;
 
     const cam    = this.camera;
@@ -434,6 +427,23 @@ export class Engine extends EventEmitter {
     // ── Draw: clear ───────────────────────────────────────────────────────────
     ctx.fillStyle = '#04060a';
     ctx.fillRect(0, 0, W, H);
+    // TEMP DEBUG — paste after ctx.fillRect(0,0,W,H)
+console.log({
+  camX: this.camera.camX,
+  camY: this.camera.camY,
+  zoom: this.camera.zoom,
+  tilt: this.camera.tilt,
+  rotation: this.camera.rotation,
+  _cr: this.camera._cr,
+  _sr: this.camera._sr,
+  playerX: this.player.x,
+  playerY: this.player.y,
+  tileCount: this._tileCache.length,
+  buildingCount: this._buildings.length,
+  featureCount: this._features.length,
+});
+
+    this._voxelR.beginFrame();
 
     // ── Draw: OSM slippy tiles (far zoom only) ────────────────────────────────
     if (this.debugLayers.osmTiles) {
@@ -464,10 +474,10 @@ export class Engine extends EventEmitter {
       } else {
         // ── Full detail tiles — rebuild cache only when camera actually moves ─
         const camMoved = (
-          Math.abs(cam.camX    - this._lastTileCamX)  > 1   ||
-          Math.abs(cam.camY    - this._lastTileCamY)  > 1   ||
-          Math.abs(cam.zoom    - this._lastTileZoom)  > 0.0005 ||
-          Math.abs(cam.rotation - this._lastTileRot)  > 0.005  ||
+          Math.abs(cam.camX    - this._lastTileCamX)  > 3     ||
+          Math.abs(cam.camY    - this._lastTileCamY)  > 3     ||
+          Math.abs(cam.zoom    - this._lastTileZoom)  > 0.002 ||
+          Math.abs(cam.rotation - this._lastTileRot)  > 0.01  ||
           this._lastTileCamX === null
         );
 
@@ -522,6 +532,7 @@ export class Engine extends EventEmitter {
 
     // ── Draw: features / POIs ─────────────────────────────────────────────────
     if (this.debugLayers.features) {
+      this._featR.frameNow = this._frameNow;
       this._featR.drawAll(this._features, this._selectedId, this.terrainCache, pGX, pGY);
     }
 
@@ -555,49 +566,53 @@ export class Engine extends EventEmitter {
     if (!this._buildings.length) return;
     const cam = this.camera;
 
-    // ── 1. Project all buildings and compute depth ─────────────────────────
-    const drawList = [];
-    for (const b of this._buildings) {
-      const p = geoToTile(
-        b.centroid.lat, b.centroid.lon,
-        this.geoCenter, this._mPerTile, this._mapW, this._mapH
-      );
-      if (p.x < 0 || p.x >= this._mapW || p.y < 0 || p.y >= this._mapH) continue;
-      if (cam.tilt < 0.05) continue;
+    const rotChanged =
+      this._lastBuildingRot === null ||
+      Math.abs(cam.rotation - this._lastBuildingRot) > 0.02;
 
-      // Use the back corner (furthest from camera) for more accurate sorting
-      // of buildings whose footprint spans multiple tiles
-      const VU       = 8;
-      const tileSize = this._mPerTile;
-      const halfSideM = Math.sqrt(Math.max(1, b.areaM2));
-      const r         = Math.max(VU, Math.min(VU * 20, (halfSideM / tileSize / 2) * VU));
-      const footprintTiles = r / VU;
+    const countChanged = this._cachedDrawList.length !== this._buildings.length;
 
-      // Back corner varies with rotation snap — approximate with centroid offset
-      const cr    = Math.cos(cam.rotation);
-      const sr    = Math.sin(cam.rotation);
-      const backX = p.x - footprintTiles * Math.abs(cr);
-      const backY = p.y - footprintTiles * Math.abs(sr);
-      const depth = tileDepth(backX, backY, cam.rotation);
+    if (rotChanged || countChanged) {
+      this._lastBuildingRot = cam.rotation;
+      this._cachedDrawList  = [];
 
-      const gx          = Math.round(p.x) - this._mapW / 2 + pGX;
-      const gy          = Math.round(p.y) - this._mapH / 2 + pGY;
-      const terrainType = this.terrainCache.get(gx, gy) ?? TerrainType.GRASS;
-      const elev        = getElevOffset(
-        this.terrainRegistry.heights[terrainType] ?? 1,
-        cam.tilt, cam.zoom
-      );
-      const engineH = Math.max(VU, Math.min(VU * 60, (b.heightM / tileSize) * VU));
-      const tc      = this.terrainRegistry.colors[TerrainType.BUILDING];
+      for (const b of this._buildings) {
+        const p = geoToTile(
+          b.centroid.lat, b.centroid.lon,
+          this.geoCenter, this._mPerTile, this._mapW, this._mapH
+        );
+        if (p.x < 0 || p.x >= this._mapW || p.y < 0 || p.y >= this._mapH) continue;
+        if (cam.tilt < 0.05) continue;
 
-      drawList.push({ p, elev, r, engineH, tc, depth });
+        const VU           = 8;
+        const tileSize     = this._mPerTile;
+        const halfSideM    = Math.sqrt(Math.max(1, b.areaM2));
+        const r            = Math.max(VU, Math.min(VU * 20, (halfSideM / tileSize / 2) * VU));
+        const footprintTiles = r / VU;
+
+        const cr    = cam._cr ?? Math.cos(cam.rotation);
+        const sr    = cam._sr ?? Math.sin(cam.rotation);
+        const backX = p.x - footprintTiles * Math.abs(cr);
+        const backY = p.y - footprintTiles * Math.abs(sr);
+        const depth = tileDepth(backX, backY, cam.rotation);
+
+        const gx          = Math.round(p.x) - this._mapW / 2 + pGX;
+        const gy          = Math.round(p.y) - this._mapH / 2 + pGY;
+        const terrainType = this.terrainCache.get(gx, gy) ?? TerrainType.GRASS;
+        const elev        = getElevOffset(
+          this.terrainRegistry.heights[terrainType] ?? 1,
+          cam.tilt, cam.zoom
+        );
+        const engineH = Math.max(VU, Math.min(VU * 60, (b.heightM / tileSize) * VU));
+        const tc      = this.terrainRegistry.colors[TerrainType.BUILDING];
+
+        this._cachedDrawList.push({ p, elev, r, engineH, tc, depth });
+      }
+
+      this._cachedDrawList.sort((a, b) => a.depth - b.depth);
     }
 
-    // ── 2. Sort back-to-front ──────────────────────────────────────────────
-    drawList.sort((a, b) => a.depth - b.depth);
-
-    // ── 3. Draw in correct order ───────────────────────────────────────────
-    for (const { p, elev, r, engineH, tc } of drawList) {
+    for (const { p, elev, r, engineH, tc } of this._cachedDrawList) {
       this._voxelR.beginTile(p.x, p.y, elev);
       this._voxelR.box(-r, 0, -r, r * 2, engineH, r * 2, tc.top, tc.right, tc.left);
     }

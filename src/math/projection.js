@@ -129,10 +129,12 @@ export function shadeHex(hex, f) {
  */
 export function applyZoom(cam, newZoom, ax, ay, zoomMin, zoomMax) {
   newZoom = Math.max(zoomMin, Math.min(zoomMax, newZoom));
+  ax = ax ?? 0;
+  ay = ay ?? 0;
   const wx = (ax + cam.camX) / cam.zoom;
   const wy = (ay + cam.camY) / cam.zoom;
-  cam.zoom  = newZoom;
-  cam.camX  = wx * newZoom - ax;
-  cam.camY  = wy * newZoom - ay;
+  cam.zoom = newZoom;
+  cam.camX = wx * newZoom - ax;
+  cam.camY = wy * newZoom - ay;
   return cam;
 }
