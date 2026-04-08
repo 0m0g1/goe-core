@@ -331,6 +331,8 @@ export class Engine extends EventEmitter {
 
     Promise.all(fetches).then(results => {
       for (const result of results) {
+        console.log('Loader result keys:', Object.keys(result));                          // ← ADD
+        console.log('terrainUpdates size:', result.terrainUpdates?.size);                 // ← ADD
         if (result.terrainUpdates) this.terrainCache.merge(result.terrainUpdates);
         if (result.buildingWays)   this._buildings = preprocessBuildings(result.buildingWays);
         if (result.features)       for (const f of result.features) this.addFeature(f);
@@ -422,27 +424,38 @@ export class Engine extends EventEmitter {
 
     // Global slippy tiles (background)
     if (this.debugLayers.osmTiles) {
-      this._osmLayer.draw(canvas, this.geoCenter);
-    }
+      // Only show slippy tiles when zoomed out far enough that voxels aren't visible
+      // At high zoom the voxel terrain fully covers the map anyway
+      const osmAlpha      = Math.max(0, Math.min(1, (0.035 - cam.zoom) / 0.02));
+      if (osmAlpha > 0) {
+        ctx.globalAlpha = osmAlpha;
+        this._osmLayer.draw(canvas, this.geoCenter);
+        ctx.globalAlpha = 1;
+      }
+    } 
 
     // Overpass terrain overlay (fades in on zoom)
     // In Engine._frame(), replace the visible tiles loop:
-    const overpassAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
+    const overpassAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02)  / 0.015));
     if (overpassAlpha > 0 && this.debugLayers.overpass) {
       ctx.globalAlpha = overpassAlpha;
-      const lod = cam.zoom > 0.3 ? 1
-                : cam.zoom > 0.1 ? 2
-                : cam.zoom > 0.04 ? 4 : 8;
+      const lod = 1;
       if (lod === 1) {
         // original per‑tile drawing
         const tiles = [];
-        for (let gy = pGY-40; gy < pGY+40; gy++) {
-          for (let gx = pGX-40; gx < pGX+40; gx++) {
-            const tx = gx - pGX + this._mapW/2;
-            const ty = gy - pGY + this._mapH/2;
-            tiles.push({ tx, ty, terrainId: this.terrainCache.get(gx, gy) ?? TerrainType.GRASS });
+        const halfW = Math.ceil(this._mapW / 2);
+        const halfH = Math.ceil(this._mapH / 2);
+       for (let gy = pGY - halfH; gy < pGY + halfH; gy++) {
+          for (let gx = pGX - halfW; gx < pGX + halfW; gx++) {
+            const tx = gx - pGX + this._mapW / 2;
+            const ty = gy - pGY + this._mapH / 2;
+            tiles.push({ 
+              tx, ty, 
+              terrainId: this.terrainCache.get(gx, gy) ?? TerrainType.GRASS 
+            });
           }
         }
+
         this._tileR.drawLayer(tiles, this.player.x, this.player.y);
       } else {
         this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overpassAlpha);

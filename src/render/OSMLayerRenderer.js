@@ -138,4 +138,9 @@ export class OSMLayerRenderer {
       }
     }
   }
+
+  setGeoCenter(geo) {
+    this._geoCenter = geo;
+    this._tileCache?.clear(); // force re-fetch tiles for new location
+  }
 }

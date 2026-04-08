@@ -54,9 +54,10 @@ export class TerrainCache {
    * @param {number} mapH
    * @param {number} defaultTerrain
    */
+  
   getLocal(tx, ty, pGlobalX, pGlobalY, mapW, mapH, defaultTerrain = 5) {
-    const gx = Math.floor(tx) - mapW / 2 + pGlobalX;
-    const gy = Math.floor(ty) - mapH / 2 + pGlobalY;
+    const gx = Math.round(tx) - Math.floor(mapW / 2) + pGlobalX;
+    const gy = Math.round(ty) - Math.floor(mapH / 2) + pGlobalY;
     return this._data.get(`${gx},${gy}`) ?? defaultTerrain;
   }
 

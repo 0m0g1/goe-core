@@ -161,13 +161,10 @@ export class OSMTerrainLoader extends BaseLoader {
   _nextEndpoint() { this._endpointIdx = (this._endpointIdx + 1) % this._endpoints.length; }
 
   _getCacheKey(geoCenter) {
-    const mLat  = 111320;
-    const mLon  = 111320 * Math.cos(geoCenter.lat * Math.PI / 180);
-    const rLat  = this._fetchRadiusM / mLat;
-    const rLon  = this._fetchRadiusM / mLon;
-    const s = (geoCenter.lat - rLat).toFixed(6), n = (geoCenter.lat + rLat).toFixed(6);
-    const w = (geoCenter.lon - rLon).toFixed(6), e = (geoCenter.lon + rLon).toFixed(6);
-    return `overpass:${s},${w},${n},${e}`;
+    // Key by rounded lat/lon at ~100m precision + radius
+    const latR = geoCenter.lat.toFixed(3);
+    const lonR = geoCenter.lon.toFixed(3);
+    return `overpass:${latR},${lonR},r${this._fetchRadiusM}`;
   }
 
   async fetch(geoCenter) {
@@ -190,26 +187,20 @@ export class OSMTerrainLoader extends BaseLoader {
     } catch (err) { console.warn('Cache read error', err); }
 
     // Build Overpass query including POIs
-    const bbox = cacheKey.slice('overpass:'.length);
-    const q = `[out:json][timeout:25];(
-      // Terrain & buildings (ways)
-      way["natural"~"water|beach|wood|grassland|heath|scrub|wetland"](${bbox});
-      way["landuse"~"water|reservoir|basin|grass|meadow|village_green|allotments|forest|park|commercial|residential|retail|industrial"](${bbox});
-      way["leisure"~"park|garden|pitch|playground"](${bbox});
-      way["waterway"~"river|stream|canal|drain|ditch|riverbank"](${bbox});
-      way["highway"~"motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|pedestrian|footway|cycleway|path"](${bbox});
-      way["building"](${bbox});
-      // POIs (nodes and ways with amenity, shop, tourism, historic, leisure)
-      node["amenity"](${bbox});
-      way["amenity"](${bbox});
-      node["shop"](${bbox});
-      way["shop"](${bbox});
-      node["tourism"](${bbox});
-      way["tourism"](${bbox});
-      node["historic"](${bbox});
-      way["historic"](${bbox});
-      node["leisure"](${bbox});
-      way["leisure"](${bbox});
+    const { lat, lon } = geoCenter;
+    const r = this._fetchRadiusM;
+    const q = `[out:json][timeout:60];(
+      way["natural"~"water|beach|wood|grassland|heath|scrub|wetland"](around:${r},${lat},${lon});
+      way["landuse"~"water|reservoir|basin|grass|meadow|village_green|allotments|forest|park|commercial|residential|retail|industrial"](around:${r},${lat},${lon});
+      way["leisure"~"park|garden|pitch|playground"](around:${r},${lat},${lon});
+      way["waterway"~"river|stream|canal|drain|ditch|riverbank"](around:${r},${lat},${lon});
+      way["highway"~"motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|pedestrian|footway|cycleway|path"](around:${r},${lat},${lon});
+      way["building"](around:${r},${lat},${lon});
+      node["amenity"](around:${r},${lat},${lon});
+      node["shop"](around:${r},${lat},${lon});
+      node["tourism"](around:${r},${lat},${lon});
+      node["historic"](around:${r},${lat},${lon});
+      node["leisure"](around:${r},${lat},${lon});
     );out geom qt;`;
 
     for (let attempt = 0; attempt < this._endpoints.length; attempt++) {

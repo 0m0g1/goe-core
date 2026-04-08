@@ -316,8 +316,10 @@
         geoCenter: initialGeo,
         showPlayer: true,
         tileURLFn: (z, x, y) => `https://a.tile.openstreetmap.org/${z}/${x}/${y}.png`,
+        mapW: 400,        // ← must match loader
+        mapH: 400,        // ← must match loader
         cameraOpts: {
-            zoom: 0.35,          // Higher initial zoom to see details
+            zoom: 0.35,
             zoomFlat: 0.18,
             zoomIso: 0.58,
             zoomSpeed: 0.0014
@@ -327,9 +329,9 @@
     // Add terrain loader (enhanced version that fetches POIs)
     const terrainLoader = new OSMTerrainLoader({
         mPerTile: 2,
-        mapW: 80,
-        mapH: 80,
-        fetchRadiusM: 800 
+        mapW: 400,        // was 80 — 8× bigger
+        mapH: 400,        // was 80
+        fetchRadiusM: 1500  // was 800 — covers the full tile area
     });
     engine.use(terrainLoader);
 
@@ -396,7 +398,7 @@
     function updateDebugStats() {
         const buildings = engine._buildings?.length || 0;
         const pois = engine._features?.length || 0;
-        const cacheSize = engine.terrainCache?._map?.size ?? 0;
+        const cacheSize = engine.terrainCache?.size() || 0;
         debugStats.innerHTML = `Buildings: ${buildings}<br>POIs: ${pois}<br>Cache: ${cacheSize}`;
     }
 
@@ -464,6 +466,12 @@
     engine.on('fetch:done', () => {
         loadingToast.style.display = 'none';
         updateDebugStats();
+        
+        const cache = engine.terrainCache;
+        const allKeys = cache._map ? [...cache._map.keys()] : [];
+        console.log('Total cache entries:', allKeys.length);
+        console.log('TerrainCache object:', cache);          // ← ADD THIS
+        console.log('TerrainCache keys:', Object.keys(cache)); // ← AND THIS
     });
 
     setInterval(() => {
