@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>GOE Core – Exploration Demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none;
+        }
+        body {
+            background: #04060a;
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
+            height: 100vh;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            image-rendering: crisp-edges;
+        }
+        /* UI overlays – same style as ExplorationView */
+        .ui-panel {
+            position: absolute;
+            pointer-events: none;
+            text-shadow: 1px 1px 2px #000;
+            letter-spacing: 0.1em;
+        }
+        .badge {
+            position: absolute;
+            top: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 10px;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            white-space: nowrap;
+            transition: color 0.3s;
+        }
+        .hud {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            font-size: 10px;
+            color: #504838;
+            line-height: 2;
+        }
+        .hud-title {
+            font-size: 12px;
+            color: #e0d0b0;
+            letter-spacing: 0.22em;
+            margin-bottom: 4px;
+        }
+        .controls {
+            position: absolute;
+            bottom: 54px;
+            left: 14px;
+            font-size: 9px;
+            color: #455034;
+            letter-spacing: 0.06em;
+            line-height: 2.2;
+        }
+        .legend {
+            position: absolute;
+            bottom: 54px;
+            right: 14px;
+            font-size: 9px;
+            color: #756f5d;
+            background: rgba(0,0,0,0.4);
+            padding: 8px;
+            border: 1px solid #282018;
+            pointer-events: none;
+            line-height: 2;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .button-panel {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
+            pointer-events: auto;
+        }
+        .button-panel button {
+            width: 28px;
+            height: 28px;
+            background: #100e0c;
+            border: 1px solid #282018;
+            color: #907860;
+            font-size: 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: monospace;
+        }
+        .tilt-indicator {
+            width: 3px;
+            height: 60px;
+            background: #141210;
+            border-radius: 2px;
+            margin-top: 6px;
+            position: relative;
+        }
+        .tilt-fill {
+            position: absolute;
+            bottom: 0;
+            width: 100%;
+            border-radius: 2px;
+            background: linear-gradient(to top, #3a8048, #a07830, #3a70a8);
+            transition: height 0.1s;
+        }
+        .card {
+            position: absolute;
+            bottom: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(12,16,12,0.92);
+            border: 1px solid #384028;
+            padding: 14px 18px;
+            min-width: 220px;
+            max-width: 300px;
+            font-size: 11px;
+            line-height: 1.8;
+            letter-spacing: 0.08em;
+            color: #c0b898;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            pointer-events: none;
+            transition: opacity 0.2s;
+        }
+        .loading-toast {
+            position: absolute;
+            bottom: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #181410;
+            border: 2px solid #504030;
+            border-radius: 4px;
+            color: #e0d0b0;
+            padding: 8px 16px;
+            font-size: 11px;
+            letter-spacing: 0.1em;
+            white-space: nowrap;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+<canvas id="game-canvas"></canvas>
+
+<!-- UI overlays (identical to ExplorationView) -->
+<div class="ui-panel badge" id="mode-badge">◉ GLOBAL MAP</div>
+
+<div class="ui-panel hud">
+    <div class="hud-title">◈ EXPLORER</div>
+    <div id="hud-coords">0.00000° N &nbsp; 0.00000° E</div>
+    <div id="hud-zoom">zoom: 0.00× &nbsp; tilt: 0%</div>
+    <div id="hud-terrain">● loading map…</div>
+    <div id="hud-elevation">▲ elevation loading…</div>
+    <div id="hud-nearby"></div>
+</div>
+
+<div class="controls">
+    WASD — move · SCROLL/PINCH — zoom · DRAG — pan · Q/E or RIGHT-DRAG — rotate · CLICK — inspect
+</div>
+
+<div class="legend">
+    <div class="legend-item"><div style="width:8px;height:8px;background:#ef4444;border-radius:50%;"></div> War/Battle</div>
+    <div class="legend-item"><div style="width:8px;height:8px;background:#f59e0b;border-radius:50%;"></div> Politics</div>
+    <div class="legend-item"><div style="width:8px;height:8px;background:#06b6d4;border-radius:50%;"></div> Science</div>
+    <div class="legend-item"><div style="width:8px;height:8px;background:#a78bfa;border-radius:50%;"></div> Art/Culture</div>
+    <div class="legend-item"><div style="width:8px;height:8px;background:#f97316;border-radius:50%;"></div> Religion</div>
+    <div class="legend-item"><div style="width:8px;height:8px;background:#22c55e;border-radius:50%;"></div> Sport</div>
+    <div class="legend-item"><div style="width:8px;height:8px;background:#dc2626;border-radius:50%;"></div> Disaster</div>
+    <div class="legend-item"><div style="width:8px;height:8px;background:#eab308;border-radius:50%;"></div> Economics</div>
+</div>
+
+<div class="button-panel">
+    <button id="zoom-in" title="Zoom in">+</button>
+    <button id="zoom-out" title="Zoom out">−</button>
+    <button id="rot-left" title="Rotate left">↺</button>
+    <button id="rot-right" title="Rotate right">↻</button>
+    <div class="tilt-indicator"><div class="tilt-fill" id="tilt-fill"></div></div>
+</div>
+
+<div id="event-card" class="card" style="display: none;"></div>
+<div id="loading-toast" class="loading-toast" style="display: none;">⟳ Fetching local 3D terrain…</div>
+
+<script type="module">
+    // Import the GOE Core library (adjust path to your actual build)
+    import { Engine, OSMTerrainLoader, ElevationLoader, ElevationFormat } from './src/GOECore.js';
+
+    // --------------------------------------------------------------
+    // 1. Sample events (replace with your real data)
+    // --------------------------------------------------------------
+    const sampleEvents = [
+        { id: 'evt1', title: 'Battle of Hastings', category: 'war', latitude: 50.886, longitude: 0.488, year: 1066, description: 'Norman conquest of England.' },
+        { id: 'evt2', title: 'Moon Landing', category: 'science', latitude: 0.674, longitude: 23.473, year: 1969, description: 'First humans on the Moon.' },
+        { id: 'evt3', title: 'Fall of Berlin Wall', category: 'politics', latitude: 52.516, longitude: 13.382, year: 1989, description: 'End of Cold War division.' }
+    ];
+
+    // Colour mapping (same as ExplorationView)
+    const categoryColors = {
+        war: '#ef4444', battle: '#ef4444', conflict: '#ef4444',
+        politics: '#f59e0b', government: '#f59e0b',
+        science: '#06b6d4', technology: '#06b6d4',
+        art: '#a78bfa', culture: '#a78bfa', music: '#a78bfa',
+        religion: '#f97316', spiritual: '#f97316',
+        sport: '#22c55e', sports: '#22c55e',
+        disaster: '#dc2626', nature: '#10b981',
+        economics: '#eab308', trade: '#eab308'
+    };
+    function eventColor(item) {
+        const cat = String(item?.category || item?.type || '').toLowerCase();
+        for (const [k, v] of Object.entries(categoryColors))
+            if (cat.includes(k)) return v;
+        return '#60a5fa';
+    }
+
+    // Format features for Engine
+    function buildFeatures(events, geoCenter) {
+        return events.map(ev => ({
+            id: ev.id,
+            latitude: ev.latitude,
+            longitude: ev.longitude,
+            color: eventColor(ev),
+            label: ev.title,
+            data: ev
+        }));
+    }
+
+    // --------------------------------------------------------------
+    // 2. Setup Engine
+    // --------------------------------------------------------------
+    const canvas = document.getElementById('game-canvas');
+    // Initial centre (first event or fallback)
+    const initialGeo = sampleEvents.length
+        ? { lat: sampleEvents[0].latitude, lon: sampleEvents[0].longitude }
+        : { lat: 51.505, lon: -0.09 };
+
+    const engine = new Engine({
+        geoCenter: initialGeo,
+        showPlayer: true,
+        // OSM slippy tiles (background)
+        tileURLFn: (z, x, y) => `https://a.tile.openstreetmap.org/${z}/${x}/${y}.png`,
+        // Optional: tweak camera behaviour
+        cameraOpts: {
+            zoomFlat: 0.18,
+            zoomIso: 0.58,
+            zoomSpeed: 0.0014
+        }
+    });
+
+    // Add terrain loader (Overpass)
+    const terrainLoader = new OSMTerrainLoader({
+        mPerTile: 2,
+        mapW: 80,
+        mapH: 80
+    });
+    engine.use(terrainLoader);
+
+    // Add elevation loader (public terrarium tiles)
+    const elevationLoader = new ElevationLoader(
+        (z, x, y) => `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`,
+        ElevationFormat.TERRARIUM,
+        2
+    );
+    engine.setElevationLoader(elevationLoader);
+
+    // Set initial events
+    engine.setFeatures(buildFeatures(sampleEvents, engine.geoCenter));
+
+    // Mount and start loop
+    engine.mount(canvas);
+
+    // --------------------------------------------------------------
+    // 3. UI updates using Engine events
+    // --------------------------------------------------------------
+    const modeBadge = document.getElementById('mode-badge');
+    const hudCoords = document.getElementById('hud-coords');
+    const hudZoom = document.getElementById('hud-zoom');
+    const hudTerrain = document.getElementById('hud-terrain');
+    const hudElevation = document.getElementById('hud-elevation');
+    const hudNearby = document.getElementById('hud-nearby');
+    const tiltFill = document.getElementById('tilt-fill');
+    const eventCard = document.getElementById('event-card');
+    const loadingToast = document.getElementById('loading-toast');
+
+    let currentCardTimeout = null;
+
+    // Helper: count nearby events (within 10 tiles)
+    function updateNearbyCount() {
+        if (!engine.player) return;
+        const px = engine.player.x, py = engine.player.y;
+        let count = 0;
+        for (const f of engine._features) {
+            const dx = Math.abs(f.tx - px);
+            const dy = Math.abs(f.ty - py);
+            if (dx < 10 && dy < 10) count++;
+        }
+        hudNearby.innerText = count ? `◈ ${count} event${count !== 1 ? 's' : ''} nearby` : '';
+    }
+
+    engine.on('hud', ({ lat, lon, zoom, tilt, terrain }) => {
+        hudCoords.innerText = `${lat.toFixed(5)}° N &nbsp; ${lon.toFixed(5)}° E`;
+        hudZoom.innerText = `zoom: ${zoom}× &nbsp; tilt: ${(tilt * 100).toFixed(0)}%`;
+        hudTerrain.innerText = terrain;
+        // Update badge style based on tilt
+        if (tilt < 0.05) modeBadge.style.color = '#3a70a8';
+        else if (tilt > 0.95) modeBadge.style.color = '#e8db9b';
+        else modeBadge.style.color = '#a07830';
+        tiltFill.style.height = `${tilt * 100}%`;
+        updateNearbyCount();
+    });
+
+    engine.on('feature:click', ({ id, data, feature }) => {
+        // Show card
+        const ev = data;
+        const color = eventColor(ev);
+        eventCard.style.display = 'block';
+        eventCard.innerHTML = `
+            <div style="font-size:9px;letter-spacing:.2em;text-transform:uppercase;margin-bottom:4px;color:${color}">
+                ${String(ev.category || ev.type || 'event').toUpperCase()}
+            </div>
+            <div style="font-size:13px;color:#e8db9b;letter-spacing:.15em;margin-bottom:2px">
+                ${ev.title || ev.name || 'Untitled'}
+            </div>
+            ${ev.year ? `<div style="color:#8a9973">${ev.year}</div>` : ''}
+            ${ev.description ? `<div style="color:#756f5d;margin-top:4px;font-size:10px">${ev.description.slice(0,120)}${ev.description.length>120?'…':''}</div>` : ''}
+            <div style="color:#455034;font-size:9px;margin-top:6px">
+                ${Number(ev.latitude).toFixed(4)}°, ${Number(ev.longitude).toFixed(4)}°
+            </div>
+        `;
+        if (currentCardTimeout) clearTimeout(currentCardTimeout);
+        currentCardTimeout = setTimeout(() => {
+            eventCard.style.display = 'none';
+        }, 5000);
+    });
+
+    engine.on('map:click', () => {
+        // Hide card when clicking empty space
+        eventCard.style.display = 'none';
+        if (currentCardTimeout) clearTimeout(currentCardTimeout);
+    });
+
+    engine.on('map:rightclick', ({ lat, lon }) => {
+        // Example: you can open a form to add an event here
+        console.log(`Right-click at ${lat}, ${lon} – ready to add event`);
+        // In a real app you'd show a modal with lat/lon pre-filled
+        alert(`Add event at ${lat.toFixed(5)}, ${lon.toFixed(5)}`);
+    });
+
+    engine.on('fetch:start', () => {
+        loadingToast.style.display = 'block';
+        hudTerrain.innerText = '⟳ loading map…';
+    });
+    engine.on('fetch:done', () => {
+        loadingToast.style.display = 'none';
+        // Terrain name will update via 'hud' event after fetch
+    });
+
+    // Elevation loader status (polling or event – simple interval)
+    setInterval(() => {
+        if (elevationLoader.status === 'ready') {
+            hudElevation.innerText = '▲ elevation ready';
+            hudElevation.style.color = '#5bc23a';
+        } else if (elevationLoader.status === 'loading') {
+            hudElevation.innerText = '⟳ loading elevation…';
+            hudElevation.style.color = '#a07830';
+        } else {
+            hudElevation.innerText = '⚠ elevation unavailable';
+            hudElevation.style.color = '#ef4444';
+        }
+    }, 500);
+
+    // Update nearby events when player moves
+    engine.on('player:move', () => updateNearbyCount());
+
+    // --------------------------------------------------------------
+    // 4. Connect UI buttons to Engine API
+    // --------------------------------------------------------------
+    document.getElementById('zoom-in').addEventListener('click', () => {
+        engine.camera.zoomIn(canvas.width / 2, canvas.height / 2);
+    });
+    document.getElementById('zoom-out').addEventListener('click', () => {
+        engine.camera.zoomOut(canvas.width / 2, canvas.height / 2);
+    });
+    document.getElementById('rot-left').addEventListener('click', () => {
+        engine.camera.rotateLeft();
+    });
+    document.getElementById('rot-right').addEventListener('click', () => {
+        engine.camera.rotateRight();
+    });
+
+    // Optional: initial centre camera on player
+    setTimeout(() => {
+        engine._centreCameraOnPlayer();
+    }, 100);
+</script>
+</body>
+</html>
