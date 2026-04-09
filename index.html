@@ -227,6 +227,7 @@
             this.solid = false;
             this.color = '#ff3333';
             this.label = '';
+            this.blocking = false;
         }
 
         render(ctx, cam, groundElevPx, extra) {
@@ -382,8 +383,8 @@
 
     function spawnBall() {
         if (!engine.playerEntity) return;
-        const tx = engine.playerEntity.tx;
-        const ty = engine.playerEntity.ty;
+        const tx = engine.playerEntity.tx + 1;
+        const ty = engine.playerEntity.ty + 1;
         const id = `ball_${Date.now()}_${ballIdCounter++}`;
         const ball = new BallEntity(id, tx, ty);
         engine.addEntity(ball);

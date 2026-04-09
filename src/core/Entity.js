@@ -26,6 +26,7 @@ export class Entity {
     this.visible = true;
 
     // Physics properties (Yaphe)
+    this.blocking = true;
     this.physicsEnabled = false;     // whether this entity participates in physics
     this.physicsRadius = 0.4;       // collision radius in tile units
     this.fixed = false;             // if true, particle is immovable

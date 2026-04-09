@@ -1,6 +1,7 @@
 /**
  * GOE Core — Engine (Unified Entity Version with Yaphe Physics)
- * Central render-loop orchestrator using a single Entity list and headless 2D physics.
+ * Player is non-physics (direct movement), balls and other objects are physics.
+ * Collisions between player and pushable objects apply a kick.
  */
 import { EventEmitter }      from './core/EventEmitter.js';
 import { Camera }            from './core/Camera.js';
@@ -33,62 +34,145 @@ import Vector2D       from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/vec
 
 import { Entity, ENTITY_TYPES } from './core/Entity.js';
 
-
+// ─────────────────────────────────────────────────────────────────────────────
+// PlayerEntity – direct movement, no physics
+// ─────────────────────────────────────────────────────────────────────────────
 class PlayerEntity extends Entity {
   constructor(id = 'player', tx = 40, ty = 40) {
     super(id, ENTITY_TYPES.PLAYER, tx, ty);
-    this.walkCycle = 0;
-    this.isMoving = false;
-    this.faceAngle = Math.PI / 2;
-    this.speedMult = 1.0;
-    // Player does NOT use physics – direct movement
-    this.physicsEnabled = false;
+    this.walkCycle  = 0;
+    this.isMoving   = false;
+    this.faceAngle  = Math.PI / 2;
+    this.speedMult  = 1.0;
+    this.physicsEnabled = true;
+    this.physicsRadius  = 0.5;
+    this.fixed          = false;
+
+    // Mirror of World2d's pathTraced — last N tile positions
+    this._posHistory    = [];
+    this._POS_HISTORY_MAX = 10;
   }
 
   update(dt, engine) {
     const input = engine._input;
-    const mv = input.getMovementVector();
+    const mv    = input.getMovementVector();
+
     if (mv) {
-      this.isMoving = true;
+      this.isMoving  = true;
       this.faceAngle = Math.atan2(-mv.dy, mv.dx);
+
       const cam = engine.camera;
-      const hw = tileHalfWidth(cam.zoom, cam.tileW);
-      const hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-      const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
-      const rx = (mv.dx / hw + mv.dy / hh) * 0.5;
-      const ry = (mv.dy / hh - mv.dx / hw) * 0.5;
-      const wx = rx * cr - ry * sr;
-      const wy = rx * sr + ry * cr;
+      const hw  = tileHalfWidth(cam.zoom, cam.tileW);
+      const hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+      const cr  = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
+      const rx  = (mv.dx / hw + mv.dy / hh) * 0.5;
+      const ry  = (mv.dy / hh - mv.dx / hw) * 0.5;
+      const wx  = rx * cr - ry * sr;
+      const wy  = rx * sr + ry * cr;
       const spd = (0.22 * this.speedMult) * dt * 60 / (Math.hypot(wx, wy) || 1);
+
       this.walkCycle += dt * 15 * this.speedMult;
+
       const newX = this.tx + wx * spd;
       const newY = this.ty + wy * spd;
+
+      // Only hard-block on fixed/solid entities (buildings, trees, fixed features)
+      // Dynamic entities (balls) are handled below via contact push
       let blocked = false;
       for (const other of engine.entities) {
         if (other === this) continue;
-        const dx = newX - other.tx;
-        const dy = newY - other.ty;
+        if (!other.fixed && !other.solid) continue;  // skip dynamic — physics handles them
+        const dx = newX - other.tx, dy = newY - other.ty;
         const minDist = this.bboxRadius + other.bboxRadius;
-        if (dx * dx + dy * dy < minDist * minDist) {
-          blocked = true;
-          break;
-        }
+        if (dx*dx + dy*dy < minDist*minDist) { blocked = true; break; }
       }
+
       if (!blocked) {
         this.tx = Math.max(0.5, Math.min(engine._mapW - 0.5, newX));
         this.ty = Math.max(0.5, Math.min(engine._mapH - 0.5, newY));
       }
     } else {
-      this.isMoving = false;
+      this.isMoving  = false;
       this.walkCycle = 0;
     }
+
+    // ── Contact-push dynamic physics entities (balls etc.) ───────────────
+    // The player is kinematic so Yaphe won't push balls on its own.
+    // We manually compute overlap and apply it as a Verlet impulse,
+    // exactly like World2d's mouse-throw: set prevPosition behind current
+    // so the integrator produces the right exit velocity.
+    for (const other of engine.entities) {
+      if (other === this || !other._particle || other.fixed) continue;
+
+      const dx   = other.tx - this.tx;
+      const dy   = other.ty - this.ty;
+      const dist = Math.hypot(dx, dy);
+      const minD = this.physicsRadius + other.physicsRadius;
+
+      if (dist < minD && dist > 0) {
+        // Direction to push the ball
+        const nx = dx / dist;
+        const ny = dy / dist;
+
+        // Overlap depth
+        const overlap = minD - dist;
+
+        // Carry the player's current velocity into the impulse.
+        // avgPos trails behind the player → velocity = pos - avgPos points forward.
+        const avg = this.getAverageHistoryPos();
+        const pvx = this.tx - avg.x;   // player velocity this frame (tile units)
+        const pvy = this.ty - avg.y;
+
+        // Project player velocity onto the contact normal
+        const dot = pvx * nx + pvy * ny;
+
+        // Exit velocity = overlap separation + player velocity component
+        const KICK_AMPLIFIER = 1.0;
+        const evx = nx * overlap + nx * Math.max(0, dot) * KICK_AMPLIFIER;
+        const evy = ny * overlap + ny * Math.max(0, dot) * KICK_AMPLIFIER;
+
+        const p = other._particle;
+        // Verlet: setting prevPosition behind position gives velocity = evx, evy
+        p.prevPosition.x = p.position.x - evx;
+        p.prevPosition.y = p.position.y - evy;
+
+        // Also push the particle position out of overlap immediately
+        // so Yaphe doesn't see a deep interpenetration and jitter
+        p.position.x += nx * overlap;
+        p.position.y += ny * overlap;
+      }
+    }
+
+    // ── Record position history ───────────────────────────────────────────
+    this._posHistory.push({ x: this.tx, y: this.ty });
+    if (this._posHistory.length > this._POS_HISTORY_MAX)
+      this._posHistory.shift();
+  }
+
+  // Returns the average of recent positions — equivalent to World2d's
+  // getAverageVector(pathTraced). Used to compute throw velocity.
+  getAverageHistoryPos() {
+    if (!this._posHistory.length) return { x: this.tx, y: this.ty };
+    const sum = this._posHistory.reduce(
+      (acc, p) => ({ x: acc.x + p.x, y: acc.y + p.y }),
+      { x: 0, y: 0 }
+    );
+    return {
+      x: sum.x / this._posHistory.length,
+      y: sum.y / this._posHistory.length,
+    };
   }
 
   render(ctx, cam, groundElevPx, extra) {
-    extra.playerRenderer.draw(this.tx, this.ty, groundElevPx + this.elevOffset, this, extra.mPerTile);
+    extra.playerRenderer.draw(
+      this.tx, this.ty, groundElevPx + this.elevOffset, this, extra.mPerTile
+    );
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// FeatureEntity – POIs, events, NPCs (optionally physical)
+// ─────────────────────────────────────────────────────────────────────────────
 class FeatureEntity extends Entity {
   constructor(id, tx, ty, data = {}) {
     super(id, ENTITY_TYPES.FEATURE, tx, ty);
@@ -97,6 +181,9 @@ class FeatureEntity extends Entity {
     this.color = data.color || '#60a5fa';
     this.ftype = resolveFeatureType(this.label, data.tags || {}, this.color);
     this.bboxRadius = 0.35;
+    this.physicsEnabled = data.physics === true;
+    this.physicsRadius = data.physicsRadius || 0.35;
+    this.fixed = data.fixed ?? true;
   }
 
   render(ctx, cam, groundElevPx, extra) {
@@ -104,6 +191,9 @@ class FeatureEntity extends Entity {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BuildingEntity – static obstacles
+// ─────────────────────────────────────────────────────────────────────────────
 class BuildingEntity extends Entity {
   constructor(id, tx, ty, footprintRadiusTiles, heightM, colorSet = null) {
     super(id, ENTITY_TYPES.BUILDING, tx, ty);
@@ -111,7 +201,6 @@ class BuildingEntity extends Entity {
     this.heightM = heightM;
     this.colorSet = colorSet;
     this.bboxRadius = footprintRadiusTiles;
-    // Buildings are static physics obstacles
     this.physicsEnabled = true;
     this.fixed = true;
     this.physicsRadius = footprintRadiusTiles;
@@ -134,6 +223,9 @@ class BuildingEntity extends Entity {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TreeEntity – static obstacles
+// ─────────────────────────────────────────────────────────────────────────────
 class TreeEntity extends Entity {
   constructor(id, tx, ty, treeType = 'deciduous', scale = 1.0, seed = 0) {
     super(id, ENTITY_TYPES.TREE, tx, ty);
@@ -141,7 +233,6 @@ class TreeEntity extends Entity {
     this.scale = scale;
     this.seed = seed;
     this.bboxRadius = 0.5;
-    // Trees are static obstacles
     this.physicsEnabled = true;
     this.fixed = true;
     this.physicsRadius = 0.5;
@@ -162,7 +253,6 @@ class TreeEntity extends Entity {
 const MAP_W        = 80;
 const MAP_H        = 80;
 const REFETCH_DIST = 18;
-const PLAYER_SPEED = 0.22;
 const M_PER_TILE   = 2;
 
 export class Engine extends EventEmitter {
@@ -194,9 +284,9 @@ export class Engine extends EventEmitter {
     this.playerEntity   = null;
     this._selectedId    = null;
 
-    // Physics world (will be created in mount)
+    // Physics world
     this.physicsWorld = null;
-    this.physicsEnabled = true;   // master toggle
+    this.physicsEnabled = true;
 
     // Terrain & loaders
     this.terrainRegistry = createTerrainRegistry(opts.terrainOverrides);
@@ -213,10 +303,7 @@ export class Engine extends EventEmitter {
       enabled:      opts.shadows      ?? true,
     };
 
-    // Slippy tile URL
-    this._tileURLFn = opts.tileURLFn ??
-      ((z,x,y) => `https://a.tile.openstreetmap.org/${z}/${x}/${y}.png`);
-
+    this._tileURLFn = opts.tileURLFn ?? ((z,x,y) => `https://a.tile.openstreetmap.org/${z}/${x}/${y}.png`);
     this._elevation = opts.elevationLoader ?? null;
 
     this.debugLayers = {
@@ -227,7 +314,6 @@ export class Engine extends EventEmitter {
       player:      true,
     };
 
-    // Cache / temp
     this._tileCache       = [];
     this._lastTileCamX    = null;
     this._lastTileCamY    = null;
@@ -247,15 +333,13 @@ export class Engine extends EventEmitter {
   // ── Physics helpers ─────────────────────────────────────────────────────
   _attachPhysics(entity) {
     if (!this.physicsWorld || !entity.physicsEnabled) return;
-    if (entity._particle) return; // already attached
+    if (entity._particle) return;
     const p = new Particle2D(entity.tx, entity.ty);
     p.radius = entity.physicsRadius;
     p.fixed = entity.fixed;
     p.isCollidable = true;
-    // Store reference
     entity._particle = p;
     this.physicsWorld.particles.push(p);
-    // The quadtree will be updated on next physicsWorld.update()
   }
 
   _detachPhysics(entity) {
@@ -282,8 +366,7 @@ export class Engine extends EventEmitter {
     this._shadows  = new ShadowSystem(this._ctx, this.camera, this._shadowOpts);
     this.treeR     = new TreeRenderer(this._ctx, cam, this._voxelR);
 
-    // Create physics world (bounds in tile units)
-    this.physicsWorld = new PhysicsWorld2D(this._mapW, this._mapH, 0.0); // zero gravity
+    this.physicsWorld = new PhysicsWorld2D(this._mapW, this._mapH, 0.0);
 
     const resize = () => {
       canvas.width  = canvas.offsetWidth  || window.innerWidth;
@@ -304,9 +387,9 @@ export class Engine extends EventEmitter {
 
     for (const loader of this._loaders) loader.init?.(this);
 
-    // Create player entity (no physics)
     this.playerEntity = new PlayerEntity('player', this._mapW/2, this._mapH/2);
     this.entities.push(this.playerEntity);
+    this._attachPhysics(this.playerEntity); 
 
     this._doFetch(this.geoCenter);
     this._lastT = 0;
@@ -356,7 +439,6 @@ export class Engine extends EventEmitter {
   }
 
   setFeatures(rawFeatures) {
-    // remove old features, keep other entity types
     const toRemove = this.entities.filter(e => e.type === ENTITY_TYPES.FEATURE);
     for (const e of toRemove) this._detachPhysics(e);
     this.entities = this.entities.filter(e => e.type !== ENTITY_TYPES.FEATURE);
@@ -382,7 +464,7 @@ export class Engine extends EventEmitter {
     if (feature.physicsEnabled) this._attachPhysics(feature);
   }
 
-  setParcels(parcels) { /* optional – can be stored separately or as entities */ }
+  setParcels(parcels) { /* optional */ }
   use(loader) { this._loaders.push(loader); return this; }
   setElevationLoader(loader) { this._elevation = loader; if (this._running && this.geoCenter) loader.prefetch?.(this.geoCenter); }
 
@@ -394,7 +476,7 @@ export class Engine extends EventEmitter {
     }
     this._lastFetchPos = { lat: 0, lon: 0 };
     this._fetching = false;
-    this._rebuildAllEntitiesGeo(); // re-project all entities to new centre
+    this._rebuildAllEntitiesGeo();
     this._centreCameraOnPlayer();
     this._doFetch(this.geoCenter);
   }
@@ -420,7 +502,6 @@ export class Engine extends EventEmitter {
       if (e.type === ENTITY_TYPES.PLAYER) continue;
       const geo = e.getGeo(this.geoCenter, this._mPerTile, this._mapW, this._mapH);
       e.setGeo(geo.lat, geo.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-      // If entity has a physics particle, update its position too
       if (e._particle) {
         e._particle.position.x = e.tx;
         e._particle.position.y = e.ty;
@@ -474,7 +555,6 @@ export class Engine extends EventEmitter {
     Promise.all(fetches).then(results => {
       const { x: pGX, y: pGY } = this._pGlobal();
 
-      // Process terrain updates
       for (const result of results) {
         if (result.terrainUpdates) this.terrainCache.merge(result.terrainUpdates);
         if (result.weatherUpdate && this.weather) {
@@ -484,15 +564,12 @@ export class Engine extends EventEmitter {
         }
       }
 
-      // Remove old building/feature/tree entities before adding new ones
       const keepTypes = [ENTITY_TYPES.PLAYER];
       const toRemove = this.entities.filter(e => !keepTypes.includes(e.type));
       for (const e of toRemove) this._detachPhysics(e);
       this.entities = this.entities.filter(e => keepTypes.includes(e.type));
 
-      // Add new entities from loaders
       for (const result of results) {
-        // Buildings
         if (result.buildingWays) {
           const buildings = preprocessBuildings(result.buildingWays);
           for (const b of buildings) {
@@ -506,28 +583,17 @@ export class Engine extends EventEmitter {
             this._attachPhysics(building);
           }
         }
-        // Features (POIs, events, NPCs)
         if (result.features) {
           for (const f of result.features) {
             const lat = f.latitude ?? f.lat;
             const lon = f.longitude ?? f.lon;
             if (lat == null || lon == null) continue;
             const pos = geoToTile(lat, lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-            if (f.data?.isProcedural) {
-              const tid = this.terrainCache.getLocal(pos.x, pos.y, pGX, pGY, this._mapW, this._mapH);
-              if (tid === TerrainType.GRASS || tid === TerrainType.FOREST) {
-                const feature = new FeatureEntity(f.id, pos.x, pos.y, f);
-                this.entities.push(feature);
-                if (feature.physicsEnabled) this._attachPhysics(feature);
-              }
-            } else {
-              const feature = new FeatureEntity(f.id, pos.x, pos.y, f);
-              this.entities.push(feature);
-              if (feature.physicsEnabled) this._attachPhysics(feature);
-            }
+            const feature = new FeatureEntity(f.id, pos.x, pos.y, f);
+            this.entities.push(feature);
+            if (feature.physicsEnabled) this._attachPhysics(feature);
           }
         }
-        // Trees from BioLoader (if any)
         if (result.trees) {
           for (const t of result.trees) {
             const pos = geoToTile(t.lat, t.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
@@ -559,7 +625,7 @@ export class Engine extends EventEmitter {
     if (topType) this.localTreeAsset = topType;
   }
 
-  // ── RENDER FRAME (with physics integration) ─────────────────────────────
+  // ── RENDER FRAME ─────────────────────────────────────────────────────────
   _frame(ts) {
     if (!this._running) return;
     this._raf = requestAnimationFrame(ts2 => this._frame(ts2));
@@ -573,7 +639,7 @@ export class Engine extends EventEmitter {
     const W      = canvas.width;
     const H      = canvas.height;
 
-    // 1. Update all entities (AI, animations, etc.)
+    // 1. Update all entities (player movement, AI, etc.)
     for (const e of this.entities) {
       e.update(dt, this);
     }
@@ -588,13 +654,41 @@ export class Engine extends EventEmitter {
     const { x: pGX, y: pGY } = this._pGlobal();
     const pElev = this._playerElev();
 
-    // 3. Physics step (only if enabled)
+    // 3. Physics step (only for particles, not the player)
     if (this.physicsWorld && this.physicsEnabled) {
-      // Optionally apply forces here (e.g., wind, player push)
+      if (this.playerEntity?._particle) {
+        const pp = this.playerEntity._particle;
+        // Carry the velocity the player produced this frame as a nudge impulse
+        // (prevPosition stays where it was so the quadtree sees the movement).
+        pp.position.x = this.playerEntity.tx;
+        pp.position.y = this.playerEntity.ty;
+      }
+      
       this.physicsWorld.update();
-      // Sync particle positions back to entities
+      // Sync particle positions back to their entities (except player)
       for (const e of this.entities) {
-        e.syncPhysics();
+        if (!e._particle) continue;
+
+        if (e === this.playerEntity) {
+          // Kinematic body: physics may have displaced the particle during
+          // collision resolution; reset it so it tracks input, not impulses.
+          e._particle.position.x     = e.tx;
+          e._particle.position.y     = e.ty;
+          e._particle.prevPosition.x = e.tx;
+          e._particle.prevPosition.y = e.ty;
+
+        } else if (e.fixed) {
+          // Static obstacles (buildings, trees): same – never let collision
+          // resolution drift them from their tile position.
+          e._particle.position.x     = e.tx;
+          e._particle.position.y     = e.ty;
+          e._particle.prevPosition.x = e.tx;
+          e._particle.prevPosition.y = e.ty;
+
+        } else {
+          // Dynamic bodies (balls etc.): let physics own the position.
+          e.syncPhysics();
+        }
       }
     }
 
@@ -638,7 +732,7 @@ export class Engine extends EventEmitter {
     this._voxelR.beginFrame();
     this._shadows.beginFrame();
 
-    // 8. Draw terrain tiles
+    // 8. Draw terrain tiles (unchanged)
     const overAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
     if (overAlpha > 0 && this.debugLayers.overpass) {
       const lod = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
@@ -665,7 +759,7 @@ export class Engine extends EventEmitter {
       }
     }
 
-    // 9. Draw building shadows (using physics particles for positions)
+    // 9. Draw building shadows
     if (this._shadows.enabled && cam.tilt > 0.05) {
       const buildingEntities = this.entities.filter(e => e.type === ENTITY_TYPES.BUILDING);
       const shadowList = [];
