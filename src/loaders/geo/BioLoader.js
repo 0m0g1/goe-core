@@ -12,47 +12,46 @@ export class BioLoader extends BaseLoader {
   get id() { return 'bio-loader'; }
 
   async fetch(geoCenter) {
-    const { lat, lon } = geoCenter;
-    const r = 0.005; 
-    // INCREASED LIMIT: 300 records to catch more real-life sightings
-    const url = `https://api.gbif.org/v1/occurrence/search?decimalLatitude=${lat-r},${lat+r}&decimalLongitude=${lon-r},${lon+r}&limit=300`;
+      const { lat, lon } = geoCenter;
+      const r = 0.005; 
+      const url = `https://api.gbif.org/v1/occurrence/search?decimalLatitude=${lat-r},${lat+r}&decimalLongitude=${lon-r},${lon+r}&limit=300`;
 
-    try {
-      const res = await fetch(url);
-      const data = await res.json();
-
-      // 1. Process Real API Results
-      const realFeatures = data.results.map(obs => this._mapRecord(obs));
-
-      // 2. Identify the "Local Vibe" (What species are actually here?)
-      const localFauna = realFeatures.filter(f => f.data.subType === 'animal');
-      
-      // 3. Procedural Spawning
-      // If we want a "Living World", we aim for at least 40 animals in the area
-      const TARGET_COUNT = 40;
-      const proceduralFeatures = [];
-      
-      if (localFauna.length < TARGET_COUNT) {
-        const needed = TARGET_COUNT - localFauna.length;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`GBIF Down: ${res.status}`); // Catch 503/404
         
-        // Pick a few "seeds" from real data so the fake animals match the real ones
-        const seeds = localFauna.length > 0 ? localFauna : [{ asset: 'bird' }, { asset: 'squirrel' }];
+        const data = await res.json();
 
-        for (let i = 0; i < needed; i++) {
-          const seed = seeds[Math.floor(Math.random() * seeds.length)];
-          proceduralFeatures.push(this._spawnAmbient(geoCenter, seed.asset || seed.ftype?.asset));
+        // ─── CRITICAL FIX: Check if results exist ───
+        const results = data.results || []; 
+        const realFeatures = results.map(obs => this._mapRecord(obs));
+
+        const localFauna = realFeatures.filter(f => f.data.subType === 'animal');
+        const TARGET_COUNT = 40;
+        const proceduralFeatures = [];
+        
+        if (localFauna.length < TARGET_COUNT) {
+          const needed = TARGET_COUNT - localFauna.length;
+          const seeds = localFauna.length > 0 ? localFauna : [{ asset: 'bird' }, { asset: 'squirrel' }];
+
+          for (let i = 0; i < needed; i++) {
+            const seed = seeds[Math.floor(Math.random() * seeds.length)];
+            // Ensure we pass a string asset name
+            const assetName = seed.asset || seed.data?.asset || 'bird';
+            proceduralFeatures.push(this._spawnAmbient(geoCenter, assetName));
+          }
         }
-      }
 
-      return {
-        features: [...realFeatures, ...proceduralFeatures]
-      };
-    } catch (e) {
-      console.error("BioLoader: API error", e);
-      // Fallback: Just spawn some generic birds/squirrels if API is down
-      return { features: Array.from({length: 20}, () => this._spawnAmbient(geoCenter, 'bird')) };
+        return { features: [...realFeatures, ...proceduralFeatures] };
+
+      } catch (e) {
+        console.warn("BioLoader: Using emergency offline fauna.", e.message);
+        // Fail gracefully: generate 20 random animals so the world isn't empty
+        return { 
+          features: Array.from({length: 20}, () => this._spawnAmbient(geoCenter, Math.random() > 0.5 ? 'bird' : 'squirrel')) 
+        };
+      }
     }
-  }
 
   _mapRecord(obs) {
     const tags = {

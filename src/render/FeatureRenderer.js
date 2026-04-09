@@ -136,127 +136,102 @@ export class FeatureRenderer {
   // ── Draw a single feature ──────────────────────────────────────────────────
 
   drawFeature(f, isSelected, terrainCache, pGlobalX, pGlobalY) {
-    const { ctx, cam, terrain, vr } = this;
-    const { tx, ty } = f;
+      const { ctx, cam, terrain, vr } = this;
+      const { tx, ty } = f;
 
-    const ftype = resolveFeatureType(f.data?.title ?? (f.data.label ?? ""), f.data?.tags ?? {}, f.color ?? '#60a5fa');
+      const ftype = resolveFeatureType(f.data?.title ?? (f.data.label ?? ""), f.data?.tags ?? {}, f.color ?? '#60a5fa');
+      const color = f.color ?? ftype.color;
+      const mode  = ftype.renderMode;
 
-    const color = f.color ?? ftype.color;
-    const mode  = ftype.renderMode;
-
-    const th    = terrain.heights[terrainCache.getLocal(tx, ty, pGlobalX, pGlobalY, cam.mapW, cam.mapH)] ?? 4;
-    const elev  = getElevOffset(th, cam.tilt, cam.zoom);
-    // ─── 1. CALCULATE VERTICAL STACK ───
-    const groundH = terrain.heights[terrainCache.getLocal(tx, ty, pGlobalX, pGlobalY, cam.mapW, cam.mapH)] ?? 4;
-    const groundElev = getElevOffset(groundH, cam.tilt, cam.zoom);
-    
-    let altitudeOffset = 0;
-    if (f.data?.category === 'aviation') {
-        // VISUAL TRICK: Scale real meters so planes stay on screen.
-        // We use a log scale or a heavy divisor so 10,000m isn't off-screen.
-        altitudeOffset = (f.data.altitude / 50) * 2; 
-    }
-    if (f.data?.category === 'traffic') altitudeOffset = 0.5;
-
-    // The "Actual" elevation for rendering
-    const finalElev = groundElev + altitudeOffset;
-
-    // Calculate screen position based on the ACTUAL height of the object
-    const center = worldToScreen(tx + 0.5, ty + 0.5, finalElev, cam);
-    const hw = tileHalfWidth(cam.zoom, cam.tileW);
-
-    // Off-screen cull (now respects altitude)
-    const cw = ctx.canvas.width, ch = ctx.canvas.height;
-    if (center.x < -hw * 4 || center.x > cw + hw * 4 || center.y < -hw * 4 || center.y > ch + hw * 4) return;
-    // 1. Trees
-    if (mode === 'tree') {
-      this._drawTree(f, ftype, elev, isSelected);
-      return;
-    }
-
-    // 2. Flat features
-    if (mode === 'flat') {
-      this._drawFlatDot(center, color, isSelected, hw, ftype.label);
-      return;
-    }
-
-    // 3. Blueprint lookup - Check tags aggressively to catch everything
-    const tags = f.data?.tags || {};
-    const keyCandidates = [
-      f.asset,                           // For Ecosystem trees
-      f.data?.asset,                     // Standard data override
-      f.data?.data?.asset,
-      tags.amenity, tags.shop, tags.leisure, tags.tourism, tags.building,
-      (f.data?.title || f.data?.label || "").toLowerCase().replace(/\s+/g, "_"),
-      ftype.asset
-    ];
-
-    let blueprint = null;
-    for (const cand of keyCandidates) {
-      if (cand && Blueprints[cand]) {
-        blueprint = Blueprints[cand];
-        break;
-      }
-    }
-
-    const isoA  = Math.min(1, Math.max(0, (cam.tilt - 0.18) / 0.28));
-    const flatA = Math.min(1, Math.max(0, (0.42  - cam.tilt) / 0.28));
-
-    // Flat view crossfade
-    if (flatA > 0.01) {
-      ctx.globalAlpha = flatA;
-      this._drawFlatDot(center, color, false, hw * 0.8, null); 
-      ctx.globalAlpha = 1;
-    }
-
-    // ISO View
-    if (isoA > 0.01) {
-      // ─── NEW: ALTITUDE LOGIC ───
+      // ─── 1. Unified Vertical Stack ───
+      const groundH = terrain.heights[terrainCache.getLocal(tx, ty, pGlobalX, pGlobalY, cam.mapW, cam.mapH)] ?? 4;
+      const groundElev = getElevOffset(groundH, cam.tilt, cam.zoom);
+      
       let altitudeOffset = 0;
       if (f.data?.category === 'aviation') {
-        // Convert real-world meters to voxel units (8 units = 1 tile)
-        // We use cam.zoom to scale the height visually
-        altitudeOffset = (f.data.altitude / this.cam.mPerTile) * 8;
+          // LOGARITHMIC SCALING: Keeps planes high, but always on screen
+          // 15 is the minimum flight height, then it grows slowly with real altitude
+          altitudeOffset = 15 + (Math.log10((f.data.altitude || 1000) + 1) * 6);
       }
-      if (f.data?.category === 'traffic') {
-          // Keep cars slightly above ground to prevent flickering
-          altitudeOffset = 0.5; 
+      if (f.data?.category === 'traffic') altitudeOffset = 0.5;
+
+      const finalElev = groundElev + altitudeOffset;
+
+      // Calculate screen center based on ACTUAL height
+      const center = worldToScreen(tx + 0.5, ty + 0.5, finalElev, cam);
+      const hw = tileHalfWidth(cam.zoom, cam.tileW);
+
+      // Off-screen cull (Respects the altitude now)
+      const cw = ctx.canvas.width, ch = ctx.canvas.height;
+      if (center.x < -hw * 4 || center.x > cw + hw * 4 || center.y < -hw * 4 || center.y > ch + hw * 4) return;
+
+      // 2. Trees (Trees don't fly, so they use ground elevation)
+      if (mode === 'tree') {
+        this._drawTree(f, ftype, groundElev, isSelected);
+        return;
       }
-      
-      // Pass the offset to beginTile
-      vr.beginTile(tx, ty, finalElev);
 
-      if (blueprint) {
-        blueprint.forEach(part => {
-          vr.box(part.x, part.y, part.z, part.w, part.h, part.d, 
-                 part.top || color, 
-                 part.right || shadeHex(color, 0.7), 
-                 part.front || shadeHex(color, 0.4));
-        });
-      } else {
-        // Generic Voxel Fallback (Replaces the 2D Sprite/Basic Tower)
-        const right = shadeHex(color, 0.6);
-        const front = shadeHex(color, 0.4);
-        const h = ftype.height ?? 4;
-        vr.box(-2, 0, -2, 4, h, 4, color, right, front);
-        // Add a clean contrasting cap so it looks like a POI marker, not a building
-        vr.box(-1, h, -1, 2, 1, 2, '#ffffff', '#e0e0e0', '#cccccc'); 
+      // 3. Flat features
+      if (mode === 'flat') {
+        this._drawFlatDot(center, color, isSelected, hw, ftype.label);
+        return;
       }
-      ctx.globalAlpha = 1;
-    }
 
-    // Label and Selection
-    if (hw > 14 && ftype.label && cam.tilt > 0.1) {
-      this._drawLabel(center, ftype.label, color, elev, hw);
-    }
-    if (isSelected) {
-      const t = this.frameNow * 0.002;
-      ctx.beginPath();
-      ctx.arc(center.x, center.y, Math.max(5, hw*(1.3 + Math.sin(t)*0.15)), 0, Math.PI*2);
-      ctx.strokeStyle = color+'99'; ctx.lineWidth = 2.5; ctx.stroke();
-    }
-  }
+      // 4. Blueprint lookup
+      const tags = f.data?.tags || {};
+      const keyCandidates = [
+        f.asset,                           
+        f.data?.asset,                     
+        f.data?.data?.asset,
+        tags.amenity, tags.shop, tags.leisure, tags.tourism, tags.building,
+        (f.data?.title || f.data?.label || "").toLowerCase().replace(/\s+/g, "_"),
+        ftype.asset
+      ];
 
+      let blueprint = null;
+      for (const cand of keyCandidates) {
+        if (cand && Blueprints[cand]) {
+          blueprint = Blueprints[cand];
+          break;
+        }
+      }
+
+      const isoA  = Math.min(1, Math.max(0, (cam.tilt - 0.18) / 0.28));
+      const flatA = Math.min(1, Math.max(0, (0.42  - cam.tilt) / 0.28));
+
+      // ISO View Rendering
+      if (isoA > 0.01) {
+        ctx.globalAlpha = isoA;
+        vr.beginTile(tx, ty, finalElev); // <── Corrected: Uses the unified elevation
+
+        if (blueprint) {
+          blueprint.forEach(part => {
+            vr.box(part.x, part.y, part.z, part.w, part.h, part.d, 
+                  part.top || color, 
+                  part.right || shadeHex(color, 0.7), 
+                  part.front || shadeHex(color, 0.4));
+          });
+        } else {
+          // Fallback for missing blueprints
+          const h = ftype.height ?? 4;
+          vr.box(-2, 0, -2, 4, h, 4, color, shadeHex(color, 0.6), shadeHex(color, 0.4));
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      // Label Rendering (Uses the 'center' which is already altitude-shifted)
+      if (hw > 12 && (f.label || ftype.label) && cam.tilt > 0.1) {
+        this._drawLabel(center, f.label || ftype.label, color, 0, hw);
+      }
+
+      if (isSelected) {
+        const t = this.frameNow * 0.002;
+        ctx.beginPath();
+        ctx.arc(center.x, center.y, Math.max(5, hw*(1.3 + Math.sin(t)*0.15)), 0, Math.PI*2);
+        ctx.strokeStyle = color+'99'; ctx.lineWidth = 2.5; ctx.stroke();
+      }
+    }
+    
   // ─── Tree rendering ────────────────────────────────────────────────────────
 
   _drawTree(f, ftype, elev, isSelected) {
