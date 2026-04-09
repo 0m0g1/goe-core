@@ -321,9 +321,10 @@
     // Setup Engine
     // --------------------------------------------------------------
     const canvas = document.getElementById('game-canvas');
-    const initialGeo = sampleEvents.length
-        ? { lat: sampleEvents[0].latitude, lon: sampleEvents[0].longitude }
-        : { lat: 51.505, lon: -0.09 };
+    
+    // --- FIX: Do NOT start on Battle of Hastings ---
+    // Instead, start at Trafalgar Square, London (safe location with no overlapping event)
+    const initialGeo = { lat: 51.5074, lon: -0.1278 };  // London Trafalgar Square
 
     const engine = new Engine({
         geoCenter: initialGeo,

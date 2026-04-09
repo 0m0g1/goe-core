@@ -10,57 +10,50 @@ import { lonToGlobalX, latToGlobalY } from '../math/geo.js';
 
 export class TerrainCache {
   constructor() {
-    /** @type {Map<string, number>} */
     this._data = new Map();
-    /** @type {number} The metres-per-tile constant (set by Engine). */
     this.mPerTile = 2;
+    this._originLat = 0;
+    this._originLon = 0;
   }
 
-  /** Store terrain at a global grid position. */
+  setOrigin(lat, lon) {
+    this._originLat = lat;
+    this._originLon = lon;
+  }
+
   set(gx, gy, terrainId) {
     this._data.set(`${gx},${gy}`, terrainId);
   }
 
-  setByKey(key, terrainId) {
-    this._data.set(key, terrainId);
-  }
-
-  /** Get terrain at a global grid position. Returns null if unknown. */
   get(gx, gy) {
     return this._data.get(`${gx},${gy}`) ?? null;
   }
 
-  getByKey(key) {
-    return this._data.get(key) ?? null;
-  }
-
-  /** Merge in a Map<key, terrainId> from a loader. */
-  merge(map) {
-    map.forEach((v, k) => this._data.set(k, v));
-  }
-
-  /** Convert a lat/lon to a global key using a reference latitude. */
-  toKey(lat, lon, refLat) {
-    return `${lonToGlobalX(lon, refLat, this.mPerTile)},${latToGlobalY(lat, this.mPerTile)}`;
+  keyFromLatLon(lat, lon) {
+    const gx = Math.round((lon - this._originLon) * (111320 * Math.cos(this._originLat * Math.PI / 180)) / this.mPerTile);
+    const gy = Math.round((lat - this._originLat) * 110574 / this.mPerTile);
+    return `${gx},${gy}`;
   }
 
   /**
-   * Resolve the terrain type for a LOCAL tile coordinate.
-   * @param {number} tx       Local tile X
-   * @param {number} ty       Local tile Y
-   * @param {number} pGlobalX Player's current global X (from center)
-   * @param {number} pGlobalY Player's current global Y
-   * @param {number} mapW
-   * @param {number} mapH
-   * @param {number} defaultTerrain
+   * Convert local tile coords (0..mapW, 0..mapH) to global key space.
+   * Tile (mapW/2, mapH/2) == global (pGX, pGY).
    */
-  
-  getLocal(tx, ty, pGlobalX, pGlobalY, mapW, mapH, defaultTerrain = 5) {
-    const gx = Math.round(tx) - Math.floor(mapW / 2) + pGlobalX;
-    const gy = Math.round(ty) - Math.floor(mapH / 2) + pGlobalY;
-    return this._data.get(`${gx},${gy}`) ?? defaultTerrain;
+  getLocal(tx, ty, pGX, pGY, mapW, mapH) {
+    const gx = Math.round(tx - mapW / 2 + pGX);
+    const gy = Math.round(ty - mapH / 2 + pGY);
+    return this._data.get(`${gx},${gy}`) ?? null;
   }
 
-  size() { return this._data.size; }
-  clear() { this._data.clear(); }
+  /**
+   * Debug helper — logs the first N keys in the cache so you can verify
+   * the coordinate space your loaders are writing into.
+   */
+  debugKeys(n = 10) {
+    const keys = [...this._data.keys()].slice(0, n);
+  }
+
+  merge(map) { map.forEach((v, k) => this._data.set(k, v)); }
+  clear()    { this._data.clear(); }
+  size()     { return this._data.size; }
 }
