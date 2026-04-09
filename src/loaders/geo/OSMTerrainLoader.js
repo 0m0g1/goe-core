@@ -306,6 +306,26 @@ export class OSMTerrainLoader extends BaseLoader {
               if (cls.type === 'polygon') rasterizePolygon(terrainUpdates, pts, cls.terrain);
               else                        rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width);
               if (el.tags?.building) buildingWays.push(el);
+
+              if (el.tags?.highway && ['primary', 'secondary', 'tertiary', 'residential'].includes(el.tags.highway)) {
+                // Only spawn a car on roughly every 3rd road way to keep performance up
+                if (Math.random() > 0.6) {
+                   features.push({
+                      id: `car:${el.id}`,
+                      latitude: el.geometry[0].lat,
+                      longitude: el.geometry[0].lon,
+                      label: 'Car',
+                      data: {
+                        category: 'traffic',
+                        asset: 'car_voxel',
+                        path: el.geometry, // The actual GPS nodes of the road
+                        progress: Math.random() * (el.geometry.length - 1),
+                        speed: 0.1 + Math.random() * 0.2 // Variable speed
+                      },
+                      renderMode: 'blueprint'
+                   });
+                }
+              }
             }
           }
 

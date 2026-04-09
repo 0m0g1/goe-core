@@ -365,7 +365,7 @@
 </script>
 
 <script type="module">
-    import { Engine, OSMTerrainLoader, BioLoader, ElevationLoader, ElevationFormat, WeatherLoader } from './src/GOECore.js';
+    import { Engine, OSMTerrainLoader, BioLoader, ElevationLoader, ElevationFormat, WeatherLoader, AviationLoader } from './src/GOECore.js';
 
     // --------------------------------------------------------------
     // NPCs & Events
@@ -474,6 +474,9 @@
     const apiKey = "b69650bacdb53e8000e14a735bb53035";
     const weatherLoader = new WeatherLoader(apiKey);
     engine.use(weatherLoader);
+
+    const aviationLoader = new AviationLoader(); // <── ADD THIS
+    engine.use(aviationLoader);
 
     const elevationLoader = new ElevationLoader(
         (z, x, y) => `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`,

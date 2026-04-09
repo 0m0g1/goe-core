@@ -270,6 +270,45 @@ export class Engine extends EventEmitter {
   rotateTo(radians) { this.camera.rotation = radians; }
 
 
+  _updateMovingFeatures(dt) {
+      this._features.forEach(f => {
+          // 1. AIRPLANE MOVEMENT (Linear Vector)
+          if (f.data?.category === 'aviation') {
+              const speed = (f.data.velocity || 200) * dt * 0.00001; 
+              const heading = (f.data.heading || 0) * (Math.PI / 180);
+              f.latitude += Math.cos(heading) * speed;
+              f.longitude += Math.sin(heading) * speed;
+              
+              // Sync the visual tile position
+              const pos = geoToTile(f.latitude, f.longitude, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+              f.tx = pos.x; f.ty = pos.y;
+          }
+
+          // 2. TRAFFIC MOVEMENT (Path Following)
+          if (f.data?.category === 'traffic' && f.data.path) {
+              const data = f.data;
+              data.progress += data.speed * dt * 10;
+              
+              // Loop car back to start of road way if it reaches the end
+              if (data.progress >= data.path.length - 1) data.progress = 0;
+
+              const idx = Math.floor(data.progress);
+              const nextIdx = idx + 1;
+              const t = data.progress % 1;
+
+              const p1 = data.path[idx];
+              const p2 = data.path[nextIdx];
+
+              // Linear interpolation between road nodes
+              const curLat = p1.lat + (p2.lat - p1.lat) * t;
+              const curLon = p1.lon + (p2.lon - p1.lon) * t;
+
+              const pos = geoToTile(curLat, curLon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+              f.tx = pos.x; f.ty = pos.y;
+          }
+      });
+  }
+
   // Add this method to Engine.js
 _updateLocalEcosystem() {
     const counts = {};
@@ -420,15 +459,10 @@ _updateLocalEcosystem() {
       Promise.all(fetches).then(results => {
         const { x: pGX, y: pGY } = this._pGlobal();
 
-        // 1. FIRST PASS: Handle Terrain, Buildings, and Weather
-        // We do this first so the TerrainCache is ready for our animal checks
+        // 1. FIRST PASS: Terrain, Buildings, Weather
         for (const result of results) {
-          if (result.terrainUpdates) {
-            this.terrainCache.merge(result.terrainUpdates);
-          }
-          if (result.buildingWays) {
-            this._buildings = preprocessBuildings(result.buildingWays);
-          }
+          if (result.terrainUpdates) this.terrainCache.merge(result.terrainUpdates);
+          if (result.buildingWays)   this._buildings = preprocessBuildings(result.buildingWays);
           if (result.weatherUpdate && this.weather) {
             this.weather.setMode(result.weatherUpdate.mode);
             this.weather.wind = result.weatherUpdate.wind;
@@ -436,31 +470,22 @@ _updateLocalEcosystem() {
           }
         }
 
-        // 2. SECOND PASS: Handle Features (with Procedural Filtering)
+        // 2. SECOND PASS: Features (Only add them ONCE here)
         results.forEach(result => {
           if (result.features) {
             result.features.forEach(f => {
               if (f.data?.isProcedural) {
-                // Project to tile space to check the ground
                 const pos = geoToTile(f.latitude, f.longitude, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
                 const terrainId = this.terrainCache.getLocal(pos.x, pos.y, pGX, pGY, this._mapW, this._mapH);
-                
-                // Only add if it's Grass (1) or Forest/Wood (7)
-                // This prevents squirrels spawning in the middle of a skyscraper
-                if (terrainId === 1 || terrainId === 7) { 
-                  this.addFeature(f);
-                }
+                if (terrainId === 1 || terrainId === 7) this.addFeature(f);
               } else {
-                // Always add real scientific sightings from GBIF/OSM
-                this.addFeature(f);
+                this.addFeature(f); // This handles real OSM POIs, Cars, and Planes
               }
             });
           }
         });
         
-        // 3. Update Ecosystem (Now that all features are added)
         this._updateLocalEcosystem();
-
         this._elevation?.prefetch?.(center);
         this._fetching = false;
         this.emit('fetch:done');
@@ -520,6 +545,8 @@ _updateLocalEcosystem() {
 
         const dt = Math.min((ts - this._lastT) / 1000, 0.05);
         this._lastT = ts;
+
+        this._updateMovingFeatures(dt);
 
         const cam    = this.camera;
         const canvas = this._canvas;

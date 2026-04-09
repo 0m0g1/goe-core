@@ -146,13 +146,28 @@ export class FeatureRenderer {
 
     const th    = terrain.heights[terrainCache.getLocal(tx, ty, pGlobalX, pGlobalY, cam.mapW, cam.mapH)] ?? 4;
     const elev  = getElevOffset(th, cam.tilt, cam.zoom);
-    const center = worldToScreen(tx+0.5, ty+0.5, elev, cam);
-    const hw    = tileHalfWidth(cam.zoom, cam.tileW);
+    // ─── 1. CALCULATE VERTICAL STACK ───
+    const groundH = terrain.heights[terrainCache.getLocal(tx, ty, pGlobalX, pGlobalY, cam.mapW, cam.mapH)] ?? 4;
+    const groundElev = getElevOffset(groundH, cam.tilt, cam.zoom);
+    
+    let altitudeOffset = 0;
+    if (f.data?.category === 'aviation') {
+        // VISUAL TRICK: Scale real meters so planes stay on screen.
+        // We use a log scale or a heavy divisor so 10,000m isn't off-screen.
+        altitudeOffset = (f.data.altitude / 50) * 2; 
+    }
+    if (f.data?.category === 'traffic') altitudeOffset = 0.5;
 
-    // Off-screen cull
+    // The "Actual" elevation for rendering
+    const finalElev = groundElev + altitudeOffset;
+
+    // Calculate screen position based on the ACTUAL height of the object
+    const center = worldToScreen(tx + 0.5, ty + 0.5, finalElev, cam);
+    const hw = tileHalfWidth(cam.zoom, cam.tileW);
+
+    // Off-screen cull (now respects altitude)
     const cw = ctx.canvas.width, ch = ctx.canvas.height;
-    if (center.x < -hw*4 || center.x > cw+hw*4 || center.y < -hw*4 || center.y > ch+hw*4) return;
-
+    if (center.x < -hw * 4 || center.x > cw + hw * 4 || center.y < -hw * 4 || center.y > ch + hw * 4) return;
     // 1. Trees
     if (mode === 'tree') {
       this._drawTree(f, ftype, elev, isSelected);
@@ -196,8 +211,20 @@ export class FeatureRenderer {
 
     // ISO View
     if (isoA > 0.01) {
-      ctx.globalAlpha = isoA;
-      vr.beginTile(tx, ty, elev);
+      // ─── NEW: ALTITUDE LOGIC ───
+      let altitudeOffset = 0;
+      if (f.data?.category === 'aviation') {
+        // Convert real-world meters to voxel units (8 units = 1 tile)
+        // We use cam.zoom to scale the height visually
+        altitudeOffset = (f.data.altitude / this.cam.mPerTile) * 8;
+      }
+      if (f.data?.category === 'traffic') {
+          // Keep cars slightly above ground to prevent flickering
+          altitudeOffset = 0.5; 
+      }
+      
+      // Pass the offset to beginTile
+      vr.beginTile(tx, ty, finalElev);
 
       if (blueprint) {
         blueprint.forEach(part => {
