@@ -1,6 +1,6 @@
 /**
- * GOE Core — Engine (Unified Entity Version)
- * Central render-loop orchestrator using a single Entity list.
+ * GOE Core — Engine (Unified Entity Version with Yaphe Physics)
+ * Central render-loop orchestrator using a single Entity list and headless 2D physics.
  */
 import { EventEmitter }      from './core/EventEmitter.js';
 import { Camera }            from './core/Camera.js';
@@ -24,9 +24,15 @@ import {
 } from './math/geo.js';
 import { preprocessBuildings } from './loaders/geo/BuildingPreprocessor.js';
 import { WeatherSystem } from './render/WeatherSystem.js';
+// Yaphe headless physics (CDN)
+import PhysicsWorld2D from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/physicsworld2d.js';
+import Particle2D     from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/particle2d.js';
+import Spring2D       from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/spring2d.js';
+import Constraint2D   from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/constraint2d.js';
+import Vector2D       from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/vector2d.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Entity system – base classes (can be moved to separate files later)
+// Entity system – base classes with physics support
 // ─────────────────────────────────────────────────────────────────────────────
 export const ENTITY_TYPES = {
   PLAYER:    'player',
@@ -46,8 +52,14 @@ class Entity {
     this.tx = tx;
     this.ty = ty;
     this.elevOffset = elevOffset;   // additional px above ground
-    this.bboxRadius = 0.4;          // tile units
+    this.bboxRadius = 0.4;          // tile units (for manual collision checks)
     this.visible = true;
+
+    // Physics properties (Yaphe)
+    this.physicsEnabled = false;     // whether this entity participates in physics
+    this.physicsRadius = 0.4;       // collision radius in tile units
+    this.fixed = false;             // if true, particle is immovable
+    this._particle = null;          // reference to Yaphe Particle2D
   }
 
   getGeo(geoCenter, mPerTile, mapW, mapH) {
@@ -58,6 +70,24 @@ class Entity {
     const pos = geoToTile(lat, lon, geoCenter, mPerTile, mapW, mapH);
     this.tx = pos.x;
     this.ty = pos.y;
+  }
+
+  // Sync physics particle position back to entity
+  syncPhysics() {
+    if (this._particle) {
+      this.tx = this._particle.position.x;
+      this.ty = this._particle.position.y;
+    }
+  }
+
+  // Remove physics particle from the world (call before removing entity)
+  removePhysics(physicsWorld) {
+    if (this._particle && physicsWorld) {
+      const idx = physicsWorld.particles.indexOf(this._particle);
+      if (idx !== -1) physicsWorld.particles.splice(idx, 1);
+      // Also remove from quadtree? PhysicsWorld2D handles that in its update.
+      this._particle = null;
+    }
   }
 
   render(ctx, cam, groundElevPx, extra) {
@@ -83,6 +113,8 @@ class PlayerEntity extends Entity {
     this.isMoving = false;
     this.faceAngle = Math.PI / 2;
     this.speedMult = 1.0;
+    // Player does NOT use physics – direct movement
+    this.physicsEnabled = false;
   }
 
   update(dt, engine) {
@@ -151,6 +183,10 @@ class BuildingEntity extends Entity {
     this.heightM = heightM;
     this.colorSet = colorSet;
     this.bboxRadius = footprintRadiusTiles;
+    // Buildings are static physics obstacles
+    this.physicsEnabled = true;
+    this.fixed = true;
+    this.physicsRadius = footprintRadiusTiles;
   }
 
   render(ctx, cam, groundElevPx, extra) {
@@ -177,6 +213,10 @@ class TreeEntity extends Entity {
     this.scale = scale;
     this.seed = seed;
     this.bboxRadius = 0.5;
+    // Trees are static obstacles
+    this.physicsEnabled = true;
+    this.fixed = true;
+    this.physicsRadius = 0.5;
   }
 
   render(ctx, cam, groundElevPx, extra) {
@@ -226,6 +266,10 @@ export class Engine extends EventEmitter {
     this.playerEntity   = null;
     this._selectedId    = null;
 
+    // Physics world (will be created in mount)
+    this.physicsWorld = null;
+    this.physicsEnabled = true;   // master toggle
+
     // Terrain & loaders
     this.terrainRegistry = createTerrainRegistry(opts.terrainOverrides);
     this.terrainCache    = new TerrainCache();
@@ -272,6 +316,28 @@ export class Engine extends EventEmitter {
   get buildings() { return this.entities.filter(e => e.type === ENTITY_TYPES.BUILDING); }
   get trees() { return this.entities.filter(e => e.type === ENTITY_TYPES.TREE); }
 
+  // ── Physics helpers ─────────────────────────────────────────────────────
+  _attachPhysics(entity) {
+    if (!this.physicsWorld || !entity.physicsEnabled) return;
+    if (entity._particle) return; // already attached
+    const p = new Particle2D(entity.tx, entity.ty);
+    p.radius = entity.physicsRadius;
+    p.fixed = entity.fixed;
+    p.isCollidable = true;
+    // Store reference
+    entity._particle = p;
+    this.physicsWorld.particles.push(p);
+    // The quadtree will be updated on next physicsWorld.update()
+  }
+
+  _detachPhysics(entity) {
+    if (entity._particle && this.physicsWorld) {
+      const idx = this.physicsWorld.particles.indexOf(entity._particle);
+      if (idx !== -1) this.physicsWorld.particles.splice(idx, 1);
+      entity._particle = null;
+    }
+  }
+
   // ── MOUNT ────────────────────────────────────────────────────────────────
   mount(canvas) {
     if (this._running) return;
@@ -287,6 +353,9 @@ export class Engine extends EventEmitter {
     this._osmLayer = new OSMLayerRenderer(this._ctx, cam, this._tileURLFn);
     this._shadows  = new ShadowSystem(this._ctx, this.camera, this._shadowOpts);
     this.treeR     = new TreeRenderer(this._ctx, cam, this._voxelR);
+
+    // Create physics world (bounds in tile units)
+    this.physicsWorld = new PhysicsWorld2D(this._mapW, this._mapH, 0.0); // zero gravity
 
     const resize = () => {
       canvas.width  = canvas.offsetWidth  || window.innerWidth;
@@ -307,7 +376,7 @@ export class Engine extends EventEmitter {
 
     for (const loader of this._loaders) loader.init?.(this);
 
-    // Create player entity
+    // Create player entity (no physics)
     this.playerEntity = new PlayerEntity('player', this._mapW/2, this._mapH/2);
     this.entities.push(this.playerEntity);
 
@@ -340,11 +409,16 @@ export class Engine extends EventEmitter {
 
   addEntity(entity) {
     this.entities.push(entity);
+    if (entity.physicsEnabled) this._attachPhysics(entity);
   }
 
   removeEntity(id) {
     const idx = this.entities.findIndex(e => e.id === id);
-    if (idx !== -1) this.entities.splice(idx, 1);
+    if (idx !== -1) {
+      const ent = this.entities[idx];
+      this._detachPhysics(ent);
+      this.entities.splice(idx, 1);
+    }
   }
 
   selectEntity(id) {
@@ -355,13 +429,17 @@ export class Engine extends EventEmitter {
 
   setFeatures(rawFeatures) {
     // remove old features, keep other entity types
+    const toRemove = this.entities.filter(e => e.type === ENTITY_TYPES.FEATURE);
+    for (const e of toRemove) this._detachPhysics(e);
     this.entities = this.entities.filter(e => e.type !== ENTITY_TYPES.FEATURE);
     for (const f of rawFeatures) {
       const lat = f.latitude ?? f.lat;
       const lon = f.longitude ?? f.lon;
       if (lat == null || lon == null) continue;
       const pos = geoToTile(lat, lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-      this.entities.push(new FeatureEntity(f.id, pos.x, pos.y, f));
+      const feature = new FeatureEntity(f.id, pos.x, pos.y, f);
+      this.entities.push(feature);
+      if (feature.physicsEnabled) this._attachPhysics(feature);
     }
     this.emit('features:changed', this.features);
   }
@@ -371,7 +449,9 @@ export class Engine extends EventEmitter {
     const lon = f.longitude ?? f.lon;
     if (lat == null || lon == null) return;
     const pos = geoToTile(lat, lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-    this.entities.push(new FeatureEntity(f.id, pos.x, pos.y, f));
+    const feature = new FeatureEntity(f.id, pos.x, pos.y, f);
+    this.entities.push(feature);
+    if (feature.physicsEnabled) this._attachPhysics(feature);
   }
 
   setParcels(parcels) { /* optional – can be stored separately or as entities */ }
@@ -412,6 +492,11 @@ export class Engine extends EventEmitter {
       if (e.type === ENTITY_TYPES.PLAYER) continue;
       const geo = e.getGeo(this.geoCenter, this._mPerTile, this._mapW, this._mapH);
       e.setGeo(geo.lat, geo.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+      // If entity has a physics particle, update its position too
+      if (e._particle) {
+        e._particle.position.x = e.tx;
+        e._particle.position.y = e.ty;
+      }
     }
   }
 
@@ -473,6 +558,8 @@ export class Engine extends EventEmitter {
 
       // Remove old building/feature/tree entities before adding new ones
       const keepTypes = [ENTITY_TYPES.PLAYER];
+      const toRemove = this.entities.filter(e => !keepTypes.includes(e.type));
+      for (const e of toRemove) this._detachPhysics(e);
       this.entities = this.entities.filter(e => keepTypes.includes(e.type));
 
       // Add new entities from loaders
@@ -488,6 +575,7 @@ export class Engine extends EventEmitter {
             const colorSet = this.terrainRegistry.colors[TerrainType.BUILDING];
             const building = new BuildingEntity(`building_${b.id || Math.random()}`, pos.x, pos.y, halfSideTiles, b.heightM, colorSet);
             this.entities.push(building);
+            this._attachPhysics(building);
           }
         }
         // Features (POIs, events, NPCs)
@@ -500,10 +588,14 @@ export class Engine extends EventEmitter {
             if (f.data?.isProcedural) {
               const tid = this.terrainCache.getLocal(pos.x, pos.y, pGX, pGY, this._mapW, this._mapH);
               if (tid === TerrainType.GRASS || tid === TerrainType.FOREST) {
-                this.entities.push(new FeatureEntity(f.id, pos.x, pos.y, f));
+                const feature = new FeatureEntity(f.id, pos.x, pos.y, f);
+                this.entities.push(feature);
+                if (feature.physicsEnabled) this._attachPhysics(feature);
               }
             } else {
-              this.entities.push(new FeatureEntity(f.id, pos.x, pos.y, f));
+              const feature = new FeatureEntity(f.id, pos.x, pos.y, f);
+              this.entities.push(feature);
+              if (feature.physicsEnabled) this._attachPhysics(feature);
             }
           }
         }
@@ -511,7 +603,9 @@ export class Engine extends EventEmitter {
         if (result.trees) {
           for (const t of result.trees) {
             const pos = geoToTile(t.lat, t.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-            this.entities.push(new TreeEntity(`tree_${t.id || Math.random()}`, pos.x, pos.y, t.species || 'deciduous', 1.0, t.seed || 0));
+            const tree = new TreeEntity(`tree_${t.id || Math.random()}`, pos.x, pos.y, t.species || 'deciduous', 1.0, t.seed || 0);
+            this.entities.push(tree);
+            this._attachPhysics(tree);
           }
         }
       }
@@ -537,7 +631,7 @@ export class Engine extends EventEmitter {
     if (topType) this.localTreeAsset = topType;
   }
 
-  // ── RENDER FRAME ─────────────────────────────────────────────────────────
+  // ── RENDER FRAME (with physics integration) ─────────────────────────────
   _frame(ts) {
     if (!this._running) return;
     this._raf = requestAnimationFrame(ts2 => this._frame(ts2));
@@ -551,7 +645,7 @@ export class Engine extends EventEmitter {
     const W      = canvas.width;
     const H      = canvas.height;
 
-    // 1. Update all entities
+    // 1. Update all entities (AI, animations, etc.)
     for (const e of this.entities) {
       e.update(dt, this);
     }
@@ -566,14 +660,24 @@ export class Engine extends EventEmitter {
     const { x: pGX, y: pGY } = this._pGlobal();
     const pElev = this._playerElev();
 
-    // 3. Centre camera on player if moving in ISO mode
+    // 3. Physics step (only if enabled)
+    if (this.physicsWorld && this.physicsEnabled) {
+      // Optionally apply forces here (e.g., wind, player push)
+      this.physicsWorld.update();
+      // Sync particle positions back to entities
+      for (const e of this.entities) {
+        e.syncPhysics();
+      }
+    }
+
+    // 4. Centre camera on player if moving in ISO mode
     if (cam.tilt > 0.08 && this.playerEntity) {
       const { x: px, y: py } = worldToScreen(this.playerEntity.tx, this.playerEntity.ty, pElev, { ...cam, camX: 0, camY: 0 });
       cam.camX += (px - W/2 - cam.camX) * 0.08;
       cam.camY += (py - H/2 - cam.camY) * 0.08;
     }
 
-    // 4. World re‑centre if player moved too far
+    // 5. World re‑centre if player moved too far
     if (this.playerEntity) {
       const dFC = Math.hypot(this.playerEntity.tx - this._mapW/2, this.playerEntity.ty - this._mapH/2);
       if (dFC > REFETCH_DIST && !this._fetching) {
@@ -591,7 +695,7 @@ export class Engine extends EventEmitter {
       }
     }
 
-    // 5. Prepare render list sorted by depth
+    // 6. Prepare render list sorted by depth
     const renderList = [];
     for (const e of this.entities) {
       if (!e.visible) continue;
@@ -600,13 +704,13 @@ export class Engine extends EventEmitter {
     }
     renderList.sort((a,b) => a.depth - b.depth);
 
-    // 6. Clear canvas
+    // 7. Clear canvas
     ctx.fillStyle = this.weather?.mode === 'rain' ? '#020308' : '#04060a';
     ctx.fillRect(0, 0, W, H);
     this._voxelR.beginFrame();
     this._shadows.beginFrame();
 
-    // 7. Draw terrain tiles
+    // 8. Draw terrain tiles
     const overAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
     if (overAlpha > 0 && this.debugLayers.overpass) {
       const lod = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
@@ -633,7 +737,7 @@ export class Engine extends EventEmitter {
       }
     }
 
-    // 8. Draw building shadows
+    // 9. Draw building shadows (using physics particles for positions)
     if (this._shadows.enabled && cam.tilt > 0.05) {
       const buildingEntities = this.entities.filter(e => e.type === ENTITY_TYPES.BUILDING);
       const shadowList = [];
@@ -648,7 +752,7 @@ export class Engine extends EventEmitter {
       this._shadows.drawBuildingShadows(shadowList);
     }
 
-    // 9. Render all entities (including player, buildings, features, trees)
+    // 10. Render all entities
     for (const { e } of renderList) {
       const groundH = this.terrainRegistry.heights[this.terrainCache.getLocal(e.tx, e.ty, pGX, pGY, this._mapW, this._mapH)] ?? 4;
       const groundElevPx = getElevOffset(groundH, cam.tilt, cam.zoom);
@@ -665,10 +769,10 @@ export class Engine extends EventEmitter {
       });
     }
 
-    // 10. Weather overlay
+    // 11. Weather overlay
     if (this.weather) this.weather.draw();
 
-    // 11. Emit HUD info
+    // 12. Emit HUD info
     if (this.playerEntity) {
       const geo = this.playerEntity.getGeo(this.geoCenter, this._mPerTile, this._mapW, this._mapH);
       this.emit('hud', {
@@ -680,7 +784,7 @@ export class Engine extends EventEmitter {
     }
   }
 
-  // ── CLICK HANDLER ────────────────────────────────────────────────────────
+  // ── CLICK HANDLER (unchanged) ───────────────────────────────────────────
   _handleClick({ x: cx, y: cy, button }) {
     if (button === 2) {
       const wPos = screenToWorld(cx, cy, this.camera);

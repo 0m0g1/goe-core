@@ -181,48 +181,36 @@ export class TileRenderer {
 
   // ── LOD helpers (unchanged from V1) ──────────────────────────────────────
 
-  drawMergedBlock(blockX, blockY, lod, terrainCache, pGX, pGY, alpha) {
+drawMergedBlock(blockX, blockY, lod, terrainCache, pGX, pGY, alpha) {
     const { ctx, cam, terrain } = this;
     const mapW = cam.mapW, mapH = cam.mapH;
-    const W = ctx.canvas.width, H = ctx.canvas.height;
 
     const centerLocal = {
       tx: blockX + lod / 2 - pGX + mapW / 2,
       ty: blockY + lod / 2 - pGY + mapH / 2,
     };
+    
     const sc = worldToScreen(centerLocal.tx, centerLocal.ty, 0, cam);
-    const blockScreenSize = lod * (cam.tileW * cam.zoom * 0.5) * 2;
-    if (sc.x < -blockScreenSize || sc.x > W + blockScreenSize ||
-        sc.y < -blockScreenSize || sc.y > H + blockScreenSize) return;
+    const blockScreenSize = lod * (cam.tileW * cam.zoom);
+    if (sc.x < -blockScreenSize || sc.x > ctx.canvas.width + blockScreenSize ||
+        sc.y < -blockScreenSize || sc.y > ctx.canvas.height + blockScreenSize) return;
 
-    const typeCounts = new Map();
-    let totalTiles = 0;
-    for (let dy = 0; dy < lod; dy++) {
-      for (let dx = 0; dx < lod; dx++) {
-        const tid = terrainCache.get(blockX + dx, blockY + dy);
-        if (tid !== null) {
-          typeCounts.set(tid, (typeCounts.get(tid) || 0) + 1);
-          totalTiles++;
-        }
+    // Fast Color Averaging
+    let r = 0, g = 0, b = 0, count = 0;
+    for (let dy = 0; dy < lod; dy += Math.max(1, Math.floor(lod/2))) {
+      for (let dx = 0; dx < lod; dx += Math.max(1, Math.floor(lod/2))) {
+        const tid = terrainCache.get(blockX + dx, blockY + dy) ?? 5;
+        const col = terrain.colors[tid]?.flat || '#5bc23a';
+        r += parseInt(col.slice(1, 3), 16);
+        g += parseInt(col.slice(3, 5), 16);
+        b += parseInt(col.slice(5, 7), 16);
+        count++;
       }
     }
-    if (totalTiles === 0) return;
+    
+    const fillStyle = `rgb(${Math.round(r/count)},${Math.round(g/count)},${Math.round(b/count)})`;
 
-    let r = 0, g = 0, b = 0;
-    for (const [tid, count] of typeCounts) {
-      const col = terrain.colors[tid]?.flat || '#5bc23a';
-      r += parseInt(col.slice(1, 3), 16) * count;
-      g += parseInt(col.slice(3, 5), 16) * count;
-      b += parseInt(col.slice(5, 7), 16) * count;
-    }
-    r = Math.round(r / totalTiles);
-    g = Math.round(g / totalTiles);
-    b = Math.round(b / totalTiles);
-
-    const toLocal = (gx, gy) => ({
-      tx: gx - pGX + mapW / 2,
-      ty: gy - pGY + mapH / 2,
-    });
+    const toLocal = (gx, gy) => ({ tx: gx - pGX + mapW / 2, ty: gy - pGY + mapH / 2 });
     const pts = [
       toLocal(blockX,       blockY),
       toLocal(blockX + lod, blockY),
@@ -230,13 +218,23 @@ export class TileRenderer {
       toLocal(blockX,       blockY + lod),
     ].map(c => worldToScreen(c.tx, c.ty, 0, cam));
 
+    ctx.save();
     ctx.globalAlpha = alpha;
     ctx.beginPath();
     pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
     ctx.closePath();
-    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    
+    ctx.fillStyle = fillStyle;
     ctx.fill();
-    ctx.globalAlpha = 1;
+
+    // ── THE CRITICAL SEAM FIX ──
+    // Drawing a thin stroke of the same color bridges the 1px anti-aliasing 
+    // gap between adjacent LOD blocks.
+    ctx.strokeStyle = fillStyle;
+    ctx.lineWidth = 1.2; 
+    ctx.stroke();
+
+    ctx.restore();
   }
 
   drawMergedLayer(terrainCache, pGX, pGY, lod, alpha) {

@@ -338,12 +338,19 @@ export function decorateBuildingFacade(ctx, cam, buildingEntry, vr, seed = 0) {
   const hw = tileHalfWidth(cam.zoom, cam.tileW);
   if (hw < 6 || cam.tilt < 0.1) return;
 
+  // Guard: ensure necessary properties exist
+  if (!p || typeof p.x !== 'number' || typeof p.y !== 'number' || !tc || !vr?.proj) return;
+
   const snap = ((Math.round(cam.rotation / (Math.PI / 2)) % 4) + 4) % 4;
   const x = -r, z = -r, w = r*2, d = r*2, h = engineH;
 
   const vp = (px, py, pz) => {
+    // Ensure beginTile receives valid numbers
+    if (typeof buildingEntry.elev !== 'number') return null;
     vr.beginTile(p.x, p.y, buildingEntry.elev);
-    return vr.proj(px, py, pz);
+    const point = vr.proj(px, py, pz);
+    // Return a valid point object or null
+    return (point && typeof point.x === 'number') ? point : null;
   };
 
   let faceA, faceB;
@@ -360,6 +367,10 @@ export function decorateBuildingFacade(ctx, cam, buildingEntry, vr, seed = 0) {
     faceA = [vp(x,0,z),     vp(x+w,0,z),   vp(x+w,h,z),   vp(x,h,z)];
     faceB = [vp(x+w,0,z),   vp(x+w,h,z),   vp(x+w,h,z+d), vp(x+w,0,z+d)];
   }
+
+  // Validate that both faces have 4 valid points
+  const isValidFace = (face) => face.length === 4 && face.every(p => p && typeof p.x === 'number');
+  if (!isValidFace(faceA) || !isValidFace(faceB)) return;
 
   const floors     = Math.max(1, Math.round((engineH / VU) * 0.7));
   const colsA      = Math.max(2, Math.round(r / VU * 3));
@@ -380,6 +391,8 @@ export function decorateBuildingFacade(ctx, cam, buildingEntry, vr, seed = 0) {
     const tr = vp(x+w, h, z);
     const br = vp(x+w, h, z+d);
     const bl = vp(x,   h, z+d);
+    // Validate roof points
+    if (!tl || !tr || !br || !bl) return;
     ctx.beginPath();
     ctx.moveTo(tl.x,tl.y); ctx.lineTo(tr.x,tr.y);
     ctx.lineTo(br.x,br.y); ctx.lineTo(bl.x,bl.y);
