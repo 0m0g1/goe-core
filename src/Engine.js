@@ -27,6 +27,7 @@ import {
   geoToTile, tileToGeo, lonToGlobalX, latToGlobalY,
 } from './math/geo.js';
 import { preprocessBuildings } from './loaders/geo/BuildingPreprocessor.js';
+import { WeatherSystem } from './render/WeatherSystem.js';
 
 const MAP_W        = 80;
 const MAP_H        = 80;
@@ -117,6 +118,9 @@ export class Engine extends EventEmitter {
 
     this._lastBuildingRot = null;
     this._cachedDrawList  = [];
+
+    this.weather = null;
+    this.localTreeAsset = 'tree'; // Default
   }
 
   // ── MOUNT ──────────────────────────────────────────────────────────────────
@@ -166,6 +170,9 @@ export class Engine extends EventEmitter {
       this._centreCameraOnPlayer();
       this._frame(ts);
     });
+
+    this.weather = new WeatherSystem(this._ctx, this.camera);
+    this.weather.setMode('none'); // Test it out!
 
     return this;
   }
@@ -262,29 +269,98 @@ export class Engine extends EventEmitter {
   /** Programmatic rotate. */
   rotateTo(radians) { this.camera.rotation = radians; }
 
+
+  // Add this method to Engine.js
+_updateLocalEcosystem() {
+    const counts = {};
+    
+    // 1. Scan BioLoader data to find the local "Dominant Species"
+    this._features.forEach(f => {
+      // Check if it's a scientific plant record from BioLoader
+      if (f.data?.subType === 'plant' && f.data?.tags?.genus) {
+        const genus = f.data.tags.genus;
+        counts[genus] = (counts[genus] || 0) + 1;
+      }
+    });
+
+    // 2. Determine the winner
+    let topGenus = null;
+    let max = 0;
+    for (const [genus, count] of Object.entries(counts)) {
+      if (count > max) { max = count; topGenus = genus; }
+    }
+
+    // 3. Mapping Genus -> Human Label & Voxel Blueprint
+    const speciesMap = {
+      'anemone':    { label: 'Windflower',  asset: 'flower_anemone' },
+      'fagus':      { label: 'Beech Tree',  asset: 'tree_oak' },
+      'quercus':    { label: 'Oak Tree',    asset: 'tree_oak' },
+      'pinus':      { label: 'Pine Tree',   asset: 'tree_pine' },
+      'picea':      { label: 'Spruce Tree', asset: 'tree_pine' },
+      'phoenix':    { label: 'Palm Tree',   asset: 'tree_palm' },
+      'anthriscus': { label: 'Cow Parsley', asset: 'flower_wild' }
+    };
+
+    const localIdentity = speciesMap[topGenus] || { label: 'Wild Tree', asset: 'tree' };
+
+    // 4. IDENTITY GRAFTING: Loop through all features
+    this._features.forEach(f => {
+      const isOSMTree = f.data?.tags?.natural === 'tree';
+      const isGeneric = !f.data?.scientificName; // Scientific names only exist on BioLoader items
+
+      if (isOSMTree && isGeneric) {
+        // Force the generic OSM tree to adopt the local identity
+        f.label = localIdentity.label;
+        
+        // Re-resolve the feature type using the new identity
+        // This ensures the 3D model (blueprint) changes too
+        f.ftype = resolveFeatureType("", { genus: topGenus });
+        
+        // Update the asset key directly for the blueprint lookup
+        f.asset = localIdentity.asset; 
+      }
+    });
+
+    if (topGenus && !speciesMap[topGenus]) {
+      console.warn(`[Ecosystem] New genus detected: "${topGenus}". Add this to your speciesMap!`);
+    }
+
+    console.log(`[Ecosystem] Region identified as ${localIdentity.label} biome.`);
+  }
+
   // ── FEATURE NORMALISATION ─────────────────────────────────────────────────
 
   _normaliseFeature(raw) {
-    const lat = Number(raw.latitude ?? raw.lat ?? NaN);
-    const lon = Number(raw.longitude ?? raw.lng ?? raw.lon ?? NaN);
-    const pos = (Number.isFinite(lat) && Number.isFinite(lon))
-      ? geoToTile(lat, lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH)
-      : { x: -999, y: -999 };
-  
-    // Resolve feature type from OSM tags for colour and render mode
-    const tags  = raw.tags ?? (raw.data?.tags ?? {});
+      const lat = Number(raw.latitude ?? raw.lat ?? NaN);
+      const lon = Number(raw.longitude ?? raw.lng ?? raw.lon ?? NaN);
+      const pos = (Number.isFinite(lat) && Number.isFinite(lon))
+        ? geoToTile(lat, lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH)
+        : { x: -999, y: -999 };
+    
+      const tags = raw.tags ?? (raw.data?.tags ?? {});
+      let ftype = resolveFeatureType(raw?.title ?? (raw?.label ?? ""), tags, raw.color ?? raw.colour ?? null);
 
-    const ftype = resolveFeatureType(raw?.title ?? (raw?.label ?? ""), tags, raw.color ?? raw.colour ?? null);
-  
-    return {
-      id:    raw.id ?? String(Math.random()),
-      tx:    pos.x,
-      ty:    pos.y,
-      color: raw.color ?? raw.colour ?? ftype.color,
-      label: raw.label ?? raw.title ?? raw.name ?? tags.name ?? ftype.label ?? '',
-      data:  { ...raw, tags },   // keep full OSM data for type resolution at draw time
-    };
-  }
+      // ── ECOSYSTEM OVERRIDE ──
+      // If OSM says "it's a tree" but doesn't say what kind, use the local dominant species
+      if (tags.natural === 'tree' && !tags.genus && !raw.scientificName) {
+        if (this.localTreeAsset && this.localTreeAsset !== 'tree') {
+          const speciesConfig = resolveFeatureType("", { genus: this.localTreeAsset });
+          if (speciesConfig.asset !== 'default') ftype = speciesConfig;
+        }
+      }
+    
+      return {
+        id:    raw.id ?? String(Math.random()),
+        tx:    pos.x,
+        ty:    pos.y,
+        color: raw.color ?? raw.colour ?? ftype.color,
+        label: raw.label ?? raw.title ?? raw.name ?? tags.name ?? ftype.label ?? '',
+        // Store the resolved config on the feature so the renderer doesn't have to re-guess
+        ftype: ftype, 
+        data:  { ...raw, ...raw.data },
+        tags
+      };
+    }
 
   _rebuildFeatures() {
     this._features = this._features.map(f => this._normaliseFeature(f.data ?? f));
@@ -349,7 +425,15 @@ export class Engine extends EventEmitter {
         }
         if (result.buildingWays)   this._buildings = preprocessBuildings(result.buildingWays);
         if (result.features)       for (const f of result.features) {this.addFeature(f)};
+        if (result.weatherUpdate && this.weather) {
+          this.weather.setMode(result.weatherUpdate.mode);
+          this.weather.wind = result.weatherUpdate.wind;
+          this.emit('weather:changed', result.weatherUpdate);
+        }
       }
+      
+      this._updateLocalEcosystem();
+
       this._elevation?.prefetch?.(center);
       this._fetching = false;
       this.emit('fetch:done');
@@ -403,7 +487,7 @@ export class Engine extends EventEmitter {
       };
     }
 
-  _frame(ts) {
+    _frame(ts) {
       if (!this._running) return;
       this._raf = requestAnimationFrame(ts2 => this._frame(ts2));
 
@@ -416,243 +500,176 @@ export class Engine extends EventEmitter {
       const W      = canvas.width;
       const H      = canvas.height;
 
-      // ── 1. Update Camera Physics ──────────────────────────────────────────────
+      // ── 1. Update Physics & Weather ──────────────────────────────────────────
       cam.updateTilt(dt);
       cam.updateRotation(dt, this.player.x, this.player.y, worldToScreen);
-
       if (this._input.isRotatingLeft())  cam.rotVel -= 2.2 * dt;
       if (this._input.isRotatingRight()) cam.rotVel += 2.2 * dt;
 
+      if (this.weather) this.weather.update(dt, this.player.x, this.player.y);
+
       const { x: pGX, y: pGY } = this._pGlobal();
+      const pElev = this._playerElev();
 
-      // ── 2. Nature AI & Interaction ────────────────────────────────────────────
-      const DETECTION_RANGE = 8;
-      const FLEE_SPEED = 0.05;
-
+      // ── 2. Nature AI (Animals Flee / Plants Wiggle) ──────────────────────────
       this._features.forEach(f => {
         if (f.data?.category === 'nature') {
           const dx = f.tx - this.player.x;
           const dy = f.ty - this.player.y;
           const distSq = dx * dx + dy * dy;
-          const dist = Math.sqrt(distSq);
 
           if (f.data.subType === 'animal') {
-            if (dist < DETECTION_RANGE) {
-              // Skittish: Run away from player
+            if (distSq < 64) { // Detection range 8 tiles
               const angle = Math.atan2(dy, dx);
-              f.tx += Math.cos(angle) * FLEE_SPEED;
-              f.ty += Math.sin(angle) * FLEE_SPEED;
-              f.tx += (Math.random() - 0.5) * 0.02; // Panic jitter
+              f.tx += Math.cos(angle) * 0.05;
+              f.ty += Math.sin(angle) * 0.05;
+              f.tx += (Math.random() - 0.5) * 0.02;
             } else {
-              // Idle: Ambient wander
               f.tx += Math.sin(ts * 0.001 + f.id) * 0.002;
               f.ty += Math.cos(ts * 0.001 + f.id) * 0.002;
             }
           } else if (f.data.subType === 'plant') {
-            // Reactive: Wiggle if player is standing on it
             f.data.wiggle = (distSq < 1.5) ? Math.sin(ts * 0.02) * 0.2 : 0;
           }
         }
       });
 
-      // ── 3. Building Projection (Collision & Depth Cache) ──────────────────────
+      // ── 3. Projection Prep ───────────────────────────────────────────────────
       if (this._buildings.length > 0) {
         const rotChanged = this._lastBuildingRot === null || Math.abs(cam.rotation - this._lastBuildingRot) > 0.02;
-        const countChanged = this._cachedDrawList.length !== this._buildings.length;
-
-        if (rotChanged || countChanged) {
+        if (rotChanged || this._cachedDrawList.length !== this._buildings.length) {
           this._lastBuildingRot = cam.rotation;
           this._cachedDrawList = [];
-
           for (const b of this._buildings) {
             const p = geoToTile(b.centroid.lat, b.centroid.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
             if (p.x < 0 || p.x >= this._mapW || p.y < 0 || p.y >= this._mapH) continue;
-
+            
             const VU = 8;
             const halfSideM = Math.sqrt(Math.max(1, b.areaM2));
             const r = Math.max(VU, Math.min(VU * 20, (halfSideM / this._mPerTile / 2) * VU));
-            
-            // Calculate depth from the "back" corner of the building relative to camera
             const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
             const backX = p.x - (r / VU) * Math.abs(cr);
             const backY = p.y - (r / VU) * Math.abs(sr);
-
+            
             const gx = Math.round(p.x) - this._mapW / 2 + pGX;
             const gy = Math.round(p.y) - this._mapH / 2 + pGY;
-            const terrainType = this.terrainCache.get(gx, gy) ?? TerrainType.GRASS;
-            const elev = getElevOffset(this.terrainRegistry.heights[terrainType] ?? 1, cam.tilt, cam.zoom);
+            const tType = this.terrainCache.get(gx, gy) ?? TerrainType.GRASS;
+            const elev = getElevOffset(this.terrainRegistry.heights[tType] ?? 1, cam.tilt, cam.zoom);
             
-            this._cachedDrawList.push({
-              p, r,
-              engineH: Math.max(VU, Math.min(VU * 60, (b.heightM / this._mPerTile) * VU)),
-              tc: this.terrainRegistry.colors[TerrainType.BUILDING],
-              depth: tileDepth(backX, backY, cam.rotation),
-              elev: elev
+            this._cachedDrawList.push({ 
+              p, r, 
+              engineH: Math.max(VU, Math.min(VU * 60, (b.heightM / this._mPerTile) * VU)), 
+              tc: this.terrainRegistry.colors[TerrainType.BUILDING], 
+              depth: tileDepth(backX, backY, cam.rotation), 
+              elev 
             });
           }
         }
       }
 
-      // ── 4. Movement & Collision ───────────────────────────────────────────────
+      // ── 4. Movement & Collision ──────────────────────────────────────────────
       const mv = this._input.getMovementVector();
-      const pElev = this._playerElev();
-
       if (mv) {
         this.player.isMoving = true;
         this.player.faceAngle = Math.atan2(-mv.dy, mv.dx);
-
         const hw = tileHalfWidth(cam.zoom, cam.tileW), hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
         const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
         const rx = (mv.dx / hw + mv.dy / hh) * 0.5, ry = (mv.dy / hh - mv.dx / hw) * 0.5;
         const wx = rx * cr - ry * sr, wy = rx * sr + ry * cr;
-
-        const terrainState = this._getMovementState(this.player.x, this.player.y, pGX, pGY);
-        const spd = (PLAYER_SPEED * terrainState.speedMult) * dt * 60 / (Math.hypot(wx, wy) || 1);
-        this.player.walkCycle += dt * 15 * terrainState.speedMult;
-
-        const nextX = this.player.x + wx * spd;
-        const nextY = this.player.y + wy * spd;
-
-        if (!this._getMovementState(nextX, nextY, pGX, pGY).isBlocked) {
-          this.player.x = nextX; this.player.y = nextY;
-        } else if (!this._getMovementState(nextX, this.player.y, pGX, pGY).isBlocked) {
-          this.player.x = nextX;
-        } else if (!this._getMovementState(this.player.x, nextY, pGX, pGY).isBlocked) {
-          this.player.y = nextY;
-        }
-
+        
+        const tState = this._getMovementState(this.player.x, this.player.y, pGX, pGY);
+        const spd = (PLAYER_SPEED * tState.speedMult) * dt * 60 / (Math.hypot(wx, wy) || 1);
+        this.player.walkCycle += dt * 15 * tState.speedMult;
+        
+        const nX = this.player.x + wx * spd, nY = this.player.y + wy * spd;
+        if (!this._getMovementState(nX, nY, pGX, pGY).isBlocked) { this.player.x = nX; this.player.y = nY; }
+        else if (!this._getMovementState(nX, this.player.y, pGX, pGY).isBlocked) { this.player.x = nX; }
+        else if (!this._getMovementState(this.player.x, nY, pGX, pGY).isBlocked) { this.player.y = nY; }
+        
         this.player.x = Math.max(0.5, Math.min(this._mapW - 0.5, this.player.x));
         this.player.y = Math.max(0.5, Math.min(this._mapH - 0.5, this.player.y));
-
+        
         if (cam.tilt > 0.08) {
           const { x: px, y: py } = worldToScreen(this.player.x, this.player.y, pElev, { ...cam, camX: 0, camY: 0 });
-          cam.camX += (px - W / 2 - cam.camX) * 0.08;
+          cam.camX += (px - W / 2 - cam.camX) * 0.08; 
           cam.camY += (py - H / 2 - cam.camY) * 0.08;
         }
+        this.emit('player:move', { x: this.player.x, y: this.player.y, geo: tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH), isSwimming: tState.isSwimming });
+      } else { this.player.isMoving = false; this.player.walkCycle = 0; }
 
-        this.emit('player:move', {
-          x: this.player.x, y: this.player.y,
-          geo: tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH),
-          isSwimming: terrainState.isSwimming
-        });
-      } else {
-        this.player.isMoving = false;
-        this.player.walkCycle = 0;
+      // ── 5. World Re-centre (Teleport Fix) ────────────────────────────────────
+      const dFC = Math.hypot(this.player.x - this._mapW/2, this.player.y - this._mapH/2);
+      if (dFC > REFETCH_DIST && !this._fetching) {
+        const oldScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
+        this.geoCenter = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+        this.player.x = this._mapW/2; this.player.y = this._mapH/2;
+        const newScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
+        cam.camX += newScreen.x - oldScreen.x; cam.camY += newScreen.y - oldScreen.y;
+        this._lastTileCamX = null; this._cachedDrawList = []; 
+        this._rebuildFeatures(); this._doFetch(this.geoCenter);
+        this.emit('center:changed', this.geoCenter);
       }
 
-      // ── 5. Construct Unified Depth-Sorted Render List ─────────────────────────
-      const renderList = [];
-
-      // Add buildings
-      if (this.debugLayers.buildings) {
-        for (const b of this._cachedDrawList) {
-          renderList.push({ type: 'building', depth: b.depth, data: b });
-        }
-      }
-
-      // Add features (Trees, POIs, Bio)
-      if (this.debugLayers.features) {
-        for (const f of this._features) {
-          renderList.push({ 
-            type: 'feature', 
-            depth: tileDepth(f.tx, f.ty, cam.rotation), 
-            data: f 
-          });
-        }
-      }
-
-      // Add player
-      if (this._showPlayer) {
-        renderList.push({ 
-          type: 'player', 
-          depth: tileDepth(this.player.x, this.player.y, cam.rotation), 
-          data: this.player 
-        });
-      }
-
-      // Sort back-to-front
-      renderList.sort((a, b) => a.depth - b.depth);
-
-      // ── 6. Final Draw Pass ────────────────────────────────────────────────────
-      ctx.fillStyle = '#04060a';
+      // ── 6. Render Pass ───────────────────────────────────────────────────────
+      ctx.fillStyle = this.weather?.mode === 'rain' ? '#020308' : '#04060a'; 
       ctx.fillRect(0, 0, W, H);
-
       this._voxelR.beginFrame();
       this._shadows.beginFrame();
 
-      // 6a. Render Tiles (Bottom Layer)
-      const overpassAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
-      if (overpassAlpha > 0 && this.debugLayers.overpass) {
+      // 6a. Bottom Layer: Tiles
+      const overAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
+      if (overAlpha > 0 && this.debugLayers.overpass) {
         const lod = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
-        if (lod > 1) {
-          this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overpassAlpha);
-        } else {
-          const camMoved = (this._lastTileCamX === null || Math.abs(cam.camX - this._lastTileCamX) > 3);
-          if (camMoved) {
+        if (lod > 1) this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overAlpha);
+        else {
+          if (this._lastTileCamX === null || Math.abs(cam.camX - this._lastTileCamX) > 3) {
             this._lastTileCamX = cam.camX;
             const hw = tileHalfWidth(cam.zoom, cam.tileW), hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-            const tilesX = Math.min(120, Math.ceil(W / Math.max(1, hw)) + 4);
-            const tilesY = Math.min(120, Math.ceil(H / Math.max(1, hh)) + 4);
-            const viewCenter = screenToWorld(W / 2, H / 2, cam);
-            const cx = Math.round(Math.max(0, Math.min(this._mapW, viewCenter.x)));
-            const cy = Math.round(Math.max(0, Math.min(this._mapH, viewCenter.y)));
-            this._tileCache.length = 0;
-            for (let ty = Math.max(0, cy - tilesY); ty < Math.min(this._mapH, cy + tilesY); ty++) {
-              for (let tx = Math.max(0, cx - tilesX); tx < Math.min(this._mapW, cx + tilesX); tx++) {
-                const gx = tx - this._mapW / 2 + pGX, gy = ty - this._mapH / 2 + pGY;
-                this._tileCache.push({ tx, ty, terrainId: this.terrainCache.get(gx, gy) ?? TerrainType.GRASS });
-              }
-            }
+            const txs = Math.min(120, Math.ceil(W / Math.max(1, hw)) + 4), tys = Math.min(120, Math.ceil(H / Math.max(1, hh)) + 4);
+            const vC = screenToWorld(W / 2, H / 2, cam);
+            const cx = Math.round(Math.max(0, Math.min(this._mapW, vC.x))), cy = Math.round(Math.max(0, Math.min(this._mapH, vC.y)));
+            this._tileCache = [];
+            for (let ty = Math.max(0, cy - tys); ty < Math.min(this._mapH, cy + tys); ty++)
+              for (let tx = Math.max(0, cx - txs); tx < Math.min(this._mapW, cx + txs); tx++)
+                this._tileCache.push({ tx, ty, terrainId: this.terrainCache.get(tx - this._mapW / 2 + pGX, ty - this._mapH / 2 + pGY) ?? TerrainType.GRASS });
           }
           this._tileR.drawLayer(this._tileCache, this.player.x, this.player.y, this.terrainCache, pGX, pGY);
         }
       }
 
-      // 6b. Render Sorted 3D Items (Buildings, Features, Player interleaved)
-      if (this._shadows.enabled && cam.tilt > 0.05) {
-        this._shadows.drawBuildingShadows(this._cachedDrawList);
-      }
+      // 6b. Interleaved Depth-Sorted Layer
+      const renderList = [];
+      for (const b of this._cachedDrawList) renderList.push({ type:'b', d:b.depth, data:b });
+      for (const f of this._features) renderList.push({ type:'f', d:tileDepth(f.tx, f.ty, cam.rotation), data:f });
+      renderList.push({ type:'p', d:tileDepth(this.player.x, this.player.y, cam.rotation), data:this.player });
+      renderList.sort((a,b) => a.d - b.d);
 
+      if (this._shadows.enabled && cam.tilt > 0.05) this._shadows.drawBuildingShadows(this._cachedDrawList);
       this._featR.frameNow = ts;
 
       for (const item of renderList) {
-        if (item.type === 'building') {
-          const b = item.data;
-          this._voxelR.beginTile(b.p.x, b.p.y, b.elev);
+        if (item.type === 'b') {
+          const b = item.data; this._voxelR.beginTile(b.p.x, b.p.y, b.elev);
           this._voxelR.box(-b.r, 0, -b.r, b.r * 2, b.engineH, b.r * 2, b.tc.top, b.tc.right, b.tc.left);
-          const seed = Math.abs(Math.round(b.p.x * 31 + b.p.y * 17)) % 10000;
-          decorateBuildingFacade(this._ctx, cam, b, this._voxelR, seed);
-        } else if (item.type === 'feature') {
+          decorateBuildingFacade(ctx, cam, b, this._voxelR, Math.abs(Math.round(b.p.x * 31 + b.p.y * 17)));
+        } else if (item.type === 'f') {
           this._featR.drawFeature(item.data, this._selectedId === item.data.id, this.terrainCache, pGX, pGY);
-        } else if (item.type === 'player') {
+        } else if (item.type === 'p') {
           this._playerR.draw(this.player.x, this.player.y, pElev, this.player, this._mPerTile);
         }
       }
 
-      // ── 7. World Re-centre & HUD ──────────────────────────────────────────────
-      const distFromCtr = Math.hypot(this.player.x - this._mapW / 2, this.player.y - this._mapH / 2);
-      if (distFromCtr > REFETCH_DIST && !this._fetching) {
-        const newGeo = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-        const oldScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
-        this.geoCenter = newGeo;
-        this.player.x = this._mapW / 2; this.player.y = this._mapH / 2;
-        const newScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
-        cam.camX += newScreen.x - oldScreen.x; cam.camY += newScreen.y - oldScreen.y;
-        this._lastTileCamX = null; this._tileCache.length = 0;
-        this._lastBuildingRot = null; this._cachedDrawList = [];
-        this._rebuildFeatures();
-        this._doFetch(this.geoCenter);
-        this.emit('center:changed', this.geoCenter);
+      // 6c. Top Layer: Weather & UI
+      if (this.weather) this.weather.draw();
+
+      if (this.weather?.mode === 'rain') {
+        ctx.save(); ctx.globalCompositeOperation = 'multiply';
+        ctx.fillStyle = 'rgba(100, 110, 150, 0.15)'; 
+        ctx.fillRect(0, 0, W, H); ctx.restore();
       }
 
       const geo = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-      this.emit('hud', { 
-        lat: geo.lat, 
-        lon: geo.lon, 
-        zoom: cam.zoom.toFixed(2), 
-        tilt: cam.tilt.toFixed(2),
-        terrain: this.terrainRegistry.names[this.terrainCache.getLocal(this.player.x, this.player.y, pGX, pGY, this._mapW, this._mapH)] ?? 'Unknown' 
-      });
+      this.emit('hud', { lat: geo.lat, lon: geo.lon, zoom: cam.zoom.toFixed(2), tilt: cam.tilt.toFixed(2), terrain: this.terrainRegistry.names[this.terrainCache.getLocal(this.player.x, this.player.y, pGX, pGY, this._mapW, this._mapH)] ?? 'Unknown' });
     }
 
   // ── BUILDING DRAW ─────────────────────────────────────────────────────────

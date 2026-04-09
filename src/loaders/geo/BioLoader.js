@@ -1,5 +1,22 @@
 import { BaseLoader } from '../BaseLoader.js';
 
+const TREE_TAXA = {
+  families: [
+    'fagaceae',   // Oaks, Beeches, Chestnuts
+    'pinaceae',   // Pines, Firs, Cedars
+    'betulaceae', // Birch, Alder
+    'aceraceae',  // Maples
+    'oleaceae',   // Ash, Olive
+    'rosaceae',   // Cherries, Apples, Hawthorn
+    'cupressaceae', // Cypress, Juniper
+    'myrtaceae',  // Eucalyptus
+    'salicaceae', // Willows, Poplars
+    'ulmaceae',   // Elms
+    'juglandaceae' // Walnuts
+  ],
+  keywords: ['tree', 'oak', 'pine', 'beech', 'birch', 'fagus', 'quercus', 'picea']
+};
+
 export class BioLoader extends BaseLoader {
   get id() { return 'bio-loader'; }
 
@@ -25,6 +42,16 @@ export class BioLoader extends BaseLoader {
             natural: obs.class?.toLowerCase() || obs.kingdom?.toLowerCase() || 'nature'
           };
 
+          // Inside BioLoader.map logic
+            const family = obs.family?.toLowerCase() || '';
+            const genus = obs.genus?.toLowerCase() || '';
+            const scientificName = obs.scientificName?.toLowerCase() || '';
+            const commonName = (obs.vernacularName || '').toLowerCase();
+
+            // Check if it's a tree based on Family or Keywords
+            const isTree = TREE_TAXA.families.includes(family) || 
+                        TREE_TAXA.keywords.some(k => scientificName.includes(k) || commonName.includes(k));
+
           return {
             id: `bio:${obs.key}`,
             latitude: obs.decimalLatitude,
@@ -33,6 +60,7 @@ export class BioLoader extends BaseLoader {
             title: obs.scientificName,
             data: { 
               category: 'nature', 
+              isTree: isTree,
               tags: tags,
               subType: obs.kingdom === 'Animalia' ? 'animal' : 'plant'
             },

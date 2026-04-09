@@ -311,8 +311,27 @@ export const Blueprints = {
     { x: -0.2, y: 0, z: -0.2, w: 0.4, h: 2, d: 0.4, top: '#4aaa2a', right: '#3a8a1a', front: '#3a8a1a' }, // Stem
     { x: -0.8, y: 2, z: -0.8, w: 1.6, h: 0.6, d: 1.6, top: '#fff', right: '#eee', front: '#eee' } // Flower Head
   ],
+  flower_anemone: [
+    { x: -0.1, y: 0, z: -0.1, w: 0.2, h: 1.5, d: 0.2, top: '#2d5a27', right: '#1e3d1a', front: '#1e3d1a' }, // Stem
+    { x: -0.6, y: 1.5, z: -0.6, w: 1.2, h: 0.4, d: 1.2, top: '#a78bfa', right: '#7c3aed', front: '#7c3aed' } // Purple Head
+    ],
   grass_tuft: [
     { x: -0.5, y: 0, z: -0.5, w: 1, h: 1.5, d: 0.2, top: '#77dd55', right: '#44aa22', front: '#44aa22' }, // Blade A
     { x: 0, y: 0, z: -0.5, w: 0.2, h: 1.2, d: 1, top: '#77dd55', right: '#44aa22', front: '#44aa22' }    // Blade B
+  ],
+  tree_oak: [
+    { x: -1, y: 0, z: -1, w: 2, h: 4, d: 2, top: '#5c4033', right: '#3c2013', front: '#4c3023' }, // Trunk
+    { x: -4, y: 4, z: -4, w: 8, h: 5, d: 8, top: '#2d5a27', right: '#1e3d1a', front: '#244a1f' }  // Wide Canopy
+  ],
+  tree_pine: [
+    { x: -0.5, y: 0, z: -0.5, w: 1, h: 3, d: 1, top: '#3c2013', right: '#2c1003', front: '#2c1003' }, // Trunk
+    { x: -3, y: 3, z: -3, w: 6, h: 2, d: 6, top: '#1a3a1a', right: '#0a2a0a', front: '#0a2a0a' }, // Tier 1
+    { x: -2, y: 5, z: -2, w: 4, h: 2, d: 4, top: '#1a3a1a', right: '#0a2a0a', front: '#0a2a0a' }, // Tier 2
+    { x: -1, y: 7, z: -1, w: 2, h: 2, d: 2, top: '#1a3a1a', right: '#0a2a0a', front: '#0a2a0a' }  // Tip
+  ],
+  tree_palm: [
+     { x: -0.5, y: 0, z: -0.5, w: 1, h: 8, d: 1, top: '#8B6030', right: '#6B4420', front: '#4a2a10' }, // Trunk
+     { x: -5, y: 8, z: 0, w: 10, h: 0.2, d: 1, top: '#4ab030', right: '#2a8020', front: '#2a8020' }, // Frond H
+     { x: 0, y: 8, z: -5, w: 1, h: 0.2, d: 10, top: '#4ab030', right: '#2a8020', front: '#2a8020' }  // Frond V
   ]
 };

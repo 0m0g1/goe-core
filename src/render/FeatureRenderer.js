@@ -140,6 +140,7 @@ export class FeatureRenderer {
     const { tx, ty } = f;
 
     const ftype = resolveFeatureType(f.data?.title ?? (f.data.label ?? ""), f.data?.tags ?? {}, f.color ?? '#60a5fa');
+
     const color = f.color ?? ftype.color;
     const mode  = ftype.renderMode;
 
