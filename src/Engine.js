@@ -405,40 +405,67 @@ _updateLocalEcosystem() {
   // ── FETCH ORCHESTRATION ────────────────────────────────────────────────────
 
   _doFetch(center) {
-    if (this._fetching) return;
-    const d = Math.hypot(center.lat - this._lastFetchPos.lat, center.lon - this._lastFetchPos.lon);
-    if (d < 0.001 && this._lastFetchPos.lat !== 0) return;
+      if (this._fetching) return;
+      const d = Math.hypot(center.lat - this._lastFetchPos.lat, center.lon - this._lastFetchPos.lon);
+      if (d < 0.001 && this._lastFetchPos.lat !== 0) return;
 
-    this._fetching    = true;
-    this._lastFetchPos = { ...center };
-    this.emit('fetch:start');
+      this._fetching     = true;
+      this._lastFetchPos = { ...center };
+      this.emit('fetch:start');
 
-    const fetches = this._loaders.map(l =>
-      l.fetch(center).catch(err => { console.error(`[GOECore] Loader ${l.id} failed:`, err); return {}; })
-    );
+      const fetches = this._loaders.map(l =>
+        l.fetch(center).catch(err => { console.error(`[GOECore] Loader ${l.id} failed:`, err); return {}; })
+      );
 
-    Promise.all(fetches).then(results => {
-      for (const result of results) {
-        if (result.terrainUpdates) {
-          // New: BlockTerrainCache instance
-          this.terrainCache.merge(result.terrainUpdates);
+      Promise.all(fetches).then(results => {
+        const { x: pGX, y: pGY } = this._pGlobal();
+
+        // 1. FIRST PASS: Handle Terrain, Buildings, and Weather
+        // We do this first so the TerrainCache is ready for our animal checks
+        for (const result of results) {
+          if (result.terrainUpdates) {
+            this.terrainCache.merge(result.terrainUpdates);
+          }
+          if (result.buildingWays) {
+            this._buildings = preprocessBuildings(result.buildingWays);
+          }
+          if (result.weatherUpdate && this.weather) {
+            this.weather.setMode(result.weatherUpdate.mode);
+            this.weather.wind = result.weatherUpdate.wind;
+            this.emit('weather:changed', result.weatherUpdate);
+          }
         }
-        if (result.buildingWays)   this._buildings = preprocessBuildings(result.buildingWays);
-        if (result.features)       for (const f of result.features) {this.addFeature(f)};
-        if (result.weatherUpdate && this.weather) {
-          this.weather.setMode(result.weatherUpdate.mode);
-          this.weather.wind = result.weatherUpdate.wind;
-          this.emit('weather:changed', result.weatherUpdate);
-        }
-      }
-      
-      this._updateLocalEcosystem();
 
-      this._elevation?.prefetch?.(center);
-      this._fetching = false;
-      this.emit('fetch:done');
-    });
-  }
+        // 2. SECOND PASS: Handle Features (with Procedural Filtering)
+        results.forEach(result => {
+          if (result.features) {
+            result.features.forEach(f => {
+              if (f.data?.isProcedural) {
+                // Project to tile space to check the ground
+                const pos = geoToTile(f.latitude, f.longitude, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+                const terrainId = this.terrainCache.getLocal(pos.x, pos.y, pGX, pGY, this._mapW, this._mapH);
+                
+                // Only add if it's Grass (1) or Forest/Wood (7)
+                // This prevents squirrels spawning in the middle of a skyscraper
+                if (terrainId === 1 || terrainId === 7) { 
+                  this.addFeature(f);
+                }
+              } else {
+                // Always add real scientific sightings from GBIF/OSM
+                this.addFeature(f);
+              }
+            });
+          }
+        });
+        
+        // 3. Update Ecosystem (Now that all features are added)
+        this._updateLocalEcosystem();
+
+        this._elevation?.prefetch?.(center);
+        this._fetching = false;
+        this.emit('fetch:done');
+      });
+    }
 
   // ── RENDER FRAME ──────────────────────────────────────────────────────────
 
@@ -488,195 +515,195 @@ _updateLocalEcosystem() {
     }
 
     _frame(ts) {
-      if (!this._running) return;
-      this._raf = requestAnimationFrame(ts2 => this._frame(ts2));
+        if (!this._running) return;
+        this._raf = requestAnimationFrame(ts2 => this._frame(ts2));
 
-      const dt = Math.min((ts - this._lastT) / 1000, 0.05);
-      this._lastT = ts;
+        const dt = Math.min((ts - this._lastT) / 1000, 0.05);
+        this._lastT = ts;
 
-      const cam    = this.camera;
-      const canvas = this._canvas;
-      const ctx    = this._ctx;
-      const W      = canvas.width;
-      const H      = canvas.height;
+        const cam    = this.camera;
+        const canvas = this._canvas;
+        const ctx    = this._ctx;
+        const W      = canvas.width;
+        const H      = canvas.height;
 
-      // ── 1. Update Physics & Weather ──────────────────────────────────────────
-      cam.updateTilt(dt);
-      cam.updateRotation(dt, this.player.x, this.player.y, worldToScreen);
-      if (this._input.isRotatingLeft())  cam.rotVel -= 2.2 * dt;
-      if (this._input.isRotatingRight()) cam.rotVel += 2.2 * dt;
+        // 1. Update Physics
+        cam.updateTilt(dt);
+        cam.updateRotation(dt, this.player.x, this.player.y, worldToScreen);
+        if (this._input.isRotatingLeft())  cam.rotVel -= 2.2 * dt;
+        if (this._input.isRotatingRight()) cam.rotVel += 2.2 * dt;
+        if (this.weather) this.weather.update(dt, this.player.x, this.player.y);
 
-      if (this.weather) this.weather.update(dt, this.player.x, this.player.y);
+        const { x: pGX, y: pGY } = this._pGlobal();
+        const pElev = this._playerElev();
 
-      const { x: pGX, y: pGY } = this._pGlobal();
-      const pElev = this._playerElev();
+        // 2. PRE-CALCULATE PLAYER SCREEN POSITION (For Transparency Check)
+        const pScr = worldToScreen(this.player.x, this.player.y, pElev, cam);
+        const pDepth = tileDepth(this.player.x, this.player.y, cam.rotation);
 
-      // ── 2. Nature AI (Animals Flee / Plants Wiggle) ──────────────────────────
-      this._features.forEach(f => {
-        if (f.data?.category === 'nature') {
-          const dx = f.tx - this.player.x;
-          const dy = f.ty - this.player.y;
-          const distSq = dx * dx + dy * dy;
+        // 3. Nature AI (Flee/Wiggle)
+        this._features.forEach(f => {
+          if (f.data?.category === 'nature') {
+            const dx = f.tx - this.player.x, dy = f.ty - this.player.y;
+            const distSq = dx * dx + dy * dy;
+            if (f.data.subType === 'animal') {
+              if (distSq < 64) {
+                const angle = Math.atan2(dy, dx);
+                const moveX = Math.cos(angle) * 0.05;
+                const moveY = Math.sin(angle) * 0.05;
+                
+                f.tx += moveX;
+                f.ty += moveY;
 
-          if (f.data.subType === 'animal') {
-            if (distSq < 64) { // Detection range 8 tiles
-              const angle = Math.atan2(dy, dx);
-              f.tx += Math.cos(angle) * 0.05;
-              f.ty += Math.sin(angle) * 0.05;
-              f.tx += (Math.random() - 0.5) * 0.02;
-            } else {
-              f.tx += Math.sin(ts * 0.001 + f.id) * 0.002;
-              f.ty += Math.cos(ts * 0.001 + f.id) * 0.002;
+                // ── NEW: Update geographic lat/lon so they don't teleport back on reset ──
+                const newGeo = tileToGeo(f.tx, f.ty, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+                f.data.latitude = newGeo.lat;
+                f.data.longitude = newGeo.lon;
+                // ────────────────────────────────────────────────────────────────────────
+              }
+            } else if (f.data.subType === 'plant') {
+              f.data.wiggle = (distSq < 1.5) ? Math.sin(ts * 0.02) * 0.2 : 0;
             }
-          } else if (f.data.subType === 'plant') {
-            f.data.wiggle = (distSq < 1.5) ? Math.sin(ts * 0.02) * 0.2 : 0;
+          }
+        });
+
+        // 4. Projection Prep
+        if (this._buildings.length > 0) {
+          const rotChanged = this._lastBuildingRot === null || Math.abs(cam.rotation - this._lastBuildingRot) > 0.02;
+          if (rotChanged || this._cachedDrawList.length !== this._buildings.length) {
+            this._lastBuildingRot = cam.rotation;
+            this._cachedDrawList = [];
+            for (const b of this._buildings) {
+              const p = geoToTile(b.centroid.lat, b.centroid.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+              if (p.x < 0 || p.x >= this._mapW || p.y < 0 || p.y >= this._mapH) continue;
+              const VU = 8;
+              const r = Math.max(VU, Math.min(VU * 20, (Math.sqrt(Math.max(1, b.areaM2)) / this._mPerTile / 2) * VU));
+              const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
+              const frontX = p.x + (r / VU) * Math.abs(cr), frontY = p.y + (r / VU) * Math.abs(sr);
+              const gx = Math.round(p.x) - this._mapW / 2 + pGX, gy = Math.round(p.y) - this._mapH / 2 + pGY;
+              const elev = getElevOffset(this.terrainRegistry.heights[this.terrainCache.get(gx, gy) ?? TerrainType.GRASS] ?? 1, cam.tilt, cam.zoom);
+              this._cachedDrawList.push({ p, r, engineH: Math.max(VU, Math.min(VU * 60, (b.heightM / this._mPerTile) * VU)), tc: this.terrainRegistry.colors[TerrainType.BUILDING], depth: tileDepth(frontX, frontY, cam.rotation), elev });
+            }
           }
         }
-      });
 
-      // ── 3. Projection Prep ───────────────────────────────────────────────────
-      // ── 3. Projection Prep ───────────────────────────────────────────────────
-      if (this._buildings.length > 0) {
-        const rotChanged = this._lastBuildingRot === null || Math.abs(cam.rotation - this._lastBuildingRot) > 0.02;
-        if (rotChanged || this._cachedDrawList.length !== this._buildings.length) {
-          this._lastBuildingRot = cam.rotation;
-          this._cachedDrawList = [];
+        // 5. Movement
+        const mv = this._input.getMovementVector();
+        if (mv) {
+          this.player.isMoving = true; this.player.faceAngle = Math.atan2(-mv.dy, mv.dx);
+          const hw = tileHalfWidth(cam.zoom, cam.tileW), hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+          const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
+          const rx = (mv.dx / hw + mv.dy / hh) * 0.5, ry = (mv.dy / hh - mv.dx / hw) * 0.5;
+          const wx = rx * cr - ry * sr, wy = rx * sr + ry * cr;
+          const tState = this._getMovementState(this.player.x, this.player.y, pGX, pGY);
+          const spd = (PLAYER_SPEED * tState.speedMult) * dt * 60 / (Math.hypot(wx, wy) || 1);
+          this.player.walkCycle += dt * 15 * tState.speedMult;
+          const nX = this.player.x + wx * spd, nY = this.player.y + wy * spd;
+          if (!this._getMovementState(nX, nY, pGX, pGY).isBlocked) { this.player.x = nX; this.player.y = nY; }
+          else if (!this._getMovementState(nX, this.player.y, pGX, pGY).isBlocked) { this.player.x = nX; }
+          else if (!this._getMovementState(this.player.x, nY, pGX, pGY).isBlocked) { this.player.y = nY; }
+          this.player.x = Math.max(0.5, Math.min(this._mapW - 0.5, this.player.x));
+          this.player.y = Math.max(0.5, Math.min(this._mapH - 0.5, this.player.y));
+          if (cam.tilt > 0.08) {
+            const { x: px, y: py } = worldToScreen(this.player.x, this.player.y, pElev, { ...cam, camX: 0, camY: 0 });
+            cam.camX += (px - W / 2 - cam.camX) * 0.08; cam.camY += (py - H / 2 - cam.camY) * 0.08;
+          }
+          this.emit('player:move', { x: this.player.x, y: this.player.y, geo: tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH), isSwimming: tState.isSwimming });
+        } else { this.player.isMoving = false; this.player.walkCycle = 0; }
+
+        // 6. World Re-centre
+        const dFC = Math.hypot(this.player.x - this._mapW/2, this.player.y - this._mapH/2);
+        if (dFC > REFETCH_DIST && !this._fetching) {
+          const oldS = worldToScreen(this.player.x, this.player.y, pElev, cam);
+          this.geoCenter = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+          this.player.x = this._mapW/2; this.player.y = this._mapH/2;
+          const newS = worldToScreen(this.player.x, this.player.y, pElev, cam);
+          cam.camX += newS.x - oldS.x; cam.camY += newS.y - oldS.y;
+          this._lastTileCamX = null; this._cachedDrawList = []; this._rebuildFeatures(); this._doFetch(this.geoCenter);
+          this.emit('center:changed', this.geoCenter);
+        }
+
+        // 7. Sort Render List
+        const renderList = [];
+        for (const b of this._cachedDrawList) renderList.push({ type:'b', d:b.depth, data:b });
+        for (const f of this._features) renderList.push({ type:'f', d:tileDepth(f.tx, f.ty, cam.rotation), data:f });
+        renderList.push({ type:'p', d:pDepth, data:this.player });
+        renderList.sort((a,b) => a.d - b.d);
+
+        // 8. Render Pass
+        ctx.fillStyle = this.weather?.mode === 'rain' ? '#020308' : '#04060a'; 
+        ctx.fillRect(0, 0, W, H);
+        this._voxelR.beginFrame();
+        this._shadows.beginFrame();
+
+        // 8a. Tiles
+        const overAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
+        if (overAlpha > 0 && this.debugLayers.overpass) {
+          const lod = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
+          if (lod > 1) this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overAlpha);
+          else {
+            if (this._lastTileCamX === null || Math.abs(cam.camX - this._lastTileCamX) > 3) {
+              this._lastTileCamX = cam.camX;
+              const hw = tileHalfWidth(cam.zoom, cam.tileW), hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+              const txs = Math.min(120, Math.ceil(W / Math.max(1, hw)) + 4), tys = Math.min(120, Math.ceil(H / Math.max(1, hh)) + 4);
+              const vC = screenToWorld(W / 2, H / 2, cam);
+              const cx = Math.round(Math.max(0, Math.min(this._mapW, vC.x))), cy = Math.round(Math.max(0, Math.min(this._mapH, vC.y)));
+              this._tileCache = [];
+              for (let ty = Math.max(0, cy - tys); ty < Math.min(this._mapH, cy + tys); ty++)
+                for (let tx = Math.max(0, cx - txs); tx < Math.min(this._mapW, cx + txs); tx++)
+                  this._tileCache.push({ tx, ty, terrainId: this.terrainCache.get(tx - this._mapW / 2 + pGX, ty - this._mapH / 2 + pGY) ?? TerrainType.GRASS });
+            }
+            this._tileR.drawLayer(this._tileCache, this.player.x, this.player.y, this.terrainCache, pGX, pGY);
+          }
+        }
+
+        if (this._shadows.enabled && cam.tilt > 0.05) this._shadows.drawBuildingShadows(this._cachedDrawList);
+        this._featR.frameNow = ts;
+
+        // 8b. DRAW SORTED OBJECTS WITH TRANSPARENCY
+        for (const item of renderList) {
+          let isObstructing = false;
+
+          // detection logic: If item is in front of player (depth-wise)
+          if (item.d > pDepth) {
+              if (item.type === 'b') {
+                  // Building check: Screen distance check
+                  const bPos = worldToScreen(item.data.p.x, item.data.p.y, item.data.elev, cam);
+                  const dx = Math.abs(bPos.x - pScr.x);
+                  const dy = pScr.y - bPos.y; // positive dy means player is "behind" building base
+                  // If player is within building width and behind it visually
+                  if (dx < item.data.r * cam.zoom * 2 && dy > 0 && dy < item.data.engineH * cam.zoom * 1.5) {
+                      isObstructing = true;
+                  }
+              } else if (item.type === 'f') {
+                  // Feature/Tree check: simple radius
+                  const fPos = worldToScreen(item.data.tx+0.5, item.data.ty+0.5, 0, cam);
+                  const dist = Math.hypot(fPos.x - pScr.x, fPos.y - pScr.y);
+                  if (dist < 40 * cam.zoom) isObstructing = true;
+              }
+          }
+
+          ctx.globalAlpha = isObstructing ? 0.35 : 1.0;
+
+          if (item.type === 'b') {
+            const b = item.data; this._voxelR.beginTile(b.p.x, b.p.y, b.elev);
+            this._voxelR.box(-b.r, 0, -b.r, b.r * 2, b.engineH, b.r * 2, b.tc.top, b.tc.right, b.tc.left);
+            decorateBuildingFacade(ctx, cam, b, this._voxelR, Math.abs(Math.round(b.p.x * 31 + b.p.y * 17)));
+          } else if (item.type === 'f') {
+            this._featR.drawFeature(item.data, this._selectedId === item.data.id, this.terrainCache, pGX, pGY);
+          } else if (item.type === 'p') {
+            ctx.globalAlpha = 1.0; // Never make the player transparent
+            this._playerR.draw(this.player.x, this.player.y, pElev, this.player, this._mPerTile);
+          }
           
-          for (const b of this._buildings) {
-            const p = geoToTile(b.centroid.lat, b.centroid.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-            if (p.x < 0 || p.x >= this._mapW || p.y < 0 || p.y >= this._mapH) continue;
-            
-            const VU = 8;
-            const halfSideM = Math.sqrt(Math.max(1, b.areaM2));
-            const r = Math.max(VU, Math.min(VU * 20, (halfSideM / this._mPerTile / 2) * VU));
-            const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
-
-            // ── FIX: Calculate depth from the FRONT corner (nearest to camera) ──
-            // This ensures huge buildings draw AFTER things that are behind them
-            const rTiles = r / VU;
-            const frontX = p.x + rTiles * Math.abs(cr);
-            const frontY = p.y + rTiles * Math.abs(sr);
-            
-            const gx = Math.round(p.x) - this._mapW / 2 + pGX;
-            const gy = Math.round(p.y) - this._mapH / 2 + pGY;
-            const tType = this.terrainCache.get(gx, gy) ?? TerrainType.GRASS;
-            const elev = getElevOffset(this.terrainRegistry.heights[tType] ?? 1, cam.tilt, cam.zoom);
-            
-            this._cachedDrawList.push({ 
-              p, r, 
-              engineH: Math.max(VU, Math.min(VU * 60, (b.heightM / this._mPerTile) * VU)), 
-              tc: this.terrainRegistry.colors[TerrainType.BUILDING], 
-              depth: tileDepth(frontX, frontY, cam.rotation), // Use Front Depth
-              elev 
-            });
-          }
+          ctx.globalAlpha = 1.0;
         }
+
+        if (this.weather) this.weather.draw();
+
+        const geo = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+        this.emit('hud', { lat: geo.lat, lon: geo.lon, zoom: cam.zoom.toFixed(2), tilt: cam.tilt.toFixed(2), terrain: this.terrainRegistry.names[this.terrainCache.getLocal(this.player.x, this.player.y, pGX, pGY, this._mapW, this._mapH)] ?? 'Unknown' });
       }
-
-      // ── 4. Movement & Collision ──────────────────────────────────────────────
-      const mv = this._input.getMovementVector();
-      if (mv) {
-        this.player.isMoving = true;
-        this.player.faceAngle = Math.atan2(-mv.dy, mv.dx);
-        const hw = tileHalfWidth(cam.zoom, cam.tileW), hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-        const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
-        const rx = (mv.dx / hw + mv.dy / hh) * 0.5, ry = (mv.dy / hh - mv.dx / hw) * 0.5;
-        const wx = rx * cr - ry * sr, wy = rx * sr + ry * cr;
-        
-        const tState = this._getMovementState(this.player.x, this.player.y, pGX, pGY);
-        const spd = (PLAYER_SPEED * tState.speedMult) * dt * 60 / (Math.hypot(wx, wy) || 1);
-        this.player.walkCycle += dt * 15 * tState.speedMult;
-        
-        const nX = this.player.x + wx * spd, nY = this.player.y + wy * spd;
-        if (!this._getMovementState(nX, nY, pGX, pGY).isBlocked) { this.player.x = nX; this.player.y = nY; }
-        else if (!this._getMovementState(nX, this.player.y, pGX, pGY).isBlocked) { this.player.x = nX; }
-        else if (!this._getMovementState(this.player.x, nY, pGX, pGY).isBlocked) { this.player.y = nY; }
-        
-        this.player.x = Math.max(0.5, Math.min(this._mapW - 0.5, this.player.x));
-        this.player.y = Math.max(0.5, Math.min(this._mapH - 0.5, this.player.y));
-        
-        if (cam.tilt > 0.08) {
-          const { x: px, y: py } = worldToScreen(this.player.x, this.player.y, pElev, { ...cam, camX: 0, camY: 0 });
-          cam.camX += (px - W / 2 - cam.camX) * 0.08; 
-          cam.camY += (py - H / 2 - cam.camY) * 0.08;
-        }
-        this.emit('player:move', { x: this.player.x, y: this.player.y, geo: tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH), isSwimming: tState.isSwimming });
-      } else { this.player.isMoving = false; this.player.walkCycle = 0; }
-
-      // ── 5. World Re-centre (Teleport Fix) ────────────────────────────────────
-      const dFC = Math.hypot(this.player.x - this._mapW/2, this.player.y - this._mapH/2);
-      if (dFC > REFETCH_DIST && !this._fetching) {
-        const oldScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
-        this.geoCenter = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-        this.player.x = this._mapW/2; this.player.y = this._mapH/2;
-        const newScreen = worldToScreen(this.player.x, this.player.y, pElev, cam);
-        cam.camX += newScreen.x - oldScreen.x; cam.camY += newScreen.y - oldScreen.y;
-        this._lastTileCamX = null; this._cachedDrawList = []; 
-        this._rebuildFeatures(); this._doFetch(this.geoCenter);
-        this.emit('center:changed', this.geoCenter);
-      }
-
-      // ── 6. Render Pass ───────────────────────────────────────────────────────
-      ctx.fillStyle = this.weather?.mode === 'rain' ? '#020308' : '#04060a'; 
-      ctx.fillRect(0, 0, W, H);
-      this._voxelR.beginFrame();
-      this._shadows.beginFrame();
-
-      // 6a. Bottom Layer: Tiles
-      const overAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
-      if (overAlpha > 0 && this.debugLayers.overpass) {
-        const lod = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
-        if (lod > 1) this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overAlpha);
-        else {
-          if (this._lastTileCamX === null || Math.abs(cam.camX - this._lastTileCamX) > 3) {
-            this._lastTileCamX = cam.camX;
-            const hw = tileHalfWidth(cam.zoom, cam.tileW), hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-            const txs = Math.min(120, Math.ceil(W / Math.max(1, hw)) + 4), tys = Math.min(120, Math.ceil(H / Math.max(1, hh)) + 4);
-            const vC = screenToWorld(W / 2, H / 2, cam);
-            const cx = Math.round(Math.max(0, Math.min(this._mapW, vC.x))), cy = Math.round(Math.max(0, Math.min(this._mapH, vC.y)));
-            this._tileCache = [];
-            for (let ty = Math.max(0, cy - tys); ty < Math.min(this._mapH, cy + tys); ty++)
-              for (let tx = Math.max(0, cx - txs); tx < Math.min(this._mapW, cx + txs); tx++)
-                this._tileCache.push({ tx, ty, terrainId: this.terrainCache.get(tx - this._mapW / 2 + pGX, ty - this._mapH / 2 + pGY) ?? TerrainType.GRASS });
-          }
-          this._tileR.drawLayer(this._tileCache, this.player.x, this.player.y, this.terrainCache, pGX, pGY);
-        }
-      }
-
-      // 6b. Interleaved Depth-Sorted Layer
-      const renderList = [];
-      for (const b of this._cachedDrawList) renderList.push({ type:'b', d:b.depth, data:b });
-      for (const f of this._features) renderList.push({ type:'f', d:tileDepth(f.tx, f.ty, cam.rotation), data:f });
-      renderList.push({ type:'p', d:tileDepth(this.player.x, this.player.y, cam.rotation), data:this.player });
-      renderList.sort((a,b) => a.d - b.d);
-
-      if (this._shadows.enabled && cam.tilt > 0.05) this._shadows.drawBuildingShadows(this._cachedDrawList);
-      this._featR.frameNow = ts;
-
-      for (const item of renderList) {
-        if (item.type === 'b') {
-          const b = item.data; this._voxelR.beginTile(b.p.x, b.p.y, b.elev);
-          this._voxelR.box(-b.r, 0, -b.r, b.r * 2, b.engineH, b.r * 2, b.tc.top, b.tc.right, b.tc.left);
-          decorateBuildingFacade(ctx, cam, b, this._voxelR, Math.abs(Math.round(b.p.x * 31 + b.p.y * 17)));
-        } else if (item.type === 'f') {
-          this._featR.drawFeature(item.data, this._selectedId === item.data.id, this.terrainCache, pGX, pGY);
-        } else if (item.type === 'p') {
-          this._playerR.draw(this.player.x, this.player.y, pElev, this.player, this._mPerTile);
-        }
-      }
-
-      // 6c. Top Layer: Weather & UI
-      if (this.weather) this.weather.draw();
-
-      if (this.weather?.mode === 'rain') {
-        ctx.save(); ctx.globalCompositeOperation = 'multiply';
-        ctx.fillStyle = 'rgba(100, 110, 150, 0.15)'; 
-        ctx.fillRect(0, 0, W, H); ctx.restore();
-      }
-
-      const geo = tileToGeo(this.player.x, this.player.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-      this.emit('hud', { lat: geo.lat, lon: geo.lon, zoom: cam.zoom.toFixed(2), tilt: cam.tilt.toFixed(2), terrain: this.terrainRegistry.names[this.terrainCache.getLocal(this.player.x, this.player.y, pGX, pGY, this._mapW, this._mapH)] ?? 'Unknown' });
-    }
 
   // ── BUILDING DRAW ─────────────────────────────────────────────────────────
 
