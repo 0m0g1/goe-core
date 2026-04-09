@@ -546,7 +546,23 @@ _updateLocalEcosystem() {
           if (f.data?.category === 'nature') {
             const dx = f.tx - this.player.x, dy = f.ty - this.player.y;
             const distSq = dx * dx + dy * dy;
+
             if (f.data.subType === 'animal') {
+              // this._features.forEach(other => {
+              //     if (other.id !== f.id && other.data?.subType === 'animal') {
+              //         const sepX = f.tx - other.tx;
+              //         const sepY = f.ty - other.ty;
+              //         const sepDistSq = sepX * sepX + sepY * sepY;
+
+              //         // If they are within 0.6 tiles of each other, push away!
+              //         if (sepDistSq < 0.36) { 
+              //             const pushStrength = 0.02; 
+              //             f.tx += sepX * pushStrength;
+              //             f.ty += sepY * pushStrength;
+              //         }
+              //     }
+              // });
+              
               if (distSq < 64) {
                 const angle = Math.atan2(dy, dx);
                 const moveX = Math.cos(angle) * 0.05;

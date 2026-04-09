@@ -89,10 +89,13 @@ export class BioLoader extends BaseLoader {
     const latOffset = (Math.random() - 0.5) * 0.009;
     const lonOffset = (Math.random() - 0.5) * 0.009;
 
+    const jitterX = (Math.random() - 0.5) * 0.0001;
+    const jitterY = (Math.random() - 0.5) * 0.0001;
+
     return {
       id: `proc:${Math.random()}`,
-      latitude: center.lat + latOffset,
-      longitude: center.lon + lonOffset,
+      latitude: center.lat + latOffset + jitterX,
+      longitude: center.lon + lonOffset + jitterY,
       label: `Ambient ${preferredAsset}`,
       data: { 
         category: 'nature', 
