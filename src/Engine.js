@@ -535,11 +535,13 @@ _updateLocalEcosystem() {
       });
 
       // ── 3. Projection Prep ───────────────────────────────────────────────────
+      // ── 3. Projection Prep ───────────────────────────────────────────────────
       if (this._buildings.length > 0) {
         const rotChanged = this._lastBuildingRot === null || Math.abs(cam.rotation - this._lastBuildingRot) > 0.02;
         if (rotChanged || this._cachedDrawList.length !== this._buildings.length) {
           this._lastBuildingRot = cam.rotation;
           this._cachedDrawList = [];
+          
           for (const b of this._buildings) {
             const p = geoToTile(b.centroid.lat, b.centroid.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
             if (p.x < 0 || p.x >= this._mapW || p.y < 0 || p.y >= this._mapH) continue;
@@ -548,8 +550,12 @@ _updateLocalEcosystem() {
             const halfSideM = Math.sqrt(Math.max(1, b.areaM2));
             const r = Math.max(VU, Math.min(VU * 20, (halfSideM / this._mPerTile / 2) * VU));
             const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
-            const backX = p.x - (r / VU) * Math.abs(cr);
-            const backY = p.y - (r / VU) * Math.abs(sr);
+
+            // ── FIX: Calculate depth from the FRONT corner (nearest to camera) ──
+            // This ensures huge buildings draw AFTER things that are behind them
+            const rTiles = r / VU;
+            const frontX = p.x + rTiles * Math.abs(cr);
+            const frontY = p.y + rTiles * Math.abs(sr);
             
             const gx = Math.round(p.x) - this._mapW / 2 + pGX;
             const gy = Math.round(p.y) - this._mapH / 2 + pGY;
@@ -560,7 +566,7 @@ _updateLocalEcosystem() {
               p, r, 
               engineH: Math.max(VU, Math.min(VU * 60, (b.heightM / this._mPerTile) * VU)), 
               tc: this.terrainRegistry.colors[TerrainType.BUILDING], 
-              depth: tileDepth(backX, backY, cam.rotation), 
+              depth: tileDepth(frontX, frontY, cam.rotation), // Use Front Depth
               elev 
             });
           }
