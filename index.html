@@ -3,236 +3,38 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>GOE Core – Exploration Demo (Test Locations)</title>
+    <title>GOE Core – Unified Entity Demo</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            user-select: none;
-        }
-        body {
-            background: #04060a;
-            overflow: hidden;
-            font-family: 'Courier New', monospace;
-            height: 100vh;
-        }
-        canvas {
-            display: block;
-            width: 100%;
-            height: 100%;
-            image-rendering: crisp-edges;
-        }
-        .ui-panel {
-            position: absolute;
-            pointer-events: none;
-            text-shadow: 1px 1px 2px #000;
-            letter-spacing: 0.1em;
-        }
-        .badge {
-            position: absolute;
-            top: 16px;
-            left: 50%;
-            transform: translateX(-50%);
-            font-size: 10px;
-            letter-spacing: 0.18em;
-            text-transform: uppercase;
-            white-space: nowrap;
-            transition: color 0.3s;
-        }
-        .hud {
-            position: absolute;
-            top: 16px;
-            left: 16px;
-            font-size: 10px;
-            color: #504838;
-            line-height: 2;
-        }
-        .hud-title {
-            font-size: 12px;
-            color: #e0d0b0;
-            letter-spacing: 0.22em;
-            margin-bottom: 4px;
-        }
-        .controls {
-            position: absolute;
-            bottom: 54px;
-            left: 14px;
-            font-size: 9px;
-            color: #455034;
-            letter-spacing: 0.06em;
-            line-height: 2.2;
-        }
-        .legend {
-            position: absolute;
-            bottom: 54px;
-            right: 14px;
-            font-size: 9px;
-            color: #756f5d;
-            background: rgba(0,0,0,0.4);
-            padding: 8px;
-            border: 1px solid #282018;
-            pointer-events: none;
-            line-height: 2;
-        }
-        .legend-item {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-        .button-panel {
-            position: absolute;
-            top: 16px;
-            right: 16px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 6px;
-            pointer-events: auto;
-        }
-        .button-panel button {
-            width: 28px;
-            height: 28px;
-            background: #100e0c;
-            border: 1px solid #282018;
-            color: #907860;
-            font-size: 16px;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-family: monospace;
-        }
-        .tilt-indicator {
-            width: 3px;
-            height: 60px;
-            background: #141210;
-            border-radius: 2px;
-            margin-top: 6px;
-            position: relative;
-        }
-        .tilt-fill {
-            position: absolute;
-            bottom: 0;
-            width: 100%;
-            border-radius: 2px;
-            background: linear-gradient(to top, #3a8048, #a07830, #3a70a8);
-            transition: height 0.1s;
-        }
-        .card {
-            position: absolute;
-            bottom: 80px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(12,16,12,0.92);
-            border: 1px solid #384028;
-            padding: 14px 18px;
-            min-width: 220px;
-            max-width: 300px;
-            font-size: 11px;
-            line-height: 1.8;
-            letter-spacing: 0.08em;
-            color: #c0b898;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-            pointer-events: none;
-            transition: opacity 0.2s;
-        }
-        .loading-toast {
-            position: absolute;
-            bottom: 16px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: #181410;
-            border: 2px solid #504030;
-            border-radius: 4px;
-            color: #e0d0b0;
-            padding: 8px 16px;
-            font-size: 11px;
-            letter-spacing: 0.1em;
-            white-space: nowrap;
-            pointer-events: none;
-        }
-        .test-panel {
-            position: absolute;
-            bottom: 120px;
-            left: 14px;
-            background: rgba(0,0,0,0.7);
-            border: 1px solid #504030;
-            border-radius: 4px;
-            padding: 8px;
-            pointer-events: auto;
-            font-family: monospace;
-            font-size: 10px;
-            z-index: 200;
-        }
-        .test-panel button {
-            background: #201e1c;
-            border: 1px solid #706050;
-            color: #e0d0b0;
-            margin: 2px;
-            padding: 4px 8px;
-            cursor: pointer;
-            font-family: monospace;
-            font-size: 10px;
-        }
-        .test-panel button:hover {
-            background: #403830;
-        }
-        .debug-panel {
-            position: absolute;
-            bottom: 120px;
-            right: 14px;
-            background: rgba(0,0,0,0.7);
-            border: 1px solid #504030;
-            border-radius: 4px;
-            padding: 8px;
-            pointer-events: auto;
-            font-family: monospace;
-            font-size: 9px;
-            color: #c0b898;
-            z-index: 200;
-        }
-        .debug-panel button {
-            background: #201e1c;
-            border: 1px solid #706050;
-            color: #e0d0b0;
-            margin-top: 4px;
-            padding: 2px 6px;
-            cursor: pointer;
-            font-family: monospace;
-            font-size: 9px;
-        }
-
-        /* Dialogue Box */
-        .dialogue-overlay {
-            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
-            width: 600px; max-width: 90vw; background: rgba(12, 16, 20, 0.95);
-            border: 2px solid #3b82f6; border-radius: 8px; padding: 20px;
-            color: #e2e8f0; font-family: monospace; z-index: 1000;
-            display: none; box-shadow: 0 10px 30px rgba(0,0,0,0.8);
-            pointer-events: auto;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; }
+        body { background: #04060a; overflow: hidden; font-family: 'Courier New', monospace; height: 100vh; }
+        canvas { display: block; width: 100%; height: 100%; image-rendering: crisp-edges; }
+        .ui-panel { position: absolute; pointer-events: none; text-shadow: 1px 1px 2px #000; letter-spacing: 0.1em; }
+        .badge { position: absolute; top: 16px; left: 50%; transform: translateX(-50%); font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; white-space: nowrap; transition: color 0.3s; }
+        .hud { position: absolute; top: 16px; left: 16px; font-size: 10px; color: #504838; line-height: 2; }
+        .hud-title { font-size: 12px; color: #e0d0b0; letter-spacing: 0.22em; margin-bottom: 4px; }
+        .controls { position: absolute; bottom: 54px; left: 14px; font-size: 9px; color: #455034; letter-spacing: 0.06em; line-height: 2.2; }
+        .legend { position: absolute; bottom: 54px; right: 14px; font-size: 9px; color: #756f5d; background: rgba(0,0,0,0.4); padding: 8px; border: 1px solid #282018; pointer-events: none; line-height: 2; }
+        .legend-item { display: flex; align-items: center; gap: 6px; }
+        .button-panel { position: absolute; top: 16px; right: 16px; display: flex; flex-direction: column; align-items: center; gap: 6px; pointer-events: auto; }
+        .button-panel button { width: 28px; height: 28px; background: #100e0c; border: 1px solid #282018; color: #907860; font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-family: monospace; }
+        .tilt-indicator { width: 3px; height: 60px; background: #141210; border-radius: 2px; margin-top: 6px; position: relative; }
+        .tilt-fill { position: absolute; bottom: 0; width: 100%; border-radius: 2px; background: linear-gradient(to top, #3a8048, #a07830, #3a70a8); transition: height 0.1s; }
+        .card { position: absolute; bottom: 80px; left: 50%; transform: translateX(-50%); background: rgba(12,16,12,0.92); border: 1px solid #384028; padding: 14px 18px; min-width: 220px; max-width: 300px; font-size: 11px; line-height: 1.8; letter-spacing: 0.08em; color: #c0b898; box-shadow: 0 4px 12px rgba(0,0,0,0.5); pointer-events: none; transition: opacity 0.2s; }
+        .loading-toast { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); background: #181410; border: 2px solid #504030; border-radius: 4px; color: #e0d0b0; padding: 8px 16px; font-size: 11px; letter-spacing: 0.1em; white-space: nowrap; pointer-events: none; }
+        .test-panel { position: absolute; bottom: 120px; left: 14px; background: rgba(0,0,0,0.7); border: 1px solid #504030; border-radius: 4px; padding: 8px; pointer-events: auto; font-family: monospace; font-size: 10px; z-index: 200; }
+        .test-panel button { background: #201e1c; border: 1px solid #706050; color: #e0d0b0; margin: 2px; padding: 4px 8px; cursor: pointer; font-family: monospace; font-size: 10px; }
+        .test-panel button:hover { background: #403830; }
+        .debug-panel { position: absolute; bottom: 120px; right: 14px; background: rgba(0,0,0,0.7); border: 1px solid #504030; border-radius: 4px; padding: 8px; pointer-events: auto; font-family: monospace; font-size: 9px; color: #c0b898; z-index: 200; }
+        .debug-panel button { background: #201e1c; border: 1px solid #706050; color: #e0d0b0; margin-top: 4px; padding: 2px 6px; cursor: pointer; font-family: monospace; font-size: 9px; }
+        .dialogue-overlay { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); width: 600px; max-width: 90vw; background: rgba(12, 16, 20, 0.95); border: 2px solid #3b82f6; border-radius: 8px; padding: 20px; color: #e2e8f0; font-family: monospace; z-index: 1000; display: none; box-shadow: 0 10px 30px rgba(0,0,0,0.8); pointer-events: auto; }
         .dialogue-name { color: #fbbf24; font-size: 14px; font-weight: bold; margin-bottom: 8px; letter-spacing: 0.1em; text-transform: uppercase; }
         .dialogue-text { font-size: 16px; line-height: 1.5; margin-bottom: 16px; }
         .dialogue-choices { display: flex; flex-direction: column; gap: 8px; }
-        .dialogue-choice {
-            background: #1e293b; border: 1px solid #475569; color: #e2e8f0;
-            padding: 10px; cursor: pointer; text-align: left; font-family: monospace; transition: 0.2s;
-        }
+        .dialogue-choice { background: #1e293b; border: 1px solid #475569; color: #e2e8f0; padding: 10px; cursor: pointer; text-align: left; font-family: monospace; transition: 0.2s; }
         .dialogue-choice:hover { background: #3b82f6; color: white; }
-
-        /* Minigame Modal */
-        .minigame-modal {
-            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            width: 450px; height: 550px; background: #000; border: 4px solid #fbbf24;
-            z-index: 2000; display: none; pointer-events: auto; box-shadow: 0 10px 50px rgba(0,0,0,0.9);
-        }
+        .minigame-modal { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 450px; height: 550px; background: #000; border: 4px solid #fbbf24; z-index: 2000; display: none; pointer-events: auto; box-shadow: 0 10px 50px rgba(0,0,0,0.9); }
         .minigame-modal iframe { width: 100%; height: 100%; border: none; }
-        .close-game {
-            position: absolute; top: -15px; right: -15px; background: #ef4444;
-            color: white; border: 2px solid white; border-radius: 50%; width: 30px; height: 30px;
-            cursor: pointer; font-weight: bold; z-index: 2001;
-        }
+        .close-game { position: absolute; top: -15px; right: -15px; background: #ef4444; color: white; border: 2px solid white; border-radius: 50%; width: 30px; height: 30px; cursor: pointer; font-weight: bold; z-index: 2001; }
     </style>
 </head>
 <body>
@@ -303,7 +105,7 @@
     <iframe id="minigame-frame" src="about:blank"></iframe>
 </div>
 
-<!-- Sudoku HTML stored safely outside JS template literal -->
+<!-- Sudoku HTML template -->
 <script id="sudoku-template" type="text/html-template">
 <!DOCTYPE html>
 <html>
@@ -365,7 +167,7 @@
 </script>
 
 <script type="module">
-    import { Engine, OSMTerrainLoader, BioLoader, ElevationLoader, ElevationFormat, WeatherLoader, AviationLoader } from './src/GOECore.js';
+    import { Engine, OSMTerrainLoader, BioLoader, ElevationLoader, ElevationFormat, WeatherLoader, AviationLoader, ENTITY_TYPES } from './src/GOECore.js';
 
     // --------------------------------------------------------------
     // NPCs & Events
@@ -475,7 +277,7 @@
     const weatherLoader = new WeatherLoader(apiKey);
     engine.use(weatherLoader);
 
-    const aviationLoader = new AviationLoader(); // <── ADD THIS
+    const aviationLoader = new AviationLoader();
     engine.use(aviationLoader);
 
     const elevationLoader = new ElevationLoader(
@@ -516,7 +318,7 @@
     });
 
     // --------------------------------------------------------------
-    // Dialogue & UI Hooks
+    // Dialogue & UI Hooks (updated for unified entity system)
     // --------------------------------------------------------------
     const modeBadge   = document.getElementById('mode-badge');
     const hudCoords   = document.getElementById('hud-coords');
@@ -536,75 +338,73 @@
     const minigameModal  = document.getElementById('minigame-modal');
     const minigameFrame  = document.getElementById('minigame-frame');
 
-    // Read the sudoku HTML from the safe <script type="text/html-template"> tag
     const sudokuSrcDoc = document.getElementById('sudoku-template').textContent;
 
     let currentCardTimeout = null;
     let currentNPC = null;
 
     function renderDialogueNode(nodeId) {
-    if (nodeId === 'exit') {
-        dialogueBox.style.display = 'none';
-        currentNPC = null;
-        return;
+        if (nodeId === 'exit') {
+            dialogueBox.style.display = 'none';
+            currentNPC = null;
+            return;
+        }
+        const dialogue = currentNPC?.data?.dialogue || currentNPC?.dialogue;
+        const node = dialogue?.[nodeId];
+        if (!node) {
+            console.error('No dialogue node found for:', nodeId, currentNPC);
+            return;
+        }
+        dialogueText.innerText = node.text;
+        dialogueChoices.innerHTML = '';
+        if (node.action === 'trigger_sudoku') {
+            minigameModal.style.display = 'block';
+            minigameFrame.srcdoc = sudokuSrcDoc;
+        }
+        node.choices.forEach(choice => {
+            const btn = document.createElement('button');
+            btn.className = 'dialogue-choice';
+            btn.innerText = '> ' + choice.text;
+            btn.onclick = () => renderDialogueNode(choice.next);
+            dialogueChoices.appendChild(btn);
+        });
     }
 
-    // Walk down to wherever dialogue actually lives
-    const dialogue = currentNPC?.data?.dialogue || currentNPC?.dialogue;
-    const node = dialogue?.[nodeId];
-
-    if (!node) {
-        console.error('No dialogue node found for:', nodeId, currentNPC);
-        return;
-    }
-
-    dialogueText.innerText = node.text;
-    dialogueChoices.innerHTML = '';
-
-    if (node.action === 'trigger_sudoku') {
-        minigameModal.style.display = 'block';
-        minigameFrame.srcdoc = sudokuSrcDoc;
-    }
-
-    node.choices.forEach(choice => {
-        const btn = document.createElement('button');
-        btn.className = 'dialogue-choice';
-        btn.innerText = '> ' + choice.text;
-        btn.onclick = () => renderDialogueNode(choice.next);
-        dialogueChoices.appendChild(btn);
-    });
-}
-    engine.on('feature:click', ({ id, data, feature }) => {
-        // 1. Check if NPC
-        if (data.category === 'npc' || (data.data && data.data.category === 'npc')) {
+    // New entity click handler
+    engine.on('entity:click', ({ entity }) => {
+        // Check if entity is an NPC (type or data.category)
+        const isNPC = entity.type === ENTITY_TYPES.NPC || 
+                      (entity.data && entity.data.category === 'npc') ||
+                      (entity.data && entity.data.dialogue);
+        
+        if (isNPC) {
             eventCard.style.display = 'none';
             if (currentCardTimeout) clearTimeout(currentCardTimeout);
-
-            currentNPC = data.data ? data.data : data;
-            dialogueName.innerText = currentNPC.title || data.label || 'NPC';
+            currentNPC = entity.data || entity;
+            dialogueName.innerText = currentNPC.title || entity.label || 'NPC';
             dialogueBox.style.display = 'block';
             renderDialogueNode('start');
             return;
         }
 
-        // 2. Normal POI logic
+        // Regular POI / event
         dialogueBox.style.display = 'none';
-        const ev = data;
+        const ev = entity.data || entity;
         const color = eventColor(ev);
         eventCard.style.display = 'block';
-        eventCard.innerHTML =
-            '<div style="font-size:9px;letter-spacing:.2em;text-transform:uppercase;margin-bottom:4px;color:' + color + '">' +
-                String(ev.category || ev.type || 'event').toUpperCase() +
-            '</div>' +
-            '<div style="font-size:13px;color:#e8db9b;letter-spacing:.15em;margin-bottom:2px">' +
-                (ev.title || ev.name || 'Untitled') +
-            '</div>' +
-            (ev.year ? '<div style="color:#8a9973">' + ev.year + '</div>' : '') +
-            (ev.description ? '<div style="color:#756f5d;margin-top:4px;font-size:10px">' + ev.description.slice(0, 120) + (ev.description.length > 120 ? '…' : '') + '</div>' : '') +
-            '<div style="color:#455034;font-size:9px;margin-top:6px">' +
-                Number(ev.latitude).toFixed(4) + '°, ' + Number(ev.longitude).toFixed(4) + '°' +
-            '</div>';
-
+        eventCard.innerHTML = `
+            <div style="font-size:9px;letter-spacing:.2em;text-transform:uppercase;margin-bottom:4px;color:${color}">
+                ${String(ev.category || ev.type || 'event').toUpperCase()}
+            </div>
+            <div style="font-size:13px;color:#e8db9b;letter-spacing:.15em;margin-bottom:2px">
+                ${ev.title || ev.name || 'Untitled'}
+            </div>
+            ${ev.year ? `<div style="color:#8a9973">${ev.year}</div>` : ''}
+            ${ev.description ? `<div style="color:#756f5d;margin-top:4px;font-size:10px">${ev.description.slice(0, 120)}${ev.description.length > 120 ? '…' : ''}</div>` : ''}
+            <div style="color:#455034;font-size:9px;margin-top:6px">
+                ${Number(ev.latitude).toFixed(4)}°, ${Number(ev.longitude).toFixed(4)}°
+            </div>
+        `;
         if (currentCardTimeout) clearTimeout(currentCardTimeout);
         currentCardTimeout = setTimeout(() => {
             eventCard.style.display = 'none';
@@ -637,27 +437,30 @@
     });
 
     function updateDebugStats() {
-        const buildings = engine._buildings ? engine._buildings.length : 0;
-        const pois      = engine._features  ? engine._features.length  : 0;
+        // Count entities by type
+        const buildings = engine.entities.filter(e => e.type === ENTITY_TYPES.BUILDING).length;
+        const pois = engine.entities.filter(e => e.type === ENTITY_TYPES.FEATURE).length;
         const cacheSize = engine.terrainCache ? engine.terrainCache.size() : 0;
-        debugStats.innerHTML = 'Buildings: ' + buildings + '<br>POIs: ' + pois + '<br>Cache: ' + cacheSize;
+        debugStats.innerHTML = `Buildings: ${buildings}<br>POIs: ${pois}<br>Cache: ${cacheSize}`;
     }
 
     function updateNearbyCount() {
         if (!engine.player) return;
-        const px = engine.player.x, py = engine.player.y;
+        const px = engine.player.tx;
+        const py = engine.player.ty;
         let count = 0;
-        for (const f of engine._features) {
-            const dx = Math.abs(f.tx - px);
-            const dy = Math.abs(f.ty - py);
+        for (const e of engine.entities) {
+            if (e === engine.player) continue;
+            const dx = Math.abs(e.tx - px);
+            const dy = Math.abs(e.ty - py);
             if (dx < 10 && dy < 10) count++;
         }
-        hudNearby.innerText = count ? '◈ ' + count + ' event' + (count !== 1 ? 's' : '') + ' nearby' : '';
+        hudNearby.innerText = count ? `◈ ${count} entity${count !== 1 ? 's' : ''} nearby` : '';
     }
 
     engine.on('hud', ({ lat, lon, zoom, tilt, terrain }) => {
-        hudCoords.innerText  = lat.toFixed(5) + '° N \u00a0 ' + lon.toFixed(5) + '° E';
-        hudZoom.innerText    = 'zoom: ' + zoom + '× \u00a0 tilt: ' + (tilt * 100).toFixed(0) + '%';
+        hudCoords.innerText  = `${lat.toFixed(5)}° N \u00a0 ${lon.toFixed(5)}° E`;
+        hudZoom.innerText    = `zoom: ${zoom}× \u00a0 tilt: ${(tilt * 100).toFixed(0)}%`;
         hudTerrain.innerText = terrain;
         if (tilt < 0.05)       modeBadge.style.color = '#3a70a8';
         else if (tilt > 0.95)  modeBadge.style.color = '#e8db9b';
@@ -680,7 +483,10 @@
         }
     }, 500);
 
+    // Re-emit player:move from engine's internal movement (if not already emitted)
+    // We'll listen to engine's custom event if available, otherwise fallback to periodic check
     engine.on('player:move', () => updateNearbyCount());
+    // Fallback: update nearby on each frame via HUD? Already calls updateNearbyCount, so fine.
 
     // UI buttons
     document.getElementById('zoom-in').addEventListener('click', () => {

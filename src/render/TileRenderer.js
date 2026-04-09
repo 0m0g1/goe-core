@@ -1,47 +1,33 @@
-import { topFaceQuad, lerpColor, tileDepth, worldToScreen } from '../math/projection.js';
+import { lerpColor, tileDepth, worldToScreen, topFaceQuad } from '../math/projection.js';
 
 export class TileRenderer {
-  /**
-   * @param {CanvasRenderingContext2D} ctx
-   * @param {object} cam
-   * @param {object} terrainRegistry
-   * @param {object|null} shadowSystem
-   */
   constructor(ctx, cam, terrainRegistry, shadowSystem = null) {
-    this.ctx     = ctx;
-    this.cam     = cam;
-    this.terrain = terrainRegistry;
+    this.ctx      = ctx;
+    this.cam      = cam;
+    this.terrain  = terrainRegistry;
     this._shadows = shadowSystem;
 
-    // ── Baked-map cache ─────────────────────────────────────────────────────
-    // One flat canvas that holds every tile in a straight top-down grid.
-    // It is re-baked whenever the player moves (pGX/pGY changes) or the
-    // sun moves enough to alter AO colours.
-    this._mapCanvas   = document.createElement('canvas');
-    this._mapCtx      = this._mapCanvas.getContext('2d');
-    this._lastPGX     = null;
-    this._lastPGY     = null;
+    // ── Baked flat-map canvas ───────────────────────────────────────────────
+    // One pixel per tile.  We keep it tiny (1px/tile) so the drawImage call
+    // is fast; the canvas transform handles all the scaling/skewing.
+    // You can raise BAKE_TILE_PX to e.g. 4 if you want sub-tile colour
+    // gradients (AO) to look smoother, but 1 is fine for solid tiles.
+    this.BAKE_TILE_PX = 1;
+
+    this._mapCanvas = document.createElement('canvas');
+    this._mapCtx    = this._mapCanvas.getContext('2d', { alpha: false });
+
+    this._lastPGX      = null;
+    this._lastPGY      = null;
     this._lastSunAngle = shadowSystem?.sunAngle    ?? 0;
     this._lastSunElev  = shadowSystem?.sunElevation ?? 0;
-    this._bakeDirty   = true;           // force first bake
+    this._bakeDirty    = true;
 
-    // Pixels per tile inside the baked image (does NOT have to match screen size)
-    this.BAKE_TILE_PX = 32;
-
-    // Reusable sort buffer — avoids allocation every frame
+    // Reusable depth-sort buffer
     this._sortBuf = [];
   }
 
-  // ── Private: bake all tiles into a straight grid image ───────────────────
-  /**
-   * Renders every tile (0…mapW, 0…mapH) into `this._mapCanvas` as a plain
-   * rectangular grid.  AO / shadow colours are applied at this stage so the
-   * per-tile draw loop is free of per-pixel maths.
-   *
-   * @param {object} terrainCache
-   * @param {number} pGX   player global-X (used by terrainCache.getLocal)
-   * @param {number} pGY   player global-Y
-   */
+  // ── Bake every tile into the flat grid image ──────────────────────────────
   _bakeMap(terrainCache, pGX, pGY) {
     const { cam, terrain } = this;
     const W  = cam.mapW;
@@ -54,151 +40,108 @@ export class TileRenderer {
 
     for (let ty = 0; ty < H; ty++) {
       for (let tx = 0; tx < W; tx++) {
-        // getLocal uses the player position so the cache stays correct as the
-        // player moves.  Falls back to terrainId 5 (default) if out of bounds.
         const tid = terrainCache.getLocal?.(tx, ty, pGX, pGY, W, H)
                  ?? terrainCache.get?.(tx, ty)
                  ?? 5;
         const terrainId = (tid !== null && tid !== undefined) ? tid : 5;
-
         const c = terrain.colors[terrainId] || terrain.colors[5];
 
-        // Base colour for the top face, blended by tilt for flat-view compat.
         let color = lerpColor(c.flat, c.top, cam.tilt);
 
-        // Apply AO / ambient shadow on top of the base colour.
         if (this._shadows?.enabled) {
           const ao = this._shadows.aoFactor(
-            tx, ty,
-            terrainCache,
-            pGX, pGY,
-            W, H,
-            terrain
+            tx, ty, terrainCache, pGX, pGY, W, H, terrain
           );
-          if (ao < 0.999) {
-            color = this._shadows.applyAO(color, ao);
-          }
+          if (ao < 0.999) color = this._shadows.applyAO(color, ao);
         }
 
         ictx.fillStyle = color;
-        // +0.5 overlap prevents hairline seams inside the baked image
-        ictx.fillRect(tx * PX, ty * PX, PX + 0.5, PX + 0.5);
+        ictx.fillRect(tx * PX, ty * PX, PX, PX);
       }
     }
 
     this._bakeDirty = false;
   }
 
-  // ── Private: should we re-bake this frame? ────────────────────────────────
   _needsRebake(pGX, pGY) {
-    if (this._bakeDirty)           return true;
-    if (pGX !== this._lastPGX)     return true;
-    if (pGY !== this._lastPGY)     return true;
+    if (this._bakeDirty)       return true;
+    if (pGX !== this._lastPGX) return true;
+    if (pGY !== this._lastPGY) return true;
     if (this._shadows?.enabled) {
-      if (Math.abs((this._shadows.sunAngle    ?? 0) - this._lastSunAngle) > 0.1) return true;
+      if (Math.abs((this._shadows.sunAngle    ?? 0) - this._lastSunAngle) > 0.1)  return true;
       if (Math.abs((this._shadows.sunElevation ?? 0) - this._lastSunElev)  > 0.01) return true;
     }
     return false;
   }
 
-  // ── drawTile: draws a single isometric quad, sampling colour from the baked
-  //              image so no per-tile colour maths are needed here.
-  /**
-   * @param {number} tx           local tile X (0…mapW)
-   * @param {number} ty           local tile Y (0…mapH)
-   * @param {number} terrainId
-   * @param {boolean} highlight   player-position highlight
-   */
-  drawTile(tx, ty, terrainId, highlight = false) {
-    const { ctx, cam, terrain } = this;
-    const PX   = this.BAKE_TILE_PX;
-    const quad = topFaceQuad(tx, ty, 0, cam);
+  // ── Draw the whole baked image in ONE call using an iso transform ─────────
+  //
+  //  The isometric projection maps tile (tx, ty) to screen via worldToScreen.
+  //  worldToScreen is linear in tx and ty, so we can express it as a 2-D affine:
+  //
+  //    screen.x = ox + tx * a + ty * c
+  //    screen.y = oy + tx * b + ty * d
+  //
+  //  We derive those vectors by sampling worldToScreen at three known points,
+  //  set ctx.setTransform once, then drawImage the baked canvas — done.
+  //  No per-tile clipping, no gaps, no bleeding.
+  //
+  _drawBakedImage() {
+    const { ctx, cam } = this;
+    const PX = this.BAKE_TILE_PX;
 
-    // Build the clipping path for this tile's isometric quad
+    // Sample three corners to derive the affine transform
+    const p00 = worldToScreen(0, 0, 0, cam);  // tile (0,0) origin
+    const p10 = worldToScreen(1, 0, 0, cam);  // +1 tile in X
+    const p01 = worldToScreen(0, 1, 0, cam);  // +1 tile in Y
+
+    // Per-bake-pixel step vectors
+    const ax = (p10.x - p00.x) / PX;   // screen dx per baked pixel in X
+    const ay = (p10.y - p00.y) / PX;
+    const bx = (p01.x - p00.x) / PX;   // screen dx per baked pixel in Y
+    const by = (p01.y - p00.y) / PX;
+
     ctx.save();
+    // setTransform(a, b, c, d, e, f) maps image pixel (px,py) to screen:
+    //   screenX = a*px + c*py + e
+    //   screenY = b*px + d*py + f
+    ctx.setTransform(ax, ay, bx, by, p00.x, p00.y);
+    ctx.imageSmoothingEnabled = false;  // keep pixel edges crisp
+    ctx.drawImage(this._mapCanvas, 0, 0);
+    ctx.restore();
+  }
+
+  // ── Per-tile highlight overlay (player position, hover, etc.) ────────────
+  _drawHighlight(tx, ty) {
+    const { ctx, cam } = this;
+    const quad = topFaceQuad(tx, ty, 0, cam);
     ctx.beginPath();
     quad.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
     ctx.closePath();
-    ctx.clip();
-
-    // ── Map the flat baked tile onto the isometric quad via a CSS/canvas
-    //    transform.  We place the image so tile (tx,ty) sits exactly under
-    //    the quad's top-left corner, then apply the same transform that turns
-    //    top-down into isometric.
-    //
-    //    The quad corners (from topFaceQuad) are:
-    //      [0] top   (tx+0.5, ty)     → screen "apex"
-    //      [1] right (tx+1,   ty+0.5)
-    //      [2] bottom(tx+0.5, ty+1)
-    //      [3] left  (tx,     ty+0.5)
-    //
-    //    We use a 2-D affine transform whose columns are derived from the
-    //    two edge vectors of the quad so the baked pixels stretch perfectly
-    //    into the diamond shape.
-    const [p0, p1, , p3] = quad; // top, right, _, left
-
-    // Vector along the "right" edge of the iso diamond (maps bake-X axis)
-    const ax = p1.x - p0.x,  ay = p1.y - p0.y;   // right edge (1 tile)
-    // Vector along the "left"  edge of the iso diamond (maps bake-Y axis)
-    const bx = p3.x - p0.x,  by = p3.y - p0.y;   // left  edge (1 tile)
-
-    // Scale from bake-pixel space to tile space
-    const s = 1 / PX;
-
-    // setTransform(a, b, c, d, e, f) maps unit square → screen quad:
-    //   e, f  = screen position of tile origin (top corner of diamond)
-    //   a, b  = right-edge vector scaled to one bake-pixel
-    //   c, d  = left-edge vector scaled to one bake-pixel
-    ctx.setTransform(
-      ax * s, ay * s,
-      bx * s, by * s,
-      p0.x, p0.y
-    );
-
-    // Draw the entire baked map; only the clipped tile region is visible.
-    ctx.drawImage(
-      this._mapCanvas,
-      -tx * PX, -ty * PX   // offset so this tile's pixels align with the origin
-    );
-
-    ctx.restore();          // resets transform + clip
-
-    // Player-position highlight on top
-    if (highlight) {
-      ctx.beginPath();
-      quad.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
-      ctx.closePath();
-      ctx.fillStyle = 'rgba(255,255,255,0.18)';
-      ctx.fill();
-    }
-
-    // Grid lines at low tilt angles
-    if (cam.tilt < 0.35) {
-      ctx.beginPath();
-      quad.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
-      ctx.closePath();
-      ctx.strokeStyle = `rgba(0,0,0,${(1 - cam.tilt / 0.35) * 0.15})`;
-      ctx.lineWidth   = 0.5;
-      ctx.stroke();
-    }
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.fill();
   }
 
-  // ── drawLayer: main entry-point called by the engine each frame ───────────
-  /**
-   * @param {object[]} tiles        visible tile list from the engine
-   * @param {number}   playerTx     player local tile X
-   * @param {number}   playerTy     player local tile Y
-   * @param {object}   terrainCache
-   * @param {number}   pGX          player global X
-   * @param {number}   pGY          player global Y
-   */
+  // ── Optional per-tile grid lines at low tilt ─────────────────────────────
+  _drawGrid(tx, ty) {
+    const { ctx, cam } = this;
+    const quad = topFaceQuad(tx, ty, 0, cam);
+    ctx.beginPath();
+    quad.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+    ctx.closePath();
+    ctx.strokeStyle = `rgba(0,0,0,${(1 - cam.tilt / 0.35) * 0.15})`;
+    ctx.lineWidth   = 0.5;
+    ctx.stroke();
+  }
+
+  // ── Main entry point called by the engine each frame ─────────────────────
   drawLayer(tiles, playerTx, playerTy, terrainCache, pGX, pGY) {
     const { ctx, cam } = this;
     const W      = ctx.canvas.width;
     const H      = ctx.canvas.height;
     const MARGIN = 80;
 
-    // ── 1. Conditionally re-bake the flat map image ─────────────────────────
+    // 1. Re-bake flat map if player moved or sun shifted
     if (this._needsRebake(pGX, pGY)) {
       this._bakeMap(terrainCache, pGX, pGY);
       this._lastPGX      = pGX;
@@ -207,7 +150,10 @@ export class TileRenderer {
       this._lastSunElev  = this._shadows?.sunElevation ?? 0;
     }
 
-    // ── 2. Screen-cull ───────────────────────────────────────────────────────
+    // 2. Stamp the entire baked map onto the screen in ONE drawImage call
+    this._drawBakedImage();
+
+    // 3. Cull visible tiles — only needed for overlay passes below
     const buf = this._sortBuf;
     buf.length = 0;
     for (const t of tiles) {
@@ -217,20 +163,23 @@ export class TileRenderer {
       t._depth = tileDepth(t.tx, t.ty, cam.rotation);
       buf.push(t);
     }
-
-    // ── 3. Depth-sort ────────────────────────────────────────────────────────
     buf.sort((a, b) => a._depth - b._depth);
 
-    // ── 4. Draw each visible tile by sampling from the baked image ──────────
-    const floorPX = Math.floor(playerTx);
-    const floorPY = Math.floor(playerTy);
+    // 4. Overlay pass — highlights and grid lines only
+    const floorPX  = Math.floor(playerTx);
+    const floorPY  = Math.floor(playerTy);
+    const needGrid = cam.tilt < 0.35;
+
     for (const t of buf) {
-      const isPl = t.tx === floorPX && t.ty === floorPY;
-      this.drawTile(t.tx, t.ty, t.terrainId, isPl);
+      if (t.tx === floorPX && t.ty === floorPY) this._drawHighlight(t.tx, t.ty);
+      if (needGrid) this._drawGrid(t.tx, t.ty);
     }
   }
 
-  // ── LOD / merged-block helpers (unchanged from V1) ────────────────────────
+  // ── Force rebake next frame (call after terrain edits) ───────────────────
+  invalidate() { this._bakeDirty = true; }
+
+  // ── LOD helpers (unchanged from V1) ──────────────────────────────────────
 
   drawMergedBlock(blockX, blockY, lod, terrainCache, pGX, pGY, alpha) {
     const { ctx, cam, terrain } = this;
@@ -242,7 +191,7 @@ export class TileRenderer {
       ty: blockY + lod / 2 - pGY + mapH / 2,
     };
     const sc = worldToScreen(centerLocal.tx, centerLocal.ty, 0, cam);
-    const blockScreenSize = lod * tileHalfWidth(cam.zoom, cam.tileW) * 2;
+    const blockScreenSize = lod * (cam.tileW * cam.zoom * 0.5) * 2;
     if (sc.x < -blockScreenSize || sc.x > W + blockScreenSize ||
         sc.y < -blockScreenSize || sc.y > H + blockScreenSize) return;
 
@@ -302,15 +251,4 @@ export class TileRenderer {
       }
     }
   }
-
-  // ── Utility ───────────────────────────────────────────────────────────────
-
-  /** Force the baked image to be rebuilt on the next frame. */
-  invalidate() {
-    this._bakeDirty = true;
-  }
-}
-
-function tileHalfWidth(zoom, tileW) {
-  return tileW * zoom * 0.5;
 }
