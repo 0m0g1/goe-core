@@ -39,7 +39,8 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-export { Engine, ENTITY_TYPES } from './Engine.js';
+export { Entity, ENTITY_TYPES } from './core/Entity.js'
+export { Engine } from './Engine.js';
 export { Camera } from './core/Camera.js';
 export { InputManager } from './core/InputManager.js';
 export { TerrainCache } from './terrain/TerrainCache.js';

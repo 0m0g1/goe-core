@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>GOE Core – Unified Entity Demo</title>
+    <title>GOE Core – Physics Test</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; }
         body { background: #04060a; overflow: hidden; font-family: 'Courier New', monospace; height: 100vh; }
@@ -35,6 +35,42 @@
         .minigame-modal { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 450px; height: 550px; background: #000; border: 4px solid #fbbf24; z-index: 2000; display: none; pointer-events: auto; box-shadow: 0 10px 50px rgba(0,0,0,0.9); }
         .minigame-modal iframe { width: 100%; height: 100%; border: none; }
         .close-game { position: absolute; top: -15px; right: -15px; background: #ef4444; color: white; border: 2px solid white; border-radius: 50%; width: 30px; height: 30px; cursor: pointer; font-weight: bold; z-index: 2001; }
+
+        /* New physics panel */
+        .physics-panel {
+            position: absolute;
+            top: 160px;
+            right: 16px;
+            background: rgba(0,0,0,0.75);
+            border: 1px solid #3a8048;
+            border-radius: 6px;
+            padding: 8px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            pointer-events: auto;
+            font-family: monospace;
+            z-index: 200;
+        }
+        .physics-panel button {
+            background: #2a2a1c;
+            border: 1px solid #6a8048;
+            color: #c0e0a0;
+            padding: 4px 8px;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        .physics-panel button:hover {
+            background: #4a6a2a;
+            color: white;
+        }
+        .physics-panel span {
+            color: #c0e0a0;
+            font-size: 9px;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -75,6 +111,13 @@
     <div class="tilt-indicator"><div class="tilt-fill" id="tilt-fill"></div></div>
 </div>
 
+<!-- NEW: Physics test panel -->
+<div class="physics-panel">
+    <button id="spawn-ball-btn">🟢 SPAWN BALL</button>
+    <button id="kick-ball-btn">⚡ KICK BALL</button>
+    <span id="ball-count">Balls: 0</span>
+</div>
+
 <div class="test-panel">
     <div style="color:#e0d0b0; margin-bottom:4px;">📍 TEST SPOTS</div>
     <button data-lat="-1.2489" data-lon="36.6642">🏫 Alliance High School</button>
@@ -105,7 +148,6 @@
     <iframe id="minigame-frame" src="about:blank"></iframe>
 </div>
 
-<!-- Sudoku HTML template -->
 <script id="sudoku-template" type="text/html-template">
 <!DOCTYPE html>
 <html>
@@ -167,10 +209,47 @@
 </script>
 
 <script type="module">
-    import { Engine, OSMTerrainLoader, BioLoader, ElevationLoader, ElevationFormat, WeatherLoader, AviationLoader, ENTITY_TYPES } from './src/GOECore.js';
+    import { Engine, OSMTerrainLoader, BioLoader, ElevationLoader, ElevationFormat, WeatherLoader, AviationLoader, Entity, ENTITY_TYPES, worldToScreen } from './src/GOECore.js';
+    // We'll also need Vector2D for forces – import from local physics folder (if available)
+    // For simplicity, we can use engine.physicsWorld and its Vector2D class if exposed.
+    // Since we have local physics files, we import Vector2D directly.
+    import Vector2D       from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/vector2d.js';
 
     // --------------------------------------------------------------
-    // NPCs & Events
+    // Custom Ball Entity (physics test)
+    // --------------------------------------------------------------
+    class BallEntity extends Entity {
+        constructor(id, tx, ty) {
+            super(id, ENTITY_TYPES.FEATURE, tx, ty);
+            this.physicsEnabled = true;
+            this.physicsRadius = 0.4;
+            this.fixed = false;
+            this.solid = false;
+            this.color = '#ff3333';
+            this.label = '';
+        }
+
+        render(ctx, cam, groundElevPx, extra) {
+            const { x, y } = worldToScreen(this.tx + 0.5, this.ty + 0.5, groundElevPx + this.elevOffset, cam);
+            const r = 10 * cam.zoom;
+            const grad = ctx.createRadialGradient(x-3, y-3, 2, x, y, r);
+            grad.addColorStop(0, '#ff8888');
+            grad.addColorStop(1, '#cc2222');
+            ctx.beginPath();
+            ctx.arc(x, y, r, 0, Math.PI*2);
+            ctx.fillStyle = grad;
+            ctx.fill();
+            ctx.shadowBlur = 0;
+            // Optional: add a small highlight
+            ctx.beginPath();
+            ctx.arc(x-2, y-2, r*0.25, 0, Math.PI*2);
+            ctx.fillStyle = 'rgba(255,255,200,0.6)';
+            ctx.fill();
+        }
+    }
+
+    // --------------------------------------------------------------
+    // NPCs & Events (unchanged)
     // --------------------------------------------------------------
     const npcMaki = {
         id: 'npc_maki',
@@ -291,7 +370,77 @@
     engine.mount(canvas);
 
     // --------------------------------------------------------------
-    // Helper: Jump to location
+    // Physics test helpers
+    // --------------------------------------------------------------
+    let ballIdCounter = 0;
+    const balls = new Set(); // keep track for UI
+
+    function updateBallCountUI() {
+        const count = Array.from(engine.entities).filter(e => e instanceof BallEntity).length;
+        document.getElementById('ball-count').innerText = `Balls: ${count}`;
+    }
+
+    function spawnBall() {
+        if (!engine.playerEntity) return;
+        const tx = engine.playerEntity.tx;
+        const ty = engine.playerEntity.ty;
+        const id = `ball_${Date.now()}_${ballIdCounter++}`;
+        const ball = new BallEntity(id, tx, ty);
+        engine.addEntity(ball);
+        // After attachment, adjust damping
+        if (ball._particle) {
+            ball._particle.damping = 0.97; // lower damping = faster stop
+        }
+        updateBallCountUI();
+        setTimeout(() => {
+            if (engine.entities.includes(ball)) {
+                engine.removeEntity(ball.id);
+                updateBallCountUI();
+            }
+        }, 30000);
+    }
+
+    function kickNearestBall() {
+        if (!engine.playerEntity) return;
+        const playerPos = { x: engine.playerEntity.tx, y: engine.playerEntity.ty };
+        let closest = null;
+        let minDist = Infinity;
+        for (const e of engine.entities) {
+            if (e instanceof BallEntity && e._particle) {
+                const dx = e.tx - playerPos.x;
+                const dy = e.ty - playerPos.y;
+                const dist = Math.hypot(dx, dy);
+                if (dist < minDist) {
+                    minDist = dist;
+                    closest = e;
+                }
+            }
+        }
+        if (closest && closest._particle) {
+            const angle = Math.random() * Math.PI * 2;
+            const strength = (1.5 + Math.random() * 2.5) / 10; // much lower
+            const vx = Math.cos(angle) * strength;
+            const vy = Math.sin(angle) * strength;
+            const p = closest._particle;
+            p.prevPosition = new Vector2D(p.position.x - vx, p.position.y - vy);
+        }
+    }
+        
+    // Wait for engine to be ready and then attach UI buttons
+    setTimeout(() => {
+        const spawnBtn = document.getElementById('spawn-ball-btn');
+        const kickBtn = document.getElementById('kick-ball-btn');
+        if (spawnBtn) spawnBtn.onclick = () => spawnBall();
+        if (kickBtn) kickBtn.onclick = () => kickNearestBall();
+    }, 500);
+
+    // Also update ball count periodically (in case of auto-removal)
+    setInterval(() => {
+        updateBallCountUI();
+    }, 2000);
+
+    // --------------------------------------------------------------
+    // Helper: Jump to location (unchanged)
     // --------------------------------------------------------------
     async function jumpTo(lat, lon) {
         engine.camera.zoom = 0.5;
@@ -318,7 +467,7 @@
     });
 
     // --------------------------------------------------------------
-    // Dialogue & UI Hooks (updated for unified entity system)
+    // Dialogue & UI Hooks (unchanged, but using entity:click)
     // --------------------------------------------------------------
     const modeBadge   = document.getElementById('mode-badge');
     const hudCoords   = document.getElementById('hud-coords');
@@ -370,9 +519,8 @@
         });
     }
 
-    // New entity click handler
     engine.on('entity:click', ({ entity }) => {
-        // Check if entity is an NPC (type or data.category)
+        // Check if entity is an NPC
         const isNPC = entity.type === ENTITY_TYPES.NPC || 
                       (entity.data && entity.data.category === 'npc') ||
                       (entity.data && entity.data.dialogue);
@@ -437,7 +585,6 @@
     });
 
     function updateDebugStats() {
-        // Count entities by type
         const buildings = engine.entities.filter(e => e.type === ENTITY_TYPES.BUILDING).length;
         const pois = engine.entities.filter(e => e.type === ENTITY_TYPES.FEATURE).length;
         const cacheSize = engine.terrainCache ? engine.terrainCache.size() : 0;
@@ -483,12 +630,8 @@
         }
     }, 500);
 
-    // Re-emit player:move from engine's internal movement (if not already emitted)
-    // We'll listen to engine's custom event if available, otherwise fallback to periodic check
     engine.on('player:move', () => updateNearbyCount());
-    // Fallback: update nearby on each frame via HUD? Already calls updateNearbyCount, so fine.
 
-    // UI buttons
     document.getElementById('zoom-in').addEventListener('click', () => {
         engine.camera.zoomIn(canvas.width / 2, canvas.height / 2);
     });
@@ -502,7 +645,6 @@
         engine.camera.rotateRight();
     });
 
-    // Initial centre
     setTimeout(() => {
         engine._centreCameraOnPlayer();
     }, 100);

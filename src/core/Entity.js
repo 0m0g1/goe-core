@@ -1,11 +1,13 @@
-// src/core/Entity.js
-import { worldToScreen, tileDepth } from '../math/projection.js';
-import { geoToTile, tileToGeo } from '../math/geo.js';
+// ─────────────────────────────────────────────────────────────────────────────
+// Entity system – base classes with physics support
 
+import { geoToTile, tileToGeo } from "../math/geo.js";
+
+// ─────────────────────────────────────────────────────────────────────────────
 export const ENTITY_TYPES = {
   PLAYER:    'player',
   BUILDING:  'building',
-  FEATURE:   'feature',   // POI, event, generic point
+  FEATURE:   'feature',
   TREE:      'tree',
   VEHICLE:   'vehicle',
   NPC:       'npc',
@@ -14,27 +16,20 @@ export const ENTITY_TYPES = {
 };
 
 export class Entity {
-  /**
-   * @param {string} id        Unique identifier
-   * @param {string} type      One of ENTITY_TYPES
-   * @param {number} tx        World tile X (local to current map centre)
-   * @param {number} ty        World tile Y
-   * @param {number} [elevOffset=0]   Additional Z offset (px, after ground elevation)
-   */
   constructor(id, type, tx, ty, elevOffset = 0) {
     this.id = id;
     this.type = type;
     this.tx = tx;
     this.ty = ty;
-    this.elevOffset = elevOffset;   // px, added to ground elevation
-    this.bboxRadius = 0.4;          // tile units, for collision / picking
+    this.elevOffset = elevOffset;   // additional px above ground
+    this.bboxRadius = 0.4;          // tile units (for manual collision checks)
     this.visible = true;
-    this._cache = {};               // renderer-specific cache
-  }
 
-  // ---- Position helpers -------------------------------------------------
-  getPosition(geoCenter, mPerTile, mapW, mapH) {
-    return { x: this.tx, y: this.ty };
+    // Physics properties (Yaphe)
+    this.physicsEnabled = false;     // whether this entity participates in physics
+    this.physicsRadius = 0.4;       // collision radius in tile units
+    this.fixed = false;             // if true, particle is immovable
+    this._particle = null;          // reference to Yaphe Particle2D
   }
 
   getGeo(geoCenter, mPerTile, mapW, mapH) {
@@ -47,53 +42,37 @@ export class Entity {
     this.ty = pos.y;
   }
 
-  // ---- Render -----------------------------------------------------------
-  /**
-   * Called by FeatureRenderer (or generic EntityRenderer) each frame.
-   * @param {CanvasRenderingContext2D} ctx
-   * @param {object} cam
-   * @param {number} groundElevPx   Final elevation from terrain (px)
-   * @param {object} extra          Optional frame data (weather, time, etc.)
-   */
-  render(ctx, cam, groundElevPx, extra = {}) {
-    // Default: draw a simple coloured circle
-    const { x, y } = worldToScreen(this.tx + 0.5, this.ty + 0.5, groundElevPx + this.elevOffset, cam);
-    ctx.beginPath();
-    ctx.arc(x, y, 8 * cam.zoom, 0, Math.PI * 2);
-    ctx.fillStyle = this.color || '#888';
-    ctx.fill();
-    if (this.label) {
-      ctx.fillStyle = 'white';
-      ctx.font = '10px sans-serif';
-      ctx.fillText(this.label, x - 10, y - 8);
+  // Sync physics particle position back to entity
+  syncPhysics() {
+    if (this._particle) {
+      this.tx = this._particle.position.x;
+      this.ty = this._particle.position.y;
     }
   }
 
-  // ---- Update (AI, animation, movement) --------------------------------
-  update(dt, engine) {
-    // override in subclasses
+  // Remove physics particle from the world (call before removing entity)
+  removePhysics(physicsWorld) {
+    if (this._particle && physicsWorld) {
+      const idx = physicsWorld.particles.indexOf(this._particle);
+      if (idx !== -1) physicsWorld.particles.splice(idx, 1);
+      // Also remove from quadtree? PhysicsWorld2D handles that in its update.
+      this._particle = null;
+    }
   }
 
-  // ---- Interaction -----------------------------------------------------
+  render(ctx, cam, groundElevPx, extra) {
+    // fallback: coloured circle
+    const { x, y } = worldToScreen(this.tx + 0.5, this.ty + 0.5, groundElevPx + this.elevOffset, cam);
+    ctx.beginPath();
+    ctx.arc(x, y, 6 * cam.zoom, 0, Math.PI * 2);
+    ctx.fillStyle = this.color || '#888';
+    ctx.fill();
+  }
+
+  update(dt, engine) {} // override in subclasses
+
   onInteract(engine, screenX, screenY) {
     engine.emit('entity:interact', { entity: this, screenX, screenY });
   }
-
-  // ---- Serialisation ---------------------------------------------------
-  toJSON() {
-    return {
-      id: this.id,
-      type: this.type,
-      tx: this.tx,
-      ty: this.ty,
-      elevOffset: this.elevOffset,
-      // subclasses should call super.toJSON() and extend
-    };
-  }
-
-  static fromJSON(data) {
-    const e = new Entity(data.id, data.type, data.tx, data.ty, data.elevOffset);
-    // restore any additional fields
-    return e;
-  }
 }
+
