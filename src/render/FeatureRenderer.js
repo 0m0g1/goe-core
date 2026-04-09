@@ -168,6 +168,9 @@ export class FeatureRenderer {
     // 3. Blueprint lookup - Check tags aggressively to catch everything
     const tags = f.data?.tags || {};
     const keyCandidates = [
+      f.asset,                           // For Ecosystem trees
+      f.data?.asset,                     // Standard data override
+      f.data?.data?.asset,
       tags.amenity, tags.shop, tags.leisure, tags.tourism, tags.building,
       (f.data?.title || f.data?.label || "").toLowerCase().replace(/\s+/g, "_"),
       ftype.asset

@@ -333,5 +333,10 @@ export const Blueprints = {
      { x: -0.5, y: 0, z: -0.5, w: 1, h: 8, d: 1, top: '#8B6030', right: '#6B4420', front: '#4a2a10' }, // Trunk
      { x: -5, y: 8, z: 0, w: 10, h: 0.2, d: 1, top: '#4ab030', right: '#2a8020', front: '#2a8020' }, // Frond H
      { x: 0, y: 8, z: -5, w: 1, h: 0.2, d: 10, top: '#4ab030', right: '#2a8020', front: '#2a8020' }  // Frond V
+  ],
+  npc_person: [
+    { x: -0.5, y: 0,   z: -0.5, w: 1, h: 1.5, d: 1, top: '#2b2b2b', right: '#1a1a1a', front: '#111111' }, // Legs
+    { x: -0.8, y: 1.5, z: -0.5, w: 1.6, h: 2,   d: 1, top: '#3b82f6', right: '#2563eb', front: '#1d4ed8' }, // Torso (Blue Shirt)
+    { x: -0.6, y: 3.5, z: -0.6, w: 1.2, h: 1.2, d: 1.2, top: '#fcd34d', right: '#fbbf24', front: '#f59e0b' } // Head
   ]
 };

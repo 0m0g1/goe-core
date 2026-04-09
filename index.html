@@ -152,7 +152,6 @@
             white-space: nowrap;
             pointer-events: none;
         }
-        /* Test spot panel */
         .test-panel {
             position: absolute;
             bottom: 120px;
@@ -203,13 +202,43 @@
             font-family: monospace;
             font-size: 9px;
         }
+
+        /* Dialogue Box */
+        .dialogue-overlay {
+            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+            width: 600px; max-width: 90vw; background: rgba(12, 16, 20, 0.95);
+            border: 2px solid #3b82f6; border-radius: 8px; padding: 20px;
+            color: #e2e8f0; font-family: monospace; z-index: 1000;
+            display: none; box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+            pointer-events: auto;
+        }
+        .dialogue-name { color: #fbbf24; font-size: 14px; font-weight: bold; margin-bottom: 8px; letter-spacing: 0.1em; text-transform: uppercase; }
+        .dialogue-text { font-size: 16px; line-height: 1.5; margin-bottom: 16px; }
+        .dialogue-choices { display: flex; flex-direction: column; gap: 8px; }
+        .dialogue-choice {
+            background: #1e293b; border: 1px solid #475569; color: #e2e8f0;
+            padding: 10px; cursor: pointer; text-align: left; font-family: monospace; transition: 0.2s;
+        }
+        .dialogue-choice:hover { background: #3b82f6; color: white; }
+
+        /* Minigame Modal */
+        .minigame-modal {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 450px; height: 550px; background: #000; border: 4px solid #fbbf24;
+            z-index: 2000; display: none; pointer-events: auto; box-shadow: 0 10px 50px rgba(0,0,0,0.9);
+        }
+        .minigame-modal iframe { width: 100%; height: 100%; border: none; }
+        .close-game {
+            position: absolute; top: -15px; right: -15px; background: #ef4444;
+            color: white; border: 2px solid white; border-radius: 50%; width: 30px; height: 30px;
+            cursor: pointer; font-weight: bold; z-index: 2001;
+        }
     </style>
 </head>
 <body>
 
 <canvas id="game-canvas"></canvas>
 
-<!-- UI overlays -->
 <div class="ui-panel badge" id="mode-badge">◉ GLOBAL MAP</div>
 
 <div class="ui-panel hud">
@@ -244,7 +273,6 @@
     <div class="tilt-indicator"><div class="tilt-fill" id="tilt-fill"></div></div>
 </div>
 
-<!-- Test spots panel -->
 <div class="test-panel">
     <div style="color:#e0d0b0; margin-bottom:4px;">📍 TEST SPOTS</div>
     <button data-lat="40.7580" data-lon="-73.9855">🗽 NYC Times Sq</button>
@@ -254,26 +282,127 @@
     <button data-lat="52.5200" data-lon="13.4050">🇩🇪 Berlin Alex</button>
 </div>
 
-<!-- Debug panel -->
 <div class="debug-panel" id="debug-panel">
     <div>🐞 DEBUG</div>
     <div id="debug-stats">Buildings: 0<br>POIs: 0<br>Cache: 0</div>
-    <button id="clear-cache-btn">🗑️ Clear Cache & Reload</button>
+    <button id="clear-cache-btn">🗑️ Clear Cache &amp; Reload</button>
 </div>
 
 <div id="event-card" class="card" style="display: none;"></div>
 <div id="loading-toast" class="loading-toast" style="display: none;">⟳ Fetching local 3D terrain…</div>
 
+<div id="dialogue-box" class="dialogue-overlay">
+    <div id="dialogue-name" class="dialogue-name">Name</div>
+    <div id="dialogue-text" class="dialogue-text">Text goes here...</div>
+    <div id="dialogue-choices" class="dialogue-choices"></div>
+</div>
+
+<div id="minigame-modal" class="minigame-modal">
+    <button class="close-game" id="close-game-btn">X</button>
+    <iframe id="minigame-frame" src="about:blank"></iframe>
+</div>
+
+<!-- Sudoku HTML stored safely outside JS template literal -->
+<script id="sudoku-template" type="text/html-template">
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { font-family: monospace; background: #0c1014; color: #e2e8f0; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+    h2 { color: #fbbf24; margin-bottom: 20px; letter-spacing: 2px; }
+    .grid { display: grid; grid-template-columns: repeat(9, 1fr); gap: 1px; background: #fbbf24; border: 3px solid #fbbf24; }
+    .cell { width: 40px; height: 40px; text-align: center; font-size: 20px; border: none; background: #1e293b; color: #fff; outline: none; }
+    .cell:focus { background: #3b82f6; }
+    .cell.fixed { background: #0f172a; color: #fbbf24; font-weight: bold; pointer-events: none; }
+    button { margin-top: 20px; padding: 12px 24px; background: #3b82f6; color: #fff; border: none; font-weight: bold; cursor: pointer; border-radius: 4px; font-family: monospace; font-size: 16px; }
+    button:hover { background: #2563eb; }
+    #msg { margin-top: 15px; min-height: 20px; color: #22c55e; }
+  </style>
+</head>
+<body>
+  <h2>TRIAL OF LOGIC</h2>
+  <div class="grid" id="board"></div>
+  <button onclick="checkWin()">VERIFY</button>
+  <p id="msg"></p>
+  <script>
+    var puzzle = [
+      5,3,0, 0,7,0, 0,0,0,
+      6,0,0, 1,9,5, 0,0,0,
+      0,9,8, 0,0,0, 0,6,0,
+      8,0,0, 0,6,0, 0,0,3,
+      4,0,0, 8,0,3, 0,0,1,
+      7,0,0, 0,2,0, 0,0,6,
+      0,6,0, 0,0,0, 2,8,0,
+      0,0,0, 4,1,9, 0,0,5,
+      0,0,0, 0,8,0, 0,7,9
+    ];
+    var board = document.getElementById('board');
+    var inputs = [];
+    puzzle.forEach(function(val) {
+      var input = document.createElement('input');
+      input.className = 'cell' + (val ? ' fixed' : '');
+      input.maxLength = 1;
+      input.value = val ? val : '';
+      input.oninput = function(e) {
+        var v = e.target.value;
+        if (v.length > 0 && (isNaN(v) || v < '1' || v > '9')) {
+          e.target.value = '';
+        }
+      };
+      board.appendChild(input);
+      inputs.push(input);
+    });
+    function checkWin() {
+      var isFull = inputs.every(function(i) { return i.value !== ''; });
+      var msg = document.getElementById('msg');
+      if (!isFull) { msg.style.color = '#ef4444'; msg.innerText = 'The board is incomplete.'; return; }
+      msg.style.color = '#22c55e'; msg.innerText = 'Impressive. Logic prevails!';
+    }
+  </script>
+</body>
+</html>
+</script>
+
 <script type="module">
     import { Engine, OSMTerrainLoader, BioLoader, ElevationLoader, ElevationFormat, WeatherLoader } from './src/GOECore.js';
 
     // --------------------------------------------------------------
-    // Sample events (optional, you can add more)
+    // NPCs & Events
     // --------------------------------------------------------------
+    const npcMaki = {
+        id: 'npc_maki',
+        title: 'Maki Kaji',
+        category: 'npc',
+        latitude: 35.6586,
+        longitude: 139.7454,
+        color: '#fbbf24',
+        data: {
+            category: 'npc',
+            asset: 'npc_person',
+            dialogue: {
+                start: {
+                    text: "Ah, a traveler! I am Maki Kaji, the godfather of Sudoku. The world is built on logic and numbers. Do you wish to test your mind?",
+                    choices: [
+                        { text: "I'm ready. Let's play!", next: 'play_game' },
+                        { text: "Not right now, thanks.", next: 'exit' }
+                    ]
+                },
+                play_game: {
+                    text: "Excellent! Let the numbers guide your path.",
+                    action: 'trigger_sudoku',
+                    choices: [
+                        { text: "Farewell.", next: 'exit' }
+                    ]
+                }
+            }
+        }
+    };
+
     const sampleEvents = [
         { id: 'evt1', title: 'Battle of Hastings', category: 'war', latitude: 50.886, longitude: 0.488, year: 1066, description: 'Norman conquest of England.' },
         { id: 'evt2', title: 'Moon Landing', category: 'science', latitude: 0.674, longitude: 23.473, year: 1969, description: 'First humans on the Moon.' },
-        { id: 'evt3', title: 'Fall of Berlin Wall', category: 'politics', latitude: 52.516, longitude: 13.382, year: 1989, description: 'End of Cold War division.' }
+        { id: 'evt3', title: 'Fall of Berlin Wall', category: 'politics', latitude: 52.516, longitude: 13.382, year: 1989, description: 'End of Cold War division.' },
+        npcMaki
     ];
 
     const categoryColors = {
@@ -286,6 +415,7 @@
         disaster: '#dc2626', nature: '#10b981',
         economics: '#eab308', trade: '#eab308'
     };
+
     function eventColor(item) {
         const cat = String(item?.category || item?.type || '').toLowerCase();
         for (const [k, v] of Object.entries(categoryColors))
@@ -293,7 +423,7 @@
         return '#60a5fa';
     }
 
-    function buildFeatures(events, geoCenter) {
+    function buildFeatures(events) {
         return events.map(ev => ({
             id: ev.id,
             latitude: ev.latitude,
@@ -316,8 +446,8 @@
         geoCenter: initialGeo,
         showPlayer: true,
         tileURLFn: (z, x, y) => `https://a.tile.openstreetmap.org/${z}/${x}/${y}.png`,
-        mapW: 400,        // ← must match loader
-        mapH: 400,        // ← must match loader
+        mapW: 400,
+        mapH: 400,
         cameraOpts: {
             zoom: 0.35,
             zoomFlat: 0.18,
@@ -326,28 +456,24 @@
         }
     });
 
-    // Add terrain loader (enhanced version that fetches POIs)
     const terrainLoader = new OSMTerrainLoader({
         mPerTile: 2,
-        mapW: 400,        // was 80 — 8× bigger
-        mapH: 400,        // was 80
-        fetchRadiusM: 1500  // was 800 — covers the full tile area
+        mapW: 400,
+        mapH: 400,
+        fetchRadiusM: 1500
     });
     engine.use(terrainLoader);
 
-
     const bioLoader = new BioLoader({
-        limit: 50,         // Don't overwhelm the engine
-        fetchRadiusM: 800  // Match your visibility
+        limit: 50,
+        fetchRadiusM: 800
     });
-    engine.use(bioLoader); // <── THIS is what "does stuff"
+    engine.use(bioLoader);
 
-    // 3. Setup REAL Weather (Corrected Constructor)
     const apiKey = "b69650bacdb53e8000e14a735bb53035";
-    const weatherLoader = new WeatherLoader(apiKey); 
+    const weatherLoader = new WeatherLoader(apiKey);
     engine.use(weatherLoader);
 
-    // Add elevation loader
     const elevationLoader = new ElevationLoader(
         (z, x, y) => `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`,
         ElevationFormat.TERRARIUM,
@@ -355,63 +481,162 @@
     );
     engine.setElevationLoader(elevationLoader);
 
-    // Set initial events
-    engine.setFeatures(buildFeatures(sampleEvents, engine.geoCenter));
-
-    // Mount and start loop
+    engine.setFeatures(buildFeatures(sampleEvents));
     engine.mount(canvas);
 
     // --------------------------------------------------------------
-    // Helper: Jump to location and optionally clear cache
+    // Helper: Jump to location
     // --------------------------------------------------------------
-    async function jumpTo(lat, lon, clearCache = false) {
-    if (clearCache) {
-        await terrainLoader.clearCache();
-        alert('Cache cleared. Reloading page...');
-        location.reload();
-        return;
-    }
-    engine.camera.zoom = 0.5;  // set zoom BEFORE panTo so centering uses it
-    engine.panTo(lat, lon);
+    async function jumpTo(lat, lon) {
+        engine.camera.zoom = 0.5;
+        engine.panTo(lat, lon);
     }
 
-    // Attach test spot buttons
     document.querySelectorAll('.test-panel button').forEach(btn => {
         btn.addEventListener('click', () => {
             const lat = parseFloat(btn.dataset.lat);
             const lon = parseFloat(btn.dataset.lon);
-            jumpTo(lat, lon, false);
+            jumpTo(lat, lon);
         });
     });
 
-    // Clear cache button
     document.getElementById('clear-cache-btn').addEventListener('click', async () => {
         await terrainLoader.clearCache();
         alert('Cache cleared. Reloading page...');
         location.reload();
     });
 
+    document.getElementById('close-game-btn').addEventListener('click', () => {
+        document.getElementById('minigame-modal').style.display = 'none';
+        document.getElementById('minigame-frame').src = 'about:blank';
+    });
+
     // --------------------------------------------------------------
-    // UI updates
+    // Dialogue & UI Hooks
     // --------------------------------------------------------------
-    const modeBadge = document.getElementById('mode-badge');
-    const hudCoords = document.getElementById('hud-coords');
-    const hudZoom = document.getElementById('hud-zoom');
-    const hudTerrain = document.getElementById('hud-terrain');
-    const hudElevation = document.getElementById('hud-elevation');
-    const hudNearby = document.getElementById('hud-nearby');
-    const tiltFill = document.getElementById('tilt-fill');
-    const eventCard = document.getElementById('event-card');
-    const loadingToast = document.getElementById('loading-toast');
-    const debugStats = document.getElementById('debug-stats');
+    const modeBadge   = document.getElementById('mode-badge');
+    const hudCoords   = document.getElementById('hud-coords');
+    const hudZoom     = document.getElementById('hud-zoom');
+    const hudTerrain  = document.getElementById('hud-terrain');
+    const hudElevation= document.getElementById('hud-elevation');
+    const hudNearby   = document.getElementById('hud-nearby');
+    const tiltFill    = document.getElementById('tilt-fill');
+    const eventCard   = document.getElementById('event-card');
+    const loadingToast= document.getElementById('loading-toast');
+    const debugStats  = document.getElementById('debug-stats');
+
+    const dialogueBox    = document.getElementById('dialogue-box');
+    const dialogueName   = document.getElementById('dialogue-name');
+    const dialogueText   = document.getElementById('dialogue-text');
+    const dialogueChoices= document.getElementById('dialogue-choices');
+    const minigameModal  = document.getElementById('minigame-modal');
+    const minigameFrame  = document.getElementById('minigame-frame');
+
+    // Read the sudoku HTML from the safe <script type="text/html-template"> tag
+    const sudokuSrcDoc = document.getElementById('sudoku-template').textContent;
 
     let currentCardTimeout = null;
+    let currentNPC = null;
+
+    function renderDialogueNode(nodeId) {
+    if (nodeId === 'exit') {
+        dialogueBox.style.display = 'none';
+        currentNPC = null;
+        return;
+    }
+
+    // Walk down to wherever dialogue actually lives
+    const dialogue = currentNPC?.data?.dialogue || currentNPC?.dialogue;
+    const node = dialogue?.[nodeId];
+
+    if (!node) {
+        console.error('No dialogue node found for:', nodeId, currentNPC);
+        return;
+    }
+
+    dialogueText.innerText = node.text;
+    dialogueChoices.innerHTML = '';
+
+    if (node.action === 'trigger_sudoku') {
+        minigameModal.style.display = 'block';
+        minigameFrame.srcdoc = sudokuSrcDoc;
+    }
+
+    node.choices.forEach(choice => {
+        const btn = document.createElement('button');
+        btn.className = 'dialogue-choice';
+        btn.innerText = '> ' + choice.text;
+        btn.onclick = () => renderDialogueNode(choice.next);
+        dialogueChoices.appendChild(btn);
+    });
+}
+    engine.on('feature:click', ({ id, data, feature }) => {
+        // 1. Check if NPC
+        if (data.category === 'npc' || (data.data && data.data.category === 'npc')) {
+            eventCard.style.display = 'none';
+            if (currentCardTimeout) clearTimeout(currentCardTimeout);
+
+            currentNPC = data.data ? data.data : data;
+            dialogueName.innerText = currentNPC.title || data.label || 'NPC';
+            dialogueBox.style.display = 'block';
+            renderDialogueNode('start');
+            return;
+        }
+
+        // 2. Normal POI logic
+        dialogueBox.style.display = 'none';
+        const ev = data;
+        const color = eventColor(ev);
+        eventCard.style.display = 'block';
+        eventCard.innerHTML =
+            '<div style="font-size:9px;letter-spacing:.2em;text-transform:uppercase;margin-bottom:4px;color:' + color + '">' +
+                String(ev.category || ev.type || 'event').toUpperCase() +
+            '</div>' +
+            '<div style="font-size:13px;color:#e8db9b;letter-spacing:.15em;margin-bottom:2px">' +
+                (ev.title || ev.name || 'Untitled') +
+            '</div>' +
+            (ev.year ? '<div style="color:#8a9973">' + ev.year + '</div>' : '') +
+            (ev.description ? '<div style="color:#756f5d;margin-top:4px;font-size:10px">' + ev.description.slice(0, 120) + (ev.description.length > 120 ? '…' : '') + '</div>' : '') +
+            '<div style="color:#455034;font-size:9px;margin-top:6px">' +
+                Number(ev.latitude).toFixed(4) + '°, ' + Number(ev.longitude).toFixed(4) + '°' +
+            '</div>';
+
+        if (currentCardTimeout) clearTimeout(currentCardTimeout);
+        currentCardTimeout = setTimeout(() => {
+            eventCard.style.display = 'none';
+        }, 5000);
+    });
+
+    engine.on('map:click', () => {
+        eventCard.style.display = 'none';
+        dialogueBox.style.display = 'none';
+        if (currentCardTimeout) clearTimeout(currentCardTimeout);
+    });
+
+    engine.on('map:rightclick', ({ lat, lon }) => {
+        console.log('Right-click at ' + lat + ', ' + lon);
+        alert('Add event at ' + lat.toFixed(5) + ', ' + lon.toFixed(5));
+    });
+
+    engine.on('fetch:start', () => {
+        loadingToast.style.display = 'block';
+        hudTerrain.innerText = '⟳ loading map…';
+    });
+    engine.on('fetch:done', () => {
+        loadingToast.style.display = 'none';
+        updateDebugStats();
+    });
+
+    engine.on('weather:changed', (w) => {
+        document.getElementById('hud-terrain').innerHTML +=
+            ' <span style="color:#60a5fa">(' + w.condition + ', ' + w.temp + '°C)</span>';
+    });
 
     function updateDebugStats() {
-        const buildings = engine._buildings?.length || 0;
-        const pois = engine._features?.length || 0;
-        const cacheSize = engine.terrainCache?.size() || 0;
-        debugStats.innerHTML = `Buildings: ${buildings}<br>POIs: ${pois}<br>Cache: ${cacheSize}`;
+        const buildings = engine._buildings ? engine._buildings.length : 0;
+        const pois      = engine._features  ? engine._features.length  : 0;
+        const cacheSize = engine.terrainCache ? engine.terrainCache.size() : 0;
+        debugStats.innerHTML = 'Buildings: ' + buildings + '<br>POIs: ' + pois + '<br>Cache: ' + cacheSize;
     }
 
     function updateNearbyCount() {
@@ -423,69 +648,19 @@
             const dy = Math.abs(f.ty - py);
             if (dx < 10 && dy < 10) count++;
         }
-        hudNearby.innerText = count ? `◈ ${count} event${count !== 1 ? 's' : ''} nearby` : '';
+        hudNearby.innerText = count ? '◈ ' + count + ' event' + (count !== 1 ? 's' : '') + ' nearby' : '';
     }
 
     engine.on('hud', ({ lat, lon, zoom, tilt, terrain }) => {
-        hudCoords.innerText = `${lat.toFixed(5)}° N &nbsp; ${lon.toFixed(5)}° E`;
-        hudZoom.innerText = `zoom: ${zoom}× &nbsp; tilt: ${(tilt * 100).toFixed(0)}%`;
+        hudCoords.innerText  = lat.toFixed(5) + '° N \u00a0 ' + lon.toFixed(5) + '° E';
+        hudZoom.innerText    = 'zoom: ' + zoom + '× \u00a0 tilt: ' + (tilt * 100).toFixed(0) + '%';
         hudTerrain.innerText = terrain;
-        if (tilt < 0.05) modeBadge.style.color = '#3a70a8';
-        else if (tilt > 0.95) modeBadge.style.color = '#e8db9b';
-        else modeBadge.style.color = '#a07830';
-        tiltFill.style.height = `${tilt * 100}%`;
+        if (tilt < 0.05)       modeBadge.style.color = '#3a70a8';
+        else if (tilt > 0.95)  modeBadge.style.color = '#e8db9b';
+        else                   modeBadge.style.color = '#a07830';
+        tiltFill.style.height = (tilt * 100) + '%';
         updateNearbyCount();
         updateDebugStats();
-    });
-
-    engine.on('feature:click', ({ id, data, feature }) => {
-        const ev = data;
-        const color = eventColor(ev);
-        eventCard.style.display = 'block';
-        eventCard.innerHTML = `
-            <div style="font-size:9px;letter-spacing:.2em;text-transform:uppercase;margin-bottom:4px;color:${color}">
-                ${String(ev.category || ev.type || 'event').toUpperCase()}
-            </div>
-            <div style="font-size:13px;color:#e8db9b;letter-spacing:.15em;margin-bottom:2px">
-                ${ev.title || ev.name || 'Untitled'}
-            </div>
-            ${ev.year ? `<div style="color:#8a9973">${ev.year}</div>` : ''}
-            ${ev.description ? `<div style="color:#756f5d;margin-top:4px;font-size:10px">${ev.description.slice(0,120)}${ev.description.length>120?'…':''}</div>` : ''}
-            <div style="color:#455034;font-size:9px;margin-top:6px">
-                ${Number(ev.latitude).toFixed(4)}°, ${Number(ev.longitude).toFixed(4)}°
-            </div>
-        `;
-        if (currentCardTimeout) clearTimeout(currentCardTimeout);
-        currentCardTimeout = setTimeout(() => {
-            eventCard.style.display = 'none';
-        }, 5000);
-    });
-
-    engine.on('map:click', () => {
-        eventCard.style.display = 'none';
-        if (currentCardTimeout) clearTimeout(currentCardTimeout);
-    });
-
-    engine.on('map:rightclick', ({ lat, lon }) => {
-        console.log(`Right-click at ${lat}, ${lon}`);
-        alert(`Add event at ${lat.toFixed(5)}, ${lon.toFixed(5)}`);
-    });
-
-    engine.on('fetch:start', () => {
-        loadingToast.style.display = 'block';
-        hudTerrain.innerText = '⟳ loading map…';
-    });
-    engine.on('fetch:done', () => {
-        loadingToast.style.display = 'none';
-        updateDebugStats();
-        
-        const cache = engine.terrainCache;
-        const allKeys = cache._map ? [...cache._map.keys()] : [];
-    });
-    // 4. Update HUD with Weather Info
-    engine.on('weather:changed', (w) => {
-        const hudTerrain = document.getElementById('hud-terrain');
-        hudTerrain.innerHTML += ` <span style="color:#60a5fa">(${w.condition}, ${w.temp}°C)</span>`;
     });
 
     setInterval(() => {

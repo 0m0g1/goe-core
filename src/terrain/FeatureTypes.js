@@ -135,6 +135,8 @@ export const FeatureTypes = {
   hotel:          { color: '#886622', asset: 'default',      height: 8,  category: 'tourism',    label: 'Hotel',          renderMode: 'tower' },
   viewpoint:      { color: '#ff8844', asset: 'default',      height: 3,  category: 'tourism',    label: 'Viewpoint',      renderMode: 'blueprint' },
   information:    { color: '#2288aa', asset: 'default',      height: 1,  category: 'tourism',    label: 'Info',           renderMode: 'blueprint' },
+
+  npc:    { color: '#2288aa', asset: 'npc_person',      height: 1,  category: 'tourism',    label: 'Info',           renderMode: 'blueprint' },
 };
 
 /**
