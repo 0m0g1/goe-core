@@ -24,6 +24,7 @@ export class Entity {
     this.elevOffset = elevOffset;   // additional px above ground
     this.bboxRadius = 0.4;          // tile units (for manual collision checks)
     this.visible = true;
+    this.solid = false;
 
     // Physics properties (Yaphe)
     this.blocking = true;

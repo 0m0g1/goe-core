@@ -42,6 +42,7 @@ import Constraint2D   from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/con
 import Vector2D       from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/vector2d.js';
 
 import { Entity, ENTITY_TYPES } from './core/Entity.js';
+import { Quadtree } from './spatial/Quadtree.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tree blueprint key mapping
@@ -67,9 +68,12 @@ class PlayerEntity extends Entity {
     this.physicsEnabled = true;
     this.physicsRadius  = 0.5;
     this.fixed          = false;
+    this.solid          = false;   // Player is not solid (doesn't block others)
+    this.bboxRadius     = 0.5;
 
     this._posHistory      = [];
     this._POS_HISTORY_MAX = 10;
+    this.solid = true;
   }
 
   update(dt, engine) {
@@ -77,43 +81,47 @@ class PlayerEntity extends Entity {
     const mv    = input.getMovementVector();
 
     if (mv) {
-      this.isMoving  = true;
-      this.faceAngle = Math.atan2(-mv.dy, mv.dx);
+        this.isMoving  = true;
+        this.faceAngle = Math.atan2(-mv.dy, mv.dx);
 
-      const cam = engine.camera;
-      const hw  = tileHalfWidth(cam.zoom, cam.tileW);
-      const hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-      const cr  = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
-      const rx  = (mv.dx / hw + mv.dy / hh) * 0.5;
-      const ry  = (mv.dy / hh - mv.dx / hw) * 0.5;
-      const wx  = rx * cr - ry * sr;
-      const wy  = rx * sr + ry * cr;
-      const spd = (0.22 * this.speedMult) * dt * 60 / (Math.hypot(wx, wy) || 1);
+        const cam = engine.camera;
+        const hw  = tileHalfWidth(cam.zoom, cam.tileW);
+        const hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+        const cr  = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
+        const rx  = (mv.dx / hw + mv.dy / hh) * 0.5;
+        const ry  = (mv.dy / hh - mv.dx / hw) * 0.5;
+        const wx  = rx * cr - ry * sr;
+        const wy  = rx * sr + ry * cr;
+        const spd = (0.22 * this.speedMult) * dt * 60 / (Math.hypot(wx, wy) || 1);
 
-      this.walkCycle += dt * 15 * this.speedMult;
+        this.walkCycle += dt * 15 * this.speedMult;
 
-      const newX = this.tx + wx * spd;
-      const newY = this.ty + wy * spd;
+        // Try full move, then axis-separated fallbacks
+        const attempts = [
+            { x: this.tx + wx * spd, y: this.ty + wy * spd },  // full
+            { x: this.tx + wx * spd, y: this.ty },              // x only
+            { x: this.tx,            y: this.ty + wy * spd },   // y only
+        ];
 
-      let blocked = false;
-      for (const other of engine.entities) {
-        if (other === this) continue;
-        if (!other.fixed && !other.solid) continue;
-        const dx = newX - other.tx, dy = newY - other.ty;
-        const minDist = this.bboxRadius + other.bboxRadius;
-        if (dx * dx + dy * dy < minDist * minDist) { blocked = true; break; }
-      }
+        let moved = false;
+        for (const attempt of attempts) {
+            if (!this._isBlocked(attempt.x, attempt.y, engine)) {
+                this.tx = Math.max(0.5, Math.min(engine._mapW - 0.5, attempt.x));
+                this.ty = Math.max(0.5, Math.min(engine._mapH - 0.5, attempt.y));
+                moved = true;
+                break;
+            }
+        }
 
-      if (!blocked) {
-        this.tx = Math.max(0.5, Math.min(engine._mapW - 0.5, newX));
-        this.ty = Math.max(0.5, Math.min(engine._mapH - 0.5, newY));
-      }
     } else {
-      this.isMoving  = false;
-      this.walkCycle = 0;
+        this.isMoving  = false;
+        this.walkCycle = 0;
     }
 
-    // Contact-push dynamic physics entities
+    // Pushout — if somehow inside a solid, eject
+    this._resolveOverlap(engine);
+
+    // Contact-push dynamic physics entities (unchanged)
     for (const other of engine.entities) {
       if (other === this || !other._particle || other.fixed) continue;
       const dx   = other.tx - this.tx;
@@ -141,6 +149,64 @@ class PlayerEntity extends Entity {
     if (this._posHistory.length > this._POS_HISTORY_MAX) this._posHistory.shift();
   }
 
+  _isBlocked(newX, newY, engine) {
+    const queryRadius = this.bboxRadius + 1.5;
+    const range = {
+        x: newX - queryRadius,
+        y: newY - queryRadius,
+        w: queryRadius * 2,
+        h: queryRadius * 2,
+    };
+    const candidates = engine._spatialTree.queryRange(range);
+    for (const candidate of candidates) {
+        const other = candidate.entity;
+        if (other === this || !other.solid) continue;
+        if (this._overlaps(newX, newY, other)) return true;
+    }
+    return false;
+  }
+
+  _overlaps(px, py, other) {
+      if (other.type === 'building') {
+          const r = other.bboxRadius;
+          const cx = Math.max(other.tx - r, Math.min(other.tx + r, px));
+          const cy = Math.max(other.ty - r, Math.min(other.ty + r, py));
+          return Math.hypot(px - cx, py - cy) < this.bboxRadius;
+      }
+      // circle-circle
+      const dx = px - other.tx, dy = py - other.ty;
+      const minDist = this.bboxRadius + other.bboxRadius;
+      return dx * dx + dy * dy < minDist * minDist;
+  }
+
+  _resolveOverlap(engine) {
+      // If currently overlapping any solid, push out along shortest axis
+      for (const e of engine.entities) {
+          if (e === this || !e.solid) continue;
+          if (!this._overlaps(this.tx, this.ty, e)) continue;
+
+          if (e.type === 'building') {
+              const r = e.bboxRadius;
+              // Find which face is closest and push to that face
+              const overlapL = (this.tx + this.bboxRadius) - (e.tx - r);
+              const overlapR = (e.tx + r) - (this.tx - this.bboxRadius);
+              const overlapT = (this.ty + this.bboxRadius) - (e.ty - r);
+              const overlapB = (e.ty + r) - (this.ty - this.bboxRadius);
+              const min = Math.min(overlapL, overlapR, overlapT, overlapB);
+              if (min === overlapL) this.tx -= overlapL;
+              else if (min === overlapR) this.tx += overlapR;
+              else if (min === overlapT) this.ty -= overlapT;
+              else this.ty += overlapB;
+          } else {
+              const dx = this.tx - e.tx, dy = this.ty - e.ty;
+              const dist = Math.hypot(dx, dy) || 0.001;
+              const push = this.bboxRadius + e.bboxRadius - dist;
+              this.tx += (dx / dist) * push;
+              this.ty += (dy / dist) * push;
+          }
+      }
+  }
+
   getAverageHistoryPos() {
     if (!this._posHistory.length) return { x: this.tx, y: this.ty };
     const sum = this._posHistory.reduce(
@@ -149,10 +215,6 @@ class PlayerEntity extends Entity {
     return { x: sum.x / this._posHistory.length, y: sum.y / this._posHistory.length };
   }
 
-  /**
-   * Submit player to WorldRenderer's pipeline via PlayerBlueprint.
-   * @param {WorldRenderer} wr
-   */
   render(wr, groundElevPx, extra) {
     drawPlayer(wr, this.tx, this.ty, groundElevPx + this.elevOffset, this, extra.mPerTile);
   }
@@ -172,6 +234,7 @@ class FeatureEntity extends Entity {
     this.physicsEnabled = data.physics === true;
     this.physicsRadius  = data.physicsRadius || 0.35;
     this.fixed          = data.fixed ?? true;
+    this.solid = false;
   }
 
   render(wr, groundElevPx, extra) {
@@ -194,6 +257,7 @@ class BuildingEntity extends Entity {
     this.physicsEnabled  = true;
     this.fixed           = true;
     this.physicsRadius   = footprintRadiusTiles;
+    this.solid = true;
   }
 
   render(wr, groundElevPx, extra) {
@@ -241,6 +305,7 @@ class TreeEntity extends Entity {
     this.physicsEnabled = true;
     this.fixed          = true;
     this.physicsRadius  = 0.5;
+    this.solid = true;
   }
 
   render(wr, groundElevPx, extra) {
@@ -341,6 +406,9 @@ export class Engine extends EventEmitter {
     // Camera animation flag (throttle heavy geometry)
     this._cameraAnimating = false;
     this._cameraSettleTimer = null;
+
+    this._spatialTree = null;
+    
   }
 
   // ── Backward compatibility getters ────────────────────────────────────────
@@ -538,12 +606,14 @@ export class Engine extends EventEmitter {
     this._raf   = requestAnimationFrame(ts => {
       this._centreCameraOnPlayer();
       this._frameOptimized(ts);
-      console.log('[recentre] geoCenter:', this.geoCenter, 'pGX:', pGX, 'pGY:', pGY);
     });
 
     // WeatherSystem also routes through WorldRenderer
     this.weather = new WeatherSystem(this._renderer);
     this.weather.setMode('none');
+
+    this._spatialTree = new Quadtree({ x: 0, y: 0, w: this._mapW, h: this._mapH }, 8);
+
     return this;
   }
 
@@ -585,12 +655,22 @@ export class Engine extends EventEmitter {
     const toRemove = this.entities.filter(e => e.type === ENTITY_TYPES.FEATURE);
     for (const e of toRemove) this._detachPhysics(e);
     this.entities = this.entities.filter(e => e.type !== ENTITY_TYPES.FEATURE);
+
+    const { x: pGX, y: pGY } = this._pGlobal();
+    const toLocal = (globalX, globalY) => ({
+      x: globalX - pGX + this._mapW / 2,
+      y: globalY - pGY + this._mapH / 2
+    });
+
     for (const f of rawFeatures) {
       const lat = f.latitude ?? f.lat;
       const lon = f.longitude ?? f.lon;
       if (lat == null || lon == null) continue;
-      const pos     = geoToTile(lat, lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-      const feature = new FeatureEntity(f.id, pos.x, pos.y, f);
+      const globalX = lonToGlobalX(lon, this.geoCenter.lat, this._mPerTile);
+      const globalY = latToGlobalY(lat, this._mPerTile);
+      const local = toLocal(globalX, globalY);
+      if (local.x < 0 || local.x >= this._mapW || local.y < 0 || local.y >= this._mapH) continue;
+      const feature = new FeatureEntity(f.id, local.x, local.y, f);
       this.entities.push(feature);
       if (feature.physicsEnabled) this._attachPhysics(feature);
     }
@@ -617,6 +697,7 @@ export class Engine extends EventEmitter {
   panTo(lat, lon) {
     const prevGeo = { ...this.geoCenter };
     this.geoCenter = { lat, lon };
+    this._osmLayer.resetTileCache();
     this._exactPG  = null;
     if (this.playerEntity) {
       this.playerEntity.tx = this._mapW / 2;
@@ -716,9 +797,10 @@ export class Engine extends EventEmitter {
   }
 
   // ── FETCH ─────────────────────────────────────────────────────────────────
+  // ── FETCH ─────────────────────────────────────────────────────────────────
   _doFetch(center) {
-    console.log('[doFetch] called with', center, 'fetching:', this._fetching);
     if (this._fetching) return;
+
     const d = Math.hypot(center.lat - this._lastFetchPos.lat, center.lon - this._lastFetchPos.lon);
     if (d < 0.001 && this._lastFetchPos.lat !== 0) return;
 
@@ -731,7 +813,14 @@ export class Engine extends EventEmitter {
     );
 
     Promise.all(fetches).then(results => {
-      let { x: pGX, y: pGY } = this._pGlobal();
+      // Get current global offset of the map centre (in global tile units)
+      const { x: pGX, y: pGY } = this._pGlobal();
+
+      // Helper: global tile → local (0..mapW, 0..mapH)
+      const toLocal = (globalX, globalY) => ({
+        x: globalX - pGX + this._mapW / 2,
+        y: globalY - pGY + this._mapH / 2
+      });
 
       for (const result of results) {
         if (result.terrainUpdates) {
@@ -750,65 +839,74 @@ export class Engine extends EventEmitter {
       }
 
       const upsert = (entity) => {
-        const old = existing.get(entity.id);
-        if (old) {
-          old.tx = entity.tx;
-          old.ty = entity.ty;
-          if (old._particle) {
-            old._particle.position.x = old.tx;
-            old._particle.position.y = old.ty;
+          const old = existing.get(entity.id);
+          if (old) {
+              old.tx = entity.tx;
+              old.ty = entity.ty;
+              old.solid = entity.solid;           // sync solid flag
+              old.bboxRadius = entity.bboxRadius; // sync radius
+              if (old._particle) {
+                  old._particle.position.x = old.tx;
+                  old._particle.position.y = old.ty;
+              }
+          } else {
+              this.entities.push(entity);
+              if (entity.physicsEnabled) this._attachPhysics(entity);
+              existing.set(entity.id, entity);
           }
-        } else {
-          this.entities.push(entity);
-          if (entity.physicsEnabled) this._attachPhysics(entity);
-          existing.set(entity.id, entity);
-        }
       };
 
       for (const result of results) {
+        // ── Buildings ──────────────────────────────────────────────────────
         if (result.buildingWays) {
           const buildings = preprocessBuildings(result.buildingWays);
           for (const b of buildings) {
-            const pos = geoToTile(b.centroid.lat, b.centroid.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-            if (pos.x < 0 || pos.x >= this._mapW || pos.y < 0 || pos.y >= this._mapH) continue;
-            const halfSideM     = Math.sqrt(Math.max(1, b.areaM2));
+            const globalX = lonToGlobalX(b.centroid.lon, this.geoCenter.lat, this._mPerTile);
+            const globalY = latToGlobalY(b.centroid.lat, this._mPerTile);
+            const local = toLocal(globalX, globalY);
+            if (local.x < 0 || local.x >= this._mapW || local.y < 0 || local.y >= this._mapH) continue;
+            const halfSideM     = Math.sqrt(Math.max(16, b.areaM2));  // min 4×4m footprint
             const halfSideTiles = halfSideM / this._mPerTile / 2;
             const colorSet      = this.terrainRegistry.colors[TerrainType.BUILDING];
             const building      = new BuildingEntity(
               `building_${b.id || Math.random()}`,
-              pos.x, pos.y, halfSideTiles, b.heightM, colorSet
+              local.x, local.y, halfSideTiles, b.heightM, colorSet
             );
-            building._facadeSeed = Math.abs(Math.round(pos.x * 31 + pos.y * 17)) % 1000;
+            building._facadeSeed = Math.abs(Math.round(local.x * 31 + local.y * 17)) % 1000;
             upsert(building);
           }
         }
+
+        // ── Features (POIs) ────────────────────────────────────────────────
         if (result.features) {
           for (const f of result.features) {
             const lat = f.latitude ?? f.lat;
             const lon = f.longitude ?? f.lon;
             if (lat == null || lon == null) continue;
-            const pos     = geoToTile(lat, lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-            const feature = new FeatureEntity(f.id, pos.x, pos.y, f);
+            const globalX = lonToGlobalX(lon, this.geoCenter.lat, this._mPerTile);
+            const globalY = latToGlobalY(lat, this._mPerTile);
+            const local = toLocal(globalX, globalY);
+            if (local.x < 0 || local.x >= this._mapW || local.y < 0 || local.y >= this._mapH) continue;
+            const feature = new FeatureEntity(f.id, local.x, local.y, f);
             upsert(feature);
           }
         }
+
+        // ── Trees ──────────────────────────────────────────────────────────
         if (result.trees) {
           for (const t of result.trees) {
-            const pos  = geoToTile(t.lat, t.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+            const globalX = lonToGlobalX(t.lon, this.geoCenter.lat, this._mPerTile);
+            const globalY = latToGlobalY(t.lat, this._mPerTile);
+            const local = toLocal(globalX, globalY);
+            if (local.x < 0 || local.x >= this._mapW || local.y < 0 || local.y >= this._mapH) continue;
             const tree = new TreeEntity(
               `tree_${t.id || Math.random()}`,
-              pos.x, pos.y, t.species || 'deciduous', 1.0, t.seed || 0
+              local.x, local.y, t.species || 'deciduous', 1.0, t.seed || 0
             );
             upsert(tree);
           }
         }
       }
-
-      // right after terrainCache.merge(result.terrainUpdates)
-      console.log('[fetch:done] terrainUpdates size:', result.terrainUpdates?.size);
-      console.log('[fetch:done] terrainCache sample:', 
-        this.terrainCache.get(Math.round(pGX), Math.round(pGY))
-      );
 
       this._updateLocalEcosystem();
       this._elevation?.prefetch?.(center);
@@ -843,6 +941,20 @@ export class Engine extends EventEmitter {
     const ctx    = this._ctx;
     const W      = canvas.width;
     const H      = canvas.height;
+
+    if (this._spatialTree) {
+        // Collect all solid entities (those that block movement)
+        const collidables = this.entities.filter(e => e.solid === true);
+        const byType = {};
+        for (const e of collidables) byType[e.type] = (byType[e.type] || 0) + 1;
+        console.log('[Quadtree]', byType);
+        const objects = collidables.map(e => ({
+            x: e.tx, y: e.ty,
+            entity: e,
+            radius: e.bboxRadius
+        }));
+        this._spatialTree.rebuild(objects);
+    }
 
     // 1. Update entities
     for (const e of this.entities) e.update(dt, this);
@@ -905,6 +1017,9 @@ export class Engine extends EventEmitter {
         this._exactPG.x += shiftX;
         this._exactPG.y += shiftY;
         this.geoCenter = tileToGeo(snapTx, snapTy, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+        this._osmLayer.resetTileCache();
+
+        this._osmLayer.resetTileCache();
 
         this.playerEntity.tx -= shiftX;
         this.playerEntity.ty -= shiftY;
@@ -967,8 +1082,7 @@ export class Engine extends EventEmitter {
 
       if (lod > 1) {
         this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overAlpha);
-      } else {
-        if (!this._skipTileCacheThisFrame) {    
+      } else {   
           if (this._isTileCacheDirty()) {
             this._saveTileCacheState();
             const hw  = tileHalfWidth(cam.zoom, cam.tileW);
@@ -990,7 +1104,6 @@ export class Engine extends EventEmitter {
                 });
               }
             }
-          }
         }
         this._skipTileCacheThisFrame = false;
         this._tileR.drawLayer(
@@ -998,10 +1111,6 @@ export class Engine extends EventEmitter {
           this.playerEntity?.tx ?? 0,
           this.playerEntity?.ty ?? 0,
           this.terrainCache, pGX, pGY
-        );
-        console.log('[draw] pGX:', pGX, 'pGY:', pGY, 
-          'tileCache[0]:', this._tileCache[0],
-          'terrainAt center:', this.terrainCache.get(Math.round(pGX), Math.round(pGY))
         );
       }
     }

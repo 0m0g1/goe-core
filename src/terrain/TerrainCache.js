@@ -56,13 +56,4 @@ export class TerrainCache {
   merge(map) { map.forEach((v, k) => this._data.set(k, v)); }
   clear()    { this._data.clear(); }
   size()     { return this._data.size; }
-
-  shift(dx, dy) {
-    const moved = new Map();
-    for (const [key, val] of this._data) {
-      const [x, y] = key.split(',').map(Number);
-      moved.set(`${x + dx},${y + dy}`, val);
-    }
-    this._data = moved;
-  }
 }

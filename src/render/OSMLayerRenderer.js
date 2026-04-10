@@ -145,4 +145,9 @@ export class OSMLayerRenderer {
   setGeoCenter(geo) {
     this._geoCenter = geo;
   }
+
+  resetTileCache() {
+    const currentZoom = this._currentOsmZoom; // store it during draw()
+    evictTileCache(currentZoom);
+  }
 }
