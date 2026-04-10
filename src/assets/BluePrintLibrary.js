@@ -197,7 +197,7 @@ const ATM = [
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Car ~4.5 m × 1.8 m × 1.5 m → 18 × 7.2 × 6 VU
-const CAR_VOXEL = [
+const CAR = [
   // Body lower
   { x: -9,   y:  0,  z: -3,   w: 18,  h:  4,  d:  6,  ...C('#1E88E5','#1565C0','#1976D2') },
   // Wheel arches cut-in (represented as darker panels)
@@ -236,7 +236,7 @@ const CAR_VOXEL = [
 
 // Taxi — same shell, yellow livery + roof sign
 const TAXI = [
-  ...CAR_VOXEL.map(p => ({
+  ...CAR.map(p => ({
     ...p,
     top:   p.top.startsWith('#1')  ? '#F9A825' : p.top.startsWith('#4') ? '#FBC02D' : p.top.startsWith('#B3') ? p.top : p.top,
     right: p.right.startsWith('#1') ? '#F57F17' : p.right,
@@ -1117,6 +1117,61 @@ const AMENITY = [
   { x: -1.5, y: 10, z: 9.2, w: 3, h: 1.5, d: 0.2, top: '#4CAF50', right: '#388E3C', front: '#2E7D32' },
 ];
 
+const EIFFEL_TOWER = [
+  // ── LEGS (four curved arches) ─────────────────────────────────────────────
+  // Front‑left leg (from viewer perspective)
+  { x: -24, y: 0,  z: -24, w: 8, h: 48, d: 8, top: '#6D4C41', right: '#5D4037', front: '#4E342E' },
+  { x: -28, y: 48, z: -28, w: 16, h: 12, d: 16, top: '#795548', right: '#6D4C41', front: '#5D4037' },
+  // Front‑right leg
+  { x: 16,  y: 0,  z: -24, w: 8, h: 48, d: 8, top: '#6D4C41', right: '#5D4037', front: '#4E342E' },
+  { x: 12,  y: 48, z: -28, w: 16, h: 12, d: 16, top: '#795548', right: '#6D4C41', front: '#5D4037' },
+  // Back‑left leg
+  { x: -24, y: 0,  z: 16,  w: 8, h: 48, d: 8, top: '#6D4C41', right: '#5D4037', front: '#4E342E' },
+  { x: -28, y: 48, z: 12,  w: 16, h: 12, d: 16, top: '#795548', right: '#6D4C41', front: '#5D4037' },
+  // Back‑right leg
+  { x: 16,  y: 0,  z: 16,  w: 8, h: 48, d: 8, top: '#6D4C41', right: '#5D4037', front: '#4E342E' },
+  { x: 12,  y: 48, z: 12,  w: 16, h: 12, d: 16, top: '#795548', right: '#6D4C41', front: '#5D4037' },
+
+  // ── FIRST PLATFORM (lower observation deck) ───────────────────────────────
+  { x: -36, y: 60, z: -36, w: 72, h: 4, d: 72, top: '#A1887F', right: '#8D6E63', front: '#795548' },
+  // Railing
+  { x: -36, y: 64, z: -36, w: 72, h: 4, d: 4, top: '#BCAAA4', right: '#A1887F', front: '#8D6E63' },
+  { x: -36, y: 64, z: 32,  w: 72, h: 4, d: 4, top: '#BCAAA4', right: '#A1887F', front: '#8D6E63' },
+  { x: -36, y: 64, z: -32, w: 4,  h: 4, d: 64, top: '#BCAAA4', right: '#A1887F', front: '#8D6E63' },
+  { x: 32,  y: 64, z: -32, w: 4,  h: 4, d: 64, top: '#BCAAA4', right: '#A1887F', front: '#8D6E63' },
+
+  // ── UPPER TOWER (tapering) ────────────────────────────────────────────────
+  // Lower section
+  { x: -20, y: 64, z: -20, w: 40, h: 40, d: 40, top: '#795548', right: '#6D4C41', front: '#5D4037' },
+  // Taper 1
+  { x: -16, y: 104, z: -16, w: 32, h: 32, d: 32, top: '#8D6E63', right: '#795548', front: '#6D4C41' },
+  // Taper 2
+  { x: -12, y: 136, z: -12, w: 24, h: 24, d: 24, top: '#A1887F', right: '#8D6E63', front: '#795548' },
+
+  // ── SECOND PLATFORM (upper observation deck) ──────────────────────────────
+  { x: -20, y: 160, z: -20, w: 40, h: 4, d: 40, top: '#BCAAA4', right: '#A1887F', front: '#8D6E63' },
+  // Railing
+  { x: -20, y: 164, z: -20, w: 40, h: 3, d: 3, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' },
+  { x: -20, y: 164, z: 17,  w: 40, h: 3, d: 3, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' },
+  { x: -20, y: 164, z: -17, w: 3,  h: 3, d: 34, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' },
+  { x: 17,  y: 164, z: -17, w: 3,  h: 3, d: 34, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' },
+
+  // ── TOP LANTERN (spire base) ──────────────────────────────────────────────
+  { x: -6,  y: 164, z: -6,  w: 12, h: 24, d: 12, top: '#A1887F', right: '#8D6E63', front: '#795548' },
+  // Spire
+  { x: -3,  y: 188, z: -3,  w: 6,  h: 20, d: 6,  top: '#D4AF37', right: '#C59B27', front: '#B8860B' },
+  // Antenna tip
+  { x: -1,  y: 208, z: -1,  w: 2,  h: 12, d: 2,  top: '#FFD700', right: '#DAA520', front: '#FFC125' },
+  // Ball at top
+  { x: -2,  y: 220, z: -2,  w: 4,  h: 4,  d: 4,  top: '#FFD700', right: '#DAA520', front: '#FFC125' },
+
+  // ── ARCHES BETWEEN LEGS (decorative) ───────────────────────────────────────
+  { x: -28, y: 40, z: -28, w: 56, h: 4, d: 4, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
+  { x: -28, y: 40, z: 24,  w: 56, h: 4, d: 4, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
+  { x: -28, y: 40, z: -24, w: 4,  h: 4, d: 48, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
+  { x: 24,  y: 40, z: -24, w: 4,  h: 4, d: 48, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
+];
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Export
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1139,7 +1194,7 @@ export const Blueprints = {
   atm:            ATM,
 
   // Vehicles
-  car_voxel:    CAR_VOXEL,
+  car:    CAR,
   taxi:         TAXI,
   bus:          BUS,
   semi_truck:   SEMI_TRUCK,
@@ -1245,4 +1300,7 @@ export const Blueprints = {
   public_transport: PUBLIC_TRANSPORT,
   emergency:        EMERGENCY,
   sport:            SPORT,
+
+  eiffel_tower:     EIFFEL_TOWER,
+  tour_eiffel:  EIFFEL_TOWER, 
 };

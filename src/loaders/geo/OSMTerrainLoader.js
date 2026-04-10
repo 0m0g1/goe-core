@@ -184,7 +184,7 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, decorateBuildin
 
     renderFn(wr, groundElevPx, extra, entity) {
       const elev  = groundElevPx + entity.elevOffset;
-      const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation);
+      const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation, rVox / VU);
 
       wr.submitShadow({ p: { x: entity.tx, y: entity.ty }, elev, r: rVox, engineH: hVox });
 
@@ -217,6 +217,7 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
     longitude:      lon,
     solid:          opts.solid          ?? false,
     bboxRadius:     opts.bboxRadius     ?? 0.35,
+    footprintRadius: opts.footprintRadius ?? opts.bboxRadius ?? 0.35,
     physicsEnabled: opts.physicsEnabled ?? false,
     physicsRadius:  opts.physicsRadius  ?? 0.35,
     fixed:          opts.fixed          ?? true,
@@ -233,7 +234,7 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
       if (wr.cam.tilt < 0.04) return;
       const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
       const elev  = groundElevPx + entity.elevOffset;
-      const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation);
+      const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation, entity.footprintRadius ?? entity.bboxRadius ?? 0.35);
       wr.submitWorldObject(depth, () => {
         wr.ctx.globalAlpha = isoA;
         wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
@@ -251,7 +252,7 @@ function makeFeatureDef(f) {
   const candidates = [f.title, f.label, f.category];
   for (const candidate of candidates) {
     if (candidate && typeof candidate === 'string') {
-      const key = candidate.toLowerCase().replace(/\s+/g, '_'); // replace all spaces with underscore
+      const key = candidate.toLowerCase().replace(/\s+/g, '_');
       if (Blueprints[key]) {
         blueprintKey = key;
         blueprint = Blueprints[key];
@@ -276,6 +277,7 @@ function makeFeatureDef(f) {
     physicsEnabled: false,
     fixed:     true,
     renderHeavy: false,
+    type: f.category,
 
     // Carry metadata for click/HUD/selection display
     label, color,
@@ -287,38 +289,37 @@ function makeFeatureDef(f) {
       const { cam } = wr;
       if (cam.tilt < 0.02) return;
       const elev  = groundElevPx + (entity.elevOffset ?? 0);
-      const depth = entity.tx * Math.cos(cam.rotation) + entity.ty * Math.sin(cam.rotation);
+      const depth = tileDepth(entity.tx, entity.ty, cam.rotation, 0.35);
       const hw    = tileHalfWidth(cam.zoom, cam.tileW);
       const r     = Math.max(3, hw * 0.7);
-      const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
+      const isoA  = Math.min(1, (cam.tilt - 0.04) / 0.12);
 
       wr.submitWorldObject(depth, () => {
-        if (blueprint) {
-          wr.submitWorldObject(depth, () => {
-            wr.ctx.globalAlpha = isoA;
-            wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
-            wr.ctx.globalAlpha = 1;
-          });
-        }
         const { x, y } = worldToScreen(entity.tx + 0.5, entity.ty + 0.5, elev, cam);
         const ctx = wr.ctx;
 
-        // Glow halo
-        ctx.beginPath();
-        ctx.arc(x, y, r * 2.2, 0, Math.PI * 2);
-        ctx.fillStyle = color + '33';
-        ctx.fill();
+        if (blueprint) {
+          ctx.globalAlpha = isoA;
+          wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
+          ctx.globalAlpha = 1;
+        } else {
+          // Glow halo
+          ctx.beginPath();
+          ctx.arc(x, y, r * 2.2, 0, Math.PI * 2);
+          ctx.fillStyle = color + '33';
+          ctx.fill();
 
-        // Main dot
-        ctx.beginPath();
-        ctx.arc(x, y, r, 0, Math.PI * 2);
-        ctx.fillStyle = color;
-        ctx.fill();
-        ctx.beginPath();
-        ctx.arc(x, y, r, 0, Math.PI * 2);
-        ctx.strokeStyle = 'rgba(0,0,0,0.4)';
-        ctx.lineWidth = 1;
-        ctx.stroke();
+          // Main dot
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.fillStyle = color;
+          ctx.fill();
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
 
         // Selection ring
         if (extra.selectedId === entity.id) {
@@ -473,9 +474,7 @@ export class OSMTerrainLoader extends BaseLoader {
 
   /** Allow the engine to inject collaborators after construction. */
   init(engine) {
-    // Pull collaborators from the engine so this loader stays decoupled
-    // from specific import paths.
-    this._terrainRegistry        = engine.terrainRegistry;
+    this._terrainRegistry = engine.terrainRegistry;
   }
 
   get _endpoint() { return this._endpoints[this._endpointIdx % this._endpoints.length]; }
@@ -518,9 +517,7 @@ export class OSMTerrainLoader extends BaseLoader {
       const age    = Date.now() - (cached?.timestamp ?? 0);
       if (cached?.terrainUpdates && age < CACHE_TTL_MS) {
         console.log(`[OSMTerrainLoader] Cache hit — rebuilding ${cached.entities?.length ?? 0} entities`);
-        // Reconstruct live entity defs from serialised data
         const liveEntities = (cached.entities ?? []).map(e => {
-          // Only rebuild as a building if the stored type is 'building'
           if (e._type === 'building') {
             return makeBuildingDef(
               { id: e.id, areaM2: e.areaM2 ?? 16, heightM: e.heightM ?? 8, centroid: { lat: e.latitude, lon: e.longitude } },
@@ -531,7 +528,6 @@ export class OSMTerrainLoader extends BaseLoader {
           if (e.bpKey) {
             return makeBlueprintDef(e.id, e.latitude, e.longitude, e.bpKey, e);
           }
-          // POI
           return makeFeatureDef(e);
         });
         return {
@@ -583,6 +579,11 @@ export class OSMTerrainLoader extends BaseLoader {
         const terrainUpdates = new Map();
         const entityDefs     = [];
 
+        // Tracks landmark blueprint keys that have already been placed this
+        // fetch so that duplicate OSM nodes / ways for the same named
+        // structure never produce more than one entity.
+        const renderedLandmarkNames = new Set();
+
         const toTile = (eLat, eLon) => ({
           x: lonToGlobalX(eLon, geoCenter.lat, this._mPerTile),
           y: latToGlobalY(eLat, this._mPerTile),
@@ -624,12 +625,15 @@ export class OSMTerrainLoader extends BaseLoader {
                   fixed:     true,
                   renderHeavy: true,
                   _lodColor: '#607D8B',
+                  title: 'car',
+                  label: 'car',
+                  category: 'car',
                   renderFn(wr, groundElevPx, extra, entity) {
-                    const blueprint = Blueprints['car_voxel'];
+                    const blueprint = Blueprints['car'];
                     if (!blueprint || wr.cam.tilt < 0.04) return;
                     const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
                     const elev  = groundElevPx + entity.elevOffset;
-                    const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation);
+                    const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation, 0.35);
                     wr.submitWorldObject(depth, () => {
                       wr.ctx.globalAlpha = isoA;
                       wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
@@ -654,7 +658,7 @@ export class OSMTerrainLoader extends BaseLoader {
                 `tree:${el.id}`,
                 el.lat, el.lon,
                 bpKey,
-                { solid: true, bboxRadius: 0.5, physicsEnabled: true, physicsRadius: 0.5, lodColor: '#2E7D32' }
+                { solid: true, bboxRadius: 0.5, footprintRadius: 1.2, physicsEnabled: true, physicsRadius: 0.5, lodColor: '#2E7D32' }
               ));
               continue;
             }
@@ -663,7 +667,33 @@ export class OSMTerrainLoader extends BaseLoader {
             const poi = classifyPOI(el.tags);
             if (!poi) continue;
 
-            const name  = el.tags?.name || poi.label;
+            const name    = el.tags?.name || poi.label;
+            const nameKey = name.toLowerCase().replace(/\s+/g, '_');
+
+            // If this name resolves to a landmark blueprint, place it once
+            // (preferring the building way centroid if already placed there)
+            // and skip the generic POI dot entirely.
+            if (Blueprints[nameKey]) {
+              if (!renderedLandmarkNames.has(nameKey)) {
+                renderedLandmarkNames.add(nameKey);
+                entityDefs.push(makeBlueprintDef(
+                  `landmark:node:${el.id}`,
+                  el.lat, el.lon,
+                  nameKey,
+                  {
+                    solid:           true,
+                    bboxRadius:      4,
+                    footprintRadius: 4,
+                    physicsEnabled:  true,
+                    physicsRadius:   4,
+                    fixed:           true,
+                    lodColor:        '#A1887F',
+                  }
+                ));
+              }
+              continue; // always skip POI fallthrough even if already rendered
+            }
+
             entityDefs.push(makeFeatureDef({
               id:          `osm:node:${el.id}`,
               latitude:    el.lat,
@@ -680,20 +710,71 @@ export class OSMTerrainLoader extends BaseLoader {
         }
 
         // ── Buildings ─────────────────────────────────────────────────────────
+
         if (buildingWays.length && this._terrainRegistry) {
           const buildings = preprocessBuildings(buildingWays);
           for (const b of buildings) {
-            entityDefs.push(
-              makeBuildingDef(b, b.centroid.lat, b.centroid.lon,
-                this._mPerTile, this._terrainRegistry, decorateBuildingFacade)
-            );
+            const name    = b.tags?.name ?? '';
+            // Fix: use global replace so multi-word names normalise correctly
+            const nameKey = name.toLowerCase().replace(/\s+/g, '_');
+            const blueprint = Blueprints[nameKey];
+
+            if (blueprint) {
+              // Prefer building centroid over a previously-placed node, so
+              // replace the node entry if the way comes later in the loop.
+              if (!renderedLandmarkNames.has(nameKey)) {
+                renderedLandmarkNames.add(nameKey);
+                entityDefs.push(makeBlueprintDef(
+                  `landmark:${b.id}`,
+                  b.centroid.lat,
+                  b.centroid.lon,
+                  nameKey,          // ← key string, not the resolved array
+                  {
+                    solid:           true,
+                    bboxRadius:      4,
+                    footprintRadius: 4,
+                    physicsEnabled:  true,
+                    physicsRadius:   4,
+                    fixed:           true,
+                    lodColor:        '#A1887F',
+                  }
+                ));
+              } else {
+                // A node already placed this landmark — update to the more
+                // accurate building centroid by swapping the entity in place.
+                const existingIdx = entityDefs.findIndex(
+                  e => e._bpKey === nameKey && e.id.startsWith('landmark:node:')
+                );
+                if (existingIdx !== -1) {
+                  entityDefs[existingIdx] = makeBlueprintDef(
+                    `landmark:${b.id}`,
+                    b.centroid.lat,
+                    b.centroid.lon,
+                    nameKey,
+                    {
+                      solid:           true,
+                      bboxRadius:      4,
+                      footprintRadius: 4,
+                      physicsEnabled:  true,
+                      physicsRadius:   4,
+                      fixed:           true,
+                      lodColor:        '#A1887F',
+                    }
+                  );
+                }
+              }
+            } else {
+              entityDefs.push(
+                makeBuildingDef(b, b.centroid.lat, b.centroid.lon,
+                  this._mPerTile, this._terrainRegistry, decorateBuildingFacade)
+              );
+            }
           }
         }
 
         console.log(`[OSMTerrainLoader] → ${terrainUpdates.size} terrain tiles, ${entityDefs.length} entities`);
 
         // ── Persist ──────────────────────────────────────────────────────────
-        // Store enough data to reconstruct entity defs on cache hit.
         try {
           await this._cache.set(cacheKey, {
             terrainUpdates: Object.fromEntries(terrainUpdates),

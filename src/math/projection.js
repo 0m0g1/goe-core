@@ -77,10 +77,15 @@ export function topFaceQuad(tx, ty, elev, cam) {
 /**
  * Depth sort key for a tile — used to determine back-to-front draw order.
  */
-export function tileDepth(tx, ty, rotation) {
-  const xw = tx, zw = ty;
-  return (xw * Math.cos(rotation) + zw * Math.sin(rotation))
-       + (-xw * Math.sin(rotation) + zw * Math.cos(rotation));
+export function tileDepth(tx, ty, rotation, footprintRadius = 0) {
+  const cr = Math.cos(rotation);
+  const sr = Math.sin(rotation);
+  // Sort from the back corner of the footprint
+  const bx = tx - footprintRadius;
+  const bz = ty - footprintRadius;
+  const xr =  bx * cr + bz * sr;
+  const zr = -bx * sr + bz * cr;
+  return xr + zr;
 }
 
 // ─── SCREEN → WORLD ──────────────────────────────────────────────────────────

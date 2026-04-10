@@ -66,6 +66,7 @@ function makeBlueprintEntityDef(id, lat, lon, assetKey, opts = {}) {
     longitude:      lon,
     solid:          opts.solid          ?? false,
     bboxRadius:     opts.bboxRadius     ?? 0.3,
+    footprintRadius: opts.footprintRadius ?? opts.bboxRadius ?? 0.3,
     physicsEnabled: opts.physicsEnabled ?? true,
     physicsRadius:  opts.physicsRadius  ?? 0.3,
     fixed:          opts.fixed          ?? false,   // fauna can be pushed
@@ -83,7 +84,7 @@ function makeBlueprintEntityDef(id, lat, lon, assetKey, opts = {}) {
       if (wr.cam.tilt < 0.04) return;
       const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
       const elev  = groundElevPx + entity.elevOffset;
-      const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation);
+      const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation, entity.footprintRadius ?? entity.bboxRadius ?? 0.3);
       wr.submitWorldObject(depth, () => {
         wr.ctx.globalAlpha = isoA;
         wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
@@ -208,8 +209,9 @@ export class BioLoader extends BaseLoader {
         subType:  isAnimal ? 'animal' : 'plant',
         solid:    false,
         fixed:    isAnimal ? false : true,   // plants stay put, animals can be nudged
-        bboxRadius:  isAnimal ? 0.25 : 0.5,
-        physicsRadius: isAnimal ? 0.25 : 0.5,
+        bboxRadius:      isAnimal ? 0.25 : 0.5,
+        footprintRadius: isAnimal ? 0.25 : 1.2,
+        physicsRadius:   isAnimal ? 0.25 : 0.5,
         lodColor: isAnimal ? '#7CB342' : '#388E3C',
         fallback: isAnimal ? 'bird' : 'tree_oak',
       }
