@@ -461,17 +461,25 @@ export class Engine extends EventEmitter {
   }
 
   panTo(lat, lon) {
-    this.geoCenter = { lat, lon };
-    if (this.playerEntity) {
-      this.playerEntity.tx = this._mapW / 2;
-      this.playerEntity.ty = this._mapH / 2;
+      const prevGeo = { ...this.geoCenter }; 
+      this.geoCenter = { lat, lon };
+      
+      // Clear the exact grid so it re-anchors to the new Lat/Lon
+      this._exactPG = null; 
+      
+      if (this.playerEntity) {
+        this.playerEntity.tx = this._mapW / 2;
+        this.playerEntity.ty = this._mapH / 2;
+        this.playerEntity._posHistory = [];
+      }
+      
+      this._lastFetchPos = { lat: 0, lon: 0 };
+      this._fetching = false;
+      
+      this._rebuildAllEntitiesGeo(prevGeo);
+      this._centreCameraOnPlayer();
+      this._doFetch(this.geoCenter);
     }
-    this._lastFetchPos = { lat: 0, lon: 0 };
-    this._fetching = false;
-    this._rebuildAllEntitiesGeo();
-    this._centreCameraOnPlayer();
-    this._doFetch(this.geoCenter);
-  }
 
   flyTo(lat, lon, zoom) {
     this.panTo(lat, lon);
@@ -489,14 +497,28 @@ export class Engine extends EventEmitter {
   }
 
   // ── INTERNAL HELPERS ────────────────────────────────────────────────────
-  _rebuildAllEntitiesGeo() {
+_rebuildAllEntitiesGeo(prevGeoCenter = this.geoCenter) {
     for (const e of this.entities) {
       if (e.type === ENTITY_TYPES.PLAYER) continue;
-      const geo = e.getGeo(this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+      
+      // 1. Calculate true real-world lat/lon using the OLD center
+      const geo = e.getGeo(prevGeoCenter, this._mPerTile, this._mapW, this._mapH);
+      
+      // 2. Reposition tx/ty relative to the NEW center
       e.setGeo(geo.lat, geo.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+      
+      // 3. Sync physics positions (and prevPosition to prevent velocity spikes)
       if (e._particle) {
+        const dx = e.tx - e._particle.position.x;
+        const dy = e.ty - e._particle.position.y;
+        
         e._particle.position.x = e.tx;
         e._particle.position.y = e.ty;
+        
+        if (e._particle.prevPosition) {
+          e._particle.prevPosition.x += dx;
+          e._particle.prevPosition.y += dy;
+        }
       }
     }
   }
@@ -526,10 +548,14 @@ export class Engine extends EventEmitter {
   }
 
   _pGlobal() {
-    return {
-      x: lonToGlobalX(this.geoCenter.lon, this.geoCenter.lat, this._mPerTile),
-      y: latToGlobalY(this.geoCenter.lat, this._mPerTile),
-    };
+      // Ensure the object exists before trying to access .x or .y
+      if (!this._exactPG) {
+          this._exactPG = {
+              x: lonToGlobalX(this.geoCenter.lon, this.geoCenter.lat, this._mPerTile),
+              y: latToGlobalY(this.geoCenter.lat, this._mPerTile),
+          };
+      }
+      return this._exactPG;
   }
 
   // ── FETCH ────────────────────────────────────────────────────────────────
@@ -547,11 +573,47 @@ export class Engine extends EventEmitter {
     );
 
     Promise.all(fetches).then(results => {
-      const { x: pGX, y: pGY } = this._pGlobal();
+      let { x: pGX, y: pGY } = this._pGlobal();
 
       for (const result of results) {
-        if (result.terrainUpdates) this.terrainCache.merge(result.terrainUpdates);
+        if (result.terrainUpdates) {
+          const before = this.terrainCache.size();
+          this.terrainCache.merge(result.terrainUpdates);
+          console.log(
+            `[Engine:fetch] terrainCache merge: ${before} → ${this.terrainCache.size()} entries` +
+            ` (+${this.terrainCache.size() - before})`
+          );
+          const sampleKey = [...result.terrainUpdates.keys()][0];
+          if (sampleKey) {
+            // Parse the stored key and compare to what getLocal would compute
+            // for the player's current tile (mapW/2, mapH/2)
+            const [skx, sky] = sampleKey.split(',').map(Number);
+            const expectedKeyForCentre = `${Math.round(this._mapW/2 - this._mapW/2 + pGX)},${Math.round(this._mapH/2 - this._mapH/2 + pGY)}`;
+            const getLocalKeyForCentre = `${Math.round(pGX)},${Math.round(pGY)}`;
+            console.log(
+              `[Engine:fetch] sample stored key: "${sampleKey}"` +
+              ` | getLocal key for centre tile: "${getLocalKeyForCentre}"` +
+              ` | pGX=${pGX.toFixed(0)} pGY=${pGY.toFixed(0)}` +
+              ` | key offset from pGX: (${(skx - pGX).toFixed(0)}, ${(sky - pGY).toFixed(0)})` +
+              ` ← should be near (-mapW/2, -mapH/2) = (${-this._mapW/2}, ${-this._mapH/2}) if loader uses local coords`+
+              ` or (0,0) if loader uses global coords`
+            );
+          }
+        }
+
+        if (this._pendingTileShift) {
+          if (!this._exactPG) this._pGlobal();
+          this._exactPG.x += this._pendingTileShift.x;
+          this._exactPG.y += this._pendingTileShift.y;
+          this._pendingTileShift = null;
+          // Synchronous bake: terrain is fresh, pGX/pGY are now correct.
+          // This runs before the next rAF so frame N+1 sees the right image.
+          const { x: newPGX, y: newPGY } = this._pGlobal();
+          this._tileR?.invalidateSync(this.terrainCache, newPGX, newPGY);
+        }
+        
         if (result.weatherUpdate && this.weather) {
+
           this.weather.setMode(result.weatherUpdate.mode);
           this.weather.wind = result.weatherUpdate.wind;
           this.emit('weather:changed', result.weatherUpdate);
@@ -665,8 +727,21 @@ export class Engine extends EventEmitter {
     if (this._input.isRotatingRight()) cam.rotVel += 2.2 * dt;
     if (this.weather) this.weather.update(dt, this.playerEntity?.tx ?? 0, this.playerEntity?.ty ?? 0);
 
-    const { x: pGX, y: pGY } = this._pGlobal();
+    let { x: pGX, y: pGY } = this._pGlobal();
     const pElev = this._playerElev();
+
+    // ── Terrain-shift diagnostics (throttled to once per second) ──────────
+    if (!this._dbgLastLog || ts - this._dbgLastLog > 1000) {
+      this._dbgLastLog = ts;
+      console.log(
+        `[Engine] geoCenter=(${this.geoCenter.lat.toFixed(6)}, ${this.geoCenter.lon.toFixed(6)})` +
+        ` pGX=${pGX.toFixed(2)} pGY=${pGY.toFixed(2)}` +
+        ` player=(${this.playerEntity?.tx.toFixed(2)}, ${this.playerEntity?.ty.toFixed(2)})` +
+        ` cam=(${cam.camX.toFixed(1)}, ${cam.camY.toFixed(1)})` +
+        ` zoom=${cam.zoom.toFixed(3)} tilt=${cam.tilt.toFixed(3)}` +
+        ` cacheSize=${this.terrainCache.size()}`
+      );
+    }
 
     // 3. Physics step
     if (this.physicsWorld && this.physicsEnabled) {
@@ -696,55 +771,99 @@ export class Engine extends EventEmitter {
       }
     }
 
-    // 4. Centre camera on player (smooth follow in ISO mode)
-    if (cam.tilt > 0.08 && this.playerEntity) {
+    // 4+5. World re-centre then smooth camera follow.
+    //
+    //      ORDER MATTERS: recentre must run BEFORE the smooth follow so that
+    //      both oldScreen and newScreen are computed against the same camX/camY.
+    //      If the smooth follow runs first it mutates camX/camY, then the geo
+    //      shift changes pGX/pGY, and the two worldToScreen calls see different
+    //      coordinate systems → large spurious screen delta → visible jump.
+    //
+    //      After a recentre the smooth follow is skipped for that frame; the
+    //      camera is already pixel-perfect on the snap point and any additional
+    //      lerp step would push it off again.
+    let didRecentre = false;
+
+    if (this.playerEntity) {
+      const dx  = this.playerEntity.tx - this._mapW / 2;
+      const dy  = this.playerEntity.ty - this._mapH / 2;
+      const dFC = Math.hypot(dx, dy);
+
+    if (dFC > REFETCH_DIST) {
+          didRecentre = true;
+
+          const nx = dx / dFC;
+          const ny = dy / dFC;
+          const snapDist = REFETCH_DIST;
+
+          const shiftX = Math.round(nx * snapDist);
+          const shiftY = Math.round(ny * snapDist);
+
+          const snapTx = this._mapW / 2 + shiftX;
+          const snapTy = this._mapH / 2 + shiftY;
+
+          // Capture elevation BEFORE moving anything — used for both
+          // worldToScreen calls so the delta is internally consistent.
+          const snapElev = pElev;
+
+          const oldScreen = worldToScreen(snapTx, snapTy, snapElev, cam);
+          const prevGeo = { ...this.geoCenter };
+
+          if (!this._exactPG) this._pGlobal();
+          this._exactPG.x += shiftX;
+          this._exactPG.y += shiftY;
+
+          this.geoCenter = tileToGeo(
+            snapTx, snapTy,
+            this.geoCenter, this._mPerTile, this._mapW, this._mapH
+          );
+
+          this.playerEntity.tx -= shiftX;
+          this.playerEntity.ty -= shiftY;
+
+          for (const p of this.playerEntity._posHistory) {
+            p.x -= shiftX;
+            p.y -= shiftY;
+          }
+
+          if (this.playerEntity._particle?.prevPosition) {
+            this.playerEntity._particle.prevPosition.x -= shiftX;
+            this.playerEntity._particle.prevPosition.y -= shiftY;
+          }
+
+          // Both calls use snapElev — no elevation mismatch.
+          const newScreen = worldToScreen(this._mapW / 2, this._mapH / 2, snapElev, cam);
+          const sdx = newScreen.x - oldScreen.x;
+          const sdy = newScreen.y - oldScreen.y;
+
+          cam.camX += sdx;
+          cam.camY += sdy;
+
+          this._rebuildAllEntitiesGeo(prevGeo);
+
+          this._lastTileCamX = null;
+          this._doFetch(this.geoCenter);
+          this.emit('center:changed', this.geoCenter);
+        }
+    }
+
+        // Re-read pGX/pGY if a recentre just mutated _exactPG this frame.
+    // The variables were captured at the top of _frame() before the shift,
+    // so terrain draws below would use stale coords without this refresh.
+    if (didRecentre) {
+      const refreshed = this._pGlobal();
+      pGX = refreshed.x;
+      pGY = refreshed.y;
+    }
+
+    // Smooth follow — skip the frame we recentred to avoid a double-correction
+    if (!didRecentre && cam.tilt > 0.08 && this.playerEntity) {
       const { x: px, y: py } = worldToScreen(
         this.playerEntity.tx, this.playerEntity.ty, pElev,
         { ...cam, camX: 0, camY: 0 }
       );
       cam.camX += (px - W/2 - cam.camX) * 0.08;
       cam.camY += (py - H/2 - cam.camY) * 0.08;
-    }
-
-    // 5. World re-centre when player drifts too far from map centre.
-    //    CRITICAL: compute the screen delta in TILE SPACE, not screen space,
-    //    so the correction is independent of elevation / stale pElev.
-    if (this.playerEntity) {
-      const dFC = Math.hypot(
-        this.playerEntity.tx - this._mapW / 2,
-        this.playerEntity.ty - this._mapH / 2
-      );
-      if (dFC > REFETCH_DIST && !this._fetching) {
-        // Remember old tile position in screen coords BEFORE any state change
-        const oldScreen = worldToScreen(
-          this.playerEntity.tx, this.playerEntity.ty, pElev, cam
-        );
-
-        // Update geo centre to player's current world position
-        this.geoCenter = this.playerEntity.getGeo(
-          this.geoCenter, this._mPerTile, this._mapW, this._mapH
-        );
-
-        // Reset player to map centre
-        this.playerEntity.tx = this._mapW / 2;
-        this.playerEntity.ty = this._mapH / 2;
-
-        // Compute new screen position of the (now-recentred) player
-        // using the SAME pElev so the delta is purely from the tile shift
-        const newScreen = worldToScreen(
-          this.playerEntity.tx, this.playerEntity.ty, pElev, cam
-        );
-
-        // Shift camera by the exact screen delta — no jump
-        cam.camX += newScreen.x - oldScreen.x;
-        cam.camY += newScreen.y - oldScreen.y;
-
-        // Rebuild entity tile positions around new centre AFTER camera fix
-        this._rebuildAllEntitiesGeo();
-        this._lastTileCamX = null; // force tile cache rebuild
-        this._doFetch(this.geoCenter);
-        this.emit('center:changed', this.geoCenter);
-      }
     }
 
     // 6. Build render list sorted by depth
@@ -864,7 +983,7 @@ export class Engine extends EventEmitter {
     }
 
     let best = null, bestDist = Infinity;
-    const { x: pGX, y: pGY } = this._pGlobal();
+    let { x: pGX, y: pGY } = this._pGlobal();
 
     for (const e of this.entities) {
       const groundH = this.terrainRegistry.heights[

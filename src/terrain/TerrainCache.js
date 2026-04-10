@@ -30,9 +30,9 @@ export class TerrainCache {
   }
 
   keyFromLatLon(lat, lon) {
-    const gx = Math.round((lon - this._originLon) * (111320 * Math.cos(this._originLat * Math.PI / 180)) / this.mPerTile);
-    const gy = Math.round((lat - this._originLat) * 110574 / this.mPerTile);
-    return `${gx},${gy}`;
+      const gx = Math.round(lonToGlobalX(lon, lat, this.mPerTile));
+      const gy = Math.round(latToGlobalY(lat, this.mPerTile));
+      return `${gx},${gy}`;
   }
 
   /**

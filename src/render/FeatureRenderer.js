@@ -151,7 +151,7 @@ export class FeatureRenderer {
       if (f.data?.category === 'aviation') {
           // LOGARITHMIC SCALING: Keeps planes high, but always on screen
           // 15 is the minimum flight height, then it grows slowly with real altitude
-          altitudeOffset = 15 + (Math.log10((f.data.altitude || 1000) + 1) * 6);
+          altitudeOffset = 5 + ((Math.log10((f.data.altitude || 1000) + 1) * 6) * 0.5);
       }
       if (f.data?.category === 'traffic') altitudeOffset = 0.5;
 

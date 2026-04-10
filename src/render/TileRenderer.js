@@ -347,4 +347,17 @@ export class TileRenderer {
   invalidate() {
     this._bakeDirty = true;
   }
+
+  // ── ADD THIS NEW METHOD immediately below invalidate() ──────────────────
+  invalidateSync(terrainCache, pGX, pGY) {
+    this._pendingBake = null;          // cancel any queued async bake
+    this._baking      = false;
+    this._bakeMap(terrainCache, pGX, pGY);
+    this._lastPGX      = pGX;
+    this._lastPGY      = pGY;
+    this._lastTilt     = this.cam.tilt;
+    this._lastSunAngle = this._shadows?.sunAngle     ?? 0;
+    this._lastSunElev  = this._shadows?.sunElevation ?? 0;
+    this._bakeDirty    = false;
+  }
 }

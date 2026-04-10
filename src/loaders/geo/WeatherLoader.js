@@ -15,18 +15,20 @@ export class WeatherLoader extends BaseLoader {
     try {
       const res = await fetch(url);
       const data = await res.json();
-
       if (!data.weather) return {};
 
-      // 1. Map Condition to Engine Modes
-      let mode = 'none';
       const main = data.weather[0].main.toLowerCase();
-      
-      if (main.includes('rain') || main.includes('drizzle')) mode = 'rain';
-      else if (main.includes('snow')) mode = 'snow';
+      let mode = 'none';
 
-      // 2. Calculate Wind Vector
-      // Map degrees (0=N, 90=E) to Engine X/Y
+      // Mapping all OpenWeatherMap Main conditions to Engine Modes
+      if (main === 'thunderstorm') mode = 'thunderstorm';
+      else if (main === 'rain' || main === 'drizzle') mode = 'rain';
+      else if (main === 'snow') mode = 'snow';
+      else if (['mist', 'smoke', 'haze', 'fog', 'ash'].includes(main)) mode = 'fog';
+      else if (['dust', 'sand', 'squall'].includes(main)) mode = 'sand';
+      else if (main === 'tornado') mode = 'thunderstorm'; // Use thunderstorm as proxy
+      else if (main === 'clouds') mode = 'cloudy';
+
       const speed = (data.wind?.speed ?? 0) * 0.01; 
       const angle = ((data.wind?.deg ?? 0) - 90) * (Math.PI / 180);
       
