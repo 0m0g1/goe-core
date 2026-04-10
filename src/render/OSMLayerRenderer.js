@@ -1,16 +1,15 @@
 /**
  * GOE Core — OSMLayerRenderer
- * Renders standard XYZ slippy-map tiles onto the isometric canvas using
- * affine matrix transforms — tiles appear flat at low zoom, tilted at high zoom.
  *
- * Tile images are cached globally across engine instances.
+ * Accepts a WorldRenderer instead of raw ctx/cam.
+ * All tile image drawing routes through worldRenderer.drawTransformedImage().
  */
 import {
   worldToScreen, tileHalfWidth, tileHalfHeight, screenToWorld,
 } from '../math/projection.js';
 import { geoToTile, tileToGeo, slippyTileToLatLon, latLonToSlippy } from '../math/geo.js';
 
-// ─── GLOBAL TILE IMAGE CACHE ─────────────────────────────────────────────────
+// ─── Global tile image cache ──────────────────────────────────────────────────
 
 const TILE_CACHE = new Map();
 
@@ -29,7 +28,6 @@ function getSlippyTile(z, x, y, urlFn) {
   return obj;
 }
 
-/** Evict tiles for a specific z level — useful when switching tile sources */
 export function evictTileCache(z) {
   if (z === undefined) { TILE_CACHE.clear(); return; }
   for (const key of TILE_CACHE.keys()) {
@@ -37,43 +35,41 @@ export function evictTileCache(z) {
   }
 }
 
-// ─── RENDERER ────────────────────────────────────────────────────────────────
+// ─── Renderer ────────────────────────────────────────────────────────────────
 
 export class OSMLayerRenderer {
   /**
-   * @param {CanvasRenderingContext2D} ctx
-   * @param {object} cam
-   * @param {(z:number,x:number,y:number)=>string} urlFn  Tile URL factory
-   * @param {number} [maxTiles=120]  Safety cap on tiles per frame
+   * @param {WorldRenderer}                         worldRenderer
+   * @param {(z:number,x:number,y:number)=>string}  urlFn
+   * @param {number}                                [maxTiles=120]
    */
-  constructor(ctx, cam, urlFn, maxTiles = 120) {
-    this.ctx      = ctx;
-    this.cam      = cam;
+  constructor(worldRenderer, urlFn, maxTiles = 120) {
+    this._wr      = worldRenderer;
     this.urlFn    = urlFn;
     this.maxTiles = maxTiles;
   }
 
-  /** Replace the tile URL factory (e.g. switching from OSM to satellite). */
-  setURLFn(urlFn) {
-    this.urlFn = urlFn;
-  }
+  get ctx() { return this._wr.ctx; }
+  get cam() { return this._wr.cam; }
+
+  setURLFn(urlFn) { this.urlFn = urlFn; }
 
   /**
    * Draw the OSM tile layer for the current frame.
-   * @param {HTMLCanvasElement} canvas
-   * @param {{lat:number, lon:number}} geoCenter
+   * @param {HTMLCanvasElement}  canvas
+   * @param {{lat:number,lon:number}} geoCenter
    */
   draw(canvas, geoCenter) {
-    const { ctx, cam, urlFn } = this;
+    const { cam, urlFn, _wr: wr } = this;
 
-    // 1. Choose OSM zoom level
+    // 1. OSM zoom level
     let osmZ = Math.round(
       Math.log2(250468 * cam.zoom * Math.cos(geoCenter.lat * Math.PI / 180))
     );
     osmZ = Math.max(0, Math.min(19, osmZ));
     const numTiles = Math.pow(2, osmZ);
 
-    // 2. Find geo corners of the canvas
+    // 2. Geo corners of canvas
     const corners = [
       [0, 0], [canvas.width, 0], [0, canvas.height], [canvas.width, canvas.height],
     ].map(([sx, sy]) => {
@@ -90,7 +86,7 @@ export class OSMLayerRenderer {
     const lon2x = lon => (lon + 180) / 360 * numTiles;
     const lat2y = lat => {
       const l = lat * Math.PI / 180;
-      return (1 - Math.log(Math.tan(l) + 1/Math.cos(l)) / Math.PI) / 2 * numTiles;
+      return (1 - Math.log(Math.tan(l) + 1 / Math.cos(l)) / Math.PI) / 2 * numTiles;
     };
 
     let minX = Math.floor(lon2x(minLon)), maxX = Math.floor(lon2x(maxLon));
@@ -98,13 +94,13 @@ export class OSMLayerRenderer {
 
     // 3. Safety cap
     let z = osmZ;
-    while ((maxX-minX+1)*(maxY-minY+1) > this.maxTiles && z > 0) {
+    while ((maxX - minX + 1) * (maxY - minY + 1) > this.maxTiles && z > 0) {
       z--;
       const nn = Math.pow(2, z);
-      minX = Math.floor((minLon+180)/360*nn);
-      maxX = Math.floor((maxLon+180)/360*nn);
-      minY = Math.floor(lat2y(maxLat) / (numTiles/nn));
-      maxY = Math.floor(lat2y(minLat) / (numTiles/nn));
+      minX = Math.floor((minLon + 180) / 360 * nn);
+      maxX = Math.floor((maxLon + 180) / 360 * nn);
+      minY = Math.floor(lat2y(maxLat) / (numTiles / nn));
+      maxY = Math.floor(lat2y(minLat) / (numTiles / nn));
     }
 
     const tile2lon = x => x / Math.pow(2, z) * 360 - 180;
@@ -113,34 +109,40 @@ export class OSMLayerRenderer {
       return 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
     };
 
-    // 4. Render tiles
+    // 4. Render tiles via WorldRenderer
     for (let x = minX; x <= maxX; x++) {
       for (let y = minY; y <= maxY; y++) {
         if (y < 0 || y >= Math.pow(2, z)) continue;
-        const wx = ((x % numTiles) + numTiles) % numTiles;
+        const wx   = ((x % numTiles) + numTiles) % numTiles;
         const tile = getSlippyTile(z, wx, y, urlFn);
         if (!tile.loaded) continue;
 
         const tNw = geoToTile(tile2lat(y),   tile2lon(x),   geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
-        const tNe = geoToTile(tile2lat(y),   tile2lon(x+1), geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
-        const tSw = geoToTile(tile2lat(y+1), tile2lon(x),   geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
+        const tNe = geoToTile(tile2lat(y),   tile2lon(x + 1), geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
+        const tSw = geoToTile(tile2lat(y + 1), tile2lon(x), geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
 
         const p1 = worldToScreen(tNw.x, tNw.y, 0, cam);
         const p2 = worldToScreen(tNe.x, tNe.y, 0, cam);
         const p4 = worldToScreen(tSw.x, tSw.y, 0, cam);
 
-        ctx.save();
-        const m11 = (p2.x-p1.x)/256, m12 = (p2.y-p1.y)/256;
-        const m21 = (p4.x-p1.x)/256, m22 = (p4.y-p1.y)/256;
-        ctx.setTransform(m11, m12, m21, m22, p1.x, p1.y);
-        ctx.drawImage(tile.img, 0, 0, 256.5, 256.5);
-        ctx.restore();
+        wr.drawTransformedImage(
+          tile.img,
+          {
+            m11: (p2.x - p1.x) / 256,
+            m12: (p2.y - p1.y) / 256,
+            m21: (p4.x - p1.x) / 256,
+            m22: (p4.y - p1.y) / 256,
+            dx:  p1.x,
+            dy:  p1.y,
+          },
+          256.5,
+          256.5,
+        );
       }
     }
   }
 
   setGeoCenter(geo) {
     this._geoCenter = geo;
-    this._tileCache?.clear(); // force re-fetch tiles for new location
   }
 }

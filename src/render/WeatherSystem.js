@@ -1,58 +1,70 @@
-import { worldToScreen, getElevOffset } from '../math/projection.js';
+/**
+ * GOE Core — WeatherSystem
+ *
+ * All drawing goes through WorldRenderer.
+ * WeatherSystem never touches CanvasRenderingContext2D directly.
+ */
+import { getElevOffset } from '../math/projection.js';
 
 export class WeatherSystem {
-  constructor(ctx, cam) {
-    this.ctx = ctx;
-    this.cam = cam;
-    this.particles = [];
-    this.mode = 'none'; 
-    this.wind = { x: 0.05, y: 0.02 };
-    this.flashAlpha = 0; // For thunderstorms
+  /**
+   * @param {WorldRenderer} worldRenderer
+   */
+  constructor(worldRenderer) {
+    this._wr = worldRenderer;
+
+    this.particles  = [];
+    this.mode       = 'none';
+    this.wind       = { x: 0.05, y: 0.02 };
+    this.flashAlpha = 0;
   }
+
+  // Convenience accessors kept so internal helpers don't need _wr.cam everywhere
+  get cam() { return this._wr.cam; }
+
+  // ── Mode management ───────────────────────────────────────────────────────
 
   setMode(mode) {
     if (this.mode === mode) return;
-    this.mode = mode;
-    this.particles = [];
+    this.mode       = mode;
+    this.particles  = [];
+    this.flashAlpha = 0;
     if (mode === 'none' || mode === 'cloudy') return;
 
-    // Adjust particle density based on weather severity
     let count = 600;
     if (mode === 'rain' || mode === 'sand') count = 1000;
-    if (mode === 'thunderstorm') count = 1500;
-    if (mode === 'fog') count = 150; // Fewer but larger particles
+    if (mode === 'thunderstorm')            count = 1500;
+    if (mode === 'fog')                     count = 150;
 
-    for (let i = 0; i < count; i++) {
-      this.particles.push(this._createParticle());
-    }
+    for (let i = 0; i < count; i++) this.particles.push(this._createParticle());
   }
 
   _createParticle() {
     const isFog = this.mode === 'fog';
     return {
-      tx: (Math.random() - 0.5) * 100,
-      ty: (Math.random() - 0.5) * 100,
-      tz: Math.random() * 25 + (isFog ? 0 : 5),
+      tx:    (Math.random() - 0.5) * 100,
+      ty:    (Math.random() - 0.5) * 100,
+      tz:    Math.random() * 25 + (isFog ? 0 : 5),
       speed: isFog ? Math.random() * 2 + 1 : Math.random() * 20 + 15,
-      size: isFog ? Math.random() * 40 + 20 : Math.random() * 2 + 1.5
+      size:  isFog ? Math.random() * 40 + 20 : Math.random() * 2 + 1.5,
     };
   }
+
+  // ── Update ────────────────────────────────────────────────────────────────
 
   update(dt, playerX, playerY) {
     if (this.mode === 'none') return;
 
-    // Handle Thunderstorm Flashes
     if (this.mode === 'thunderstorm') {
       if (this.flashAlpha > 0) this.flashAlpha -= dt * 2;
-      if (Math.random() < 0.005) this.flashAlpha = 0.6; // Random lightning strike
+      if (Math.random() < 0.005) this.flashAlpha = 0.6;
     }
 
-    for (let p of this.particles) {
+    for (const p of this.particles) {
       p.tz -= p.speed * dt;
       p.tx += this.wind.x * dt;
       p.ty += this.wind.y * dt;
 
-      // Reset particles when they hit the ground (tz < 0)
       if (p.tz < 0) {
         Object.assign(p, this._createParticle());
         p.tx += playerX;
@@ -61,65 +73,74 @@ export class WeatherSystem {
     }
   }
 
+  // ── Draw — called by RenderPipeline.flush() ───────────────────────────────
+
   draw() {
     if (this.mode === 'none') return;
-    const { ctx, cam } = this;
+    const { _wr: wr, cam } = this;
+    const ctx = wr.ctx;
+    const W   = ctx.canvas.width;
+    const H   = ctx.canvas.height;
 
-    // 1. Draw Global Overlays (Clouds/Thunder/Fog base)
+    // 1. Global overlays
     if (this.mode === 'cloudy' || this.mode === 'thunderstorm') {
-        ctx.fillStyle = `rgba(0, 0, 20, 0.2)`; // Dim the world
-        ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+      wr.fillRect(0, 0, W, H, 'rgba(0,0,20,0.2)');
     }
-    
     if (this.flashAlpha > 0) {
-        ctx.fillStyle = `rgba(255, 255, 255, ${this.flashAlpha})`;
-        ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+      wr.fillRect(0, 0, W, H, `rgba(255,255,255,${this.flashAlpha})`);
     }
 
-    // 2. Set Particle Styles
-    this._setStyles(ctx);
+    // 2. Determine particle style
+    const isLine   = (this.mode === 'rain' || this.mode === 'thunderstorm' || this.mode === 'sand');
+    const isCircle = !isLine; // snow or fog
 
-    for (let p of this.particles) {
+    const lineStyle   = this._lineStyle();
+    const circleStyle = this._circleStyle();
+
+    // 3. Draw particles
+    for (const p of this.particles) {
       const elev = getElevOffset(p.tz * 8, cam.tilt, cam.zoom);
-      const pos = worldToScreen(p.tx, p.ty, elev, cam);
+      const pos  = wr.worldToScreen(p.tx, p.ty, elev);
 
-      if (pos.x < -100 || pos.x > ctx.canvas.width + 100 || pos.y < -100 || pos.y > ctx.canvas.height + 100) continue;
+      if (pos.x < -100 || pos.x > W + 100 || pos.y < -100 || pos.y > H + 100) continue;
 
-      if (this.mode === 'rain' || this.mode === 'thunderstorm' || this.mode === 'sand') {
-        ctx.beginPath();
-        ctx.moveTo(pos.x, pos.y);
+      if (isLine) {
         const length = (this.mode === 'sand' ? 10 : 25) * cam.zoom;
-        ctx.lineTo(pos.x + this.wind.x * 50, pos.y + length);
-        ctx.stroke();
+        wr.drawLine(
+          pos.x,
+          pos.y,
+          pos.x + this.wind.x * 50,
+          pos.y + length,
+          lineStyle.color,
+          lineStyle.width,
+        );
       } else {
-        // Snow or Fog (Circles)
-        ctx.beginPath();
-        ctx.arc(pos.x, pos.y, p.size * cam.zoom, 0, Math.PI * 2);
-        if (this.mode === 'fog') ctx.fill();
-        else ctx.stroke();
+        const r = p.size * cam.zoom;
+        if (this.mode === 'fog') {
+          wr.drawCircle(pos.x, pos.y, r, circleStyle.fill);
+        } else {
+          // Snow — stroke circle
+          ctx.beginPath();
+          ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
+          ctx.strokeStyle = circleStyle.stroke;
+          ctx.lineWidth   = 2;
+          ctx.stroke();
+        }
       }
     }
   }
 
-  _setStyles(ctx) {
+  _lineStyle() {
     switch (this.mode) {
       case 'rain':
-      case 'thunderstorm':
-        ctx.strokeStyle = 'rgba(200, 220, 255, 0.6)';
-        ctx.lineWidth = 1.2;
-        break;
-      case 'snow':
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
-        ctx.lineWidth = 2;
-        break;
-      case 'fog':
-        ctx.fillStyle = 'rgba(200, 200, 210, 0.05)';
-        break;
-      case 'sand':
-        ctx.strokeStyle = 'rgba(194, 178, 128, 0.7)'; // Sandy beige
-        ctx.lineWidth = 1.5;
-        break;
+      case 'thunderstorm': return { color: 'rgba(200,220,255,0.6)', width: 1.2 };
+      case 'sand':         return { color: 'rgba(194,178,128,0.7)', width: 1.5 };
+      default:             return { color: 'rgba(255,255,255,0.9)', width: 2   };
     }
-    ctx.lineCap = 'round';
+  }
+
+  _circleStyle() {
+    if (this.mode === 'fog')  return { fill: 'rgba(200,200,210,0.05)' };
+    return { stroke: 'rgba(255,255,255,0.9)' }; // snow
   }
 }

@@ -119,4 +119,58 @@ export class ShadowSystem {
   applyAO(hexColor, factor) {
     return factor >= 0.999 ? hexColor : darkenHex(hexColor, factor);
   }
+
+  /**
+   * Renders merged shadows from the pipeline to prevent overlapping alpha stacking.
+   */
+  drawShadows(shadowCasters) {
+    if (!this.enabled || !shadowCasters.length || this.cam.tilt < 0.05) return;
+
+    const { ctx, cam } = this;
+    ctx.save();
+    ctx.fillStyle = this.shadowColor;
+    ctx.globalAlpha = this.shadowAlpha * Math.min(1, cam.tilt / 0.3);
+    ctx.globalCompositeOperation = 'multiply';
+
+    ctx.beginPath();
+
+    const VU = 8;
+    // Iterate through pipeline shadow casters instead of building entities
+    for (const { p, elev, r, engineH } of shadowCasters) {
+      const hT = r / VU;
+      const hTiles = engineH / VU;
+
+      const base = [
+        { x: p.x - hT, y: p.y - hT }, { x: p.x + hT, y: p.y - hT },
+        { x: p.x + hT, y: p.y + hT }, { x: p.x - hT, y: p.y + hT }
+      ];
+      
+      const sB = base.map(c => worldToScreen(c.x, c.y, elev, cam));
+      const sT = base.map(c => {
+        const tx = c.x + this._uDX * hTiles;
+        const ty = c.y + this._uDY * hTiles;
+        return worldToScreen(tx, ty, elev, cam);
+      });
+
+      ctx.moveTo(sB[0].x, sB[0].y);
+      for (let i = 1; i < 4; i++) ctx.lineTo(sB[i].x, sB[i].y);
+      ctx.lineTo(sB[0].x, sB[0].y); 
+      
+      ctx.moveTo(sT[0].x, sT[0].y);
+      for (let i = 1; i < 4; i++) ctx.lineTo(sT[i].x, sT[i].y);
+      ctx.closePath();
+
+      for (let i = 0; i < 4; i++) {
+        const next = (i + 1) % 4;
+        ctx.moveTo(sB[i].x, sB[i].y);
+        ctx.lineTo(sB[next].x, sB[next].y);
+        ctx.lineTo(sT[next].x, sT[next].y);
+        ctx.lineTo(sT[i].x, sT[i].y);
+        ctx.closePath();
+      }
+    }
+    
+    ctx.fill(); 
+    ctx.restore();
+  }
 }
