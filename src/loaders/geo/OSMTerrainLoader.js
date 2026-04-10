@@ -30,6 +30,9 @@ const DEFAULT_ENDPOINTS = [
 
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+// VU — voxel units per tile (must match VoxelRenderer)
+const VU = 8;
+
 // ─── Terrain classification ────────────────────────────────────────────────────
 
 function classifyOSM(tags) {
@@ -95,10 +98,7 @@ const POI_COLORS = {
 
 function classifyPOI(tags) {
   if (!tags) return null;
-
-  // OSM individual trees → handled separately as tree entities
   if (tags.natural === 'tree') return null;
-
   const cats = ['amenity','shop','tourism','historic','leisure','office','natural'];
   for (const cat of cats) {
     const val = tags[cat];
@@ -150,9 +150,57 @@ function rasterizeLine(cache, pts, terrain, width) {
   }
 }
 
-// ─── EntityDef factories ────────────────────────────────────────────────────────
+// ─── Blueprint scaling helpers ─────────────────────────────────────────────────
 
-const VU = 8;
+/**
+ * Compute the native axis-aligned bounding box of a blueprint in voxel units.
+ *   maxY         — tallest point (voxel units above y=0)
+ *   halfExtentXZ — largest half-width/depth from origin (voxel units)
+ */
+function blueprintNativeBounds(blueprint) {
+  let maxY = 0, halfXZ = 0;
+  for (const p of blueprint) {
+    maxY   = Math.max(maxY,   p.y + p.h);
+    halfXZ = Math.max(halfXZ, Math.abs(p.x) + p.w, Math.abs(p.z) + p.d);
+  }
+  return { maxY, halfExtentXZ: halfXZ / 2 };
+}
+
+/**
+ * Derive a uniform scale factor so the blueprint matches real-world OSM dims.
+ *
+ * Strategy:
+ *   - If OSM height tag is present use it as the primary driver (most reliable).
+ *   - Otherwise fall back to footprint area.
+ *   - If neither is known, return 1 (native voxel scale).
+ *
+ * @param {Array}  blueprint  — raw blueprint box array
+ * @param {number} osmHeightM — height in metres from OSM tags (0 = unknown)
+ * @param {number} osmAreaM2  — footprint area in m² from OSM  (0 = unknown)
+ * @param {number} mPerTile   — metres per tile in the engine
+ * @returns {number} uniform scale factor
+ */
+function computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile) {
+  const { maxY, halfExtentXZ } = blueprintNativeBounds(blueprint);
+
+  if (osmHeightM > 0 && maxY > 0) {
+    // Native blueprint height in tiles → target height in tiles → ratio
+    const nativeTileH = maxY / VU;
+    const targetTileH = osmHeightM / mPerTile;
+    return targetTileH / nativeTileH;
+  }
+
+  if (osmAreaM2 > 0 && halfExtentXZ > 0) {
+    // Treat footprint as square: half-extent = sqrt(area) / 2
+    const nativeTileR = halfExtentXZ / VU;
+    const targetTileR = Math.sqrt(osmAreaM2) / mPerTile / 2;
+    return targetTileR / nativeTileR;
+  }
+
+  return 1;
+}
+
+// ─── EntityDef factories ────────────────────────────────────────────────────────
 
 /**
  * Create a building EntityDef.
@@ -176,11 +224,11 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, decorateBuildin
     physicsEnabled: true,
     physicsRadius:  halfSideTiles,
     fixed:          true,
-    renderHeavy:    false,        // buildings use box draw, not full blueprint
-    _isBuildingBox: true,         // tells player collision to use AABB
+    renderHeavy:    false,
+    _isBuildingBox: true,
     _lodColor:      '#78909C',
-    _areaM2:        b.areaM2,      // stored for cache reconstruction
-    _heightM:       b.heightM,     // stored for cache reconstruction
+    _areaM2:        b.areaM2,
+    _heightM:       b.heightM,
 
     renderFn(wr, groundElevPx, extra, entity) {
       const elev  = groundElevPx + entity.elevOffset;
@@ -209,35 +257,67 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, decorateBuildin
   };
 }
 
-/** Blueprint entity (trees, fauna, aviation props, etc.) */
+/**
+ * Blueprint entity (trees, landmarks, fauna, aviation props, etc.)
+ *
+ * opts.scale — uniform scale applied to every box at draw time so the model
+ *              matches real-world OSM dimensions. Default 1 (native voxel size).
+ *              Stored as _scale on the entity so it survives cache round-trips.
+ */
 function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
+  const scale = opts.scale ?? 1;
+
   return {
     id,
-    latitude:       lat,
-    longitude:      lon,
-    solid:          opts.solid          ?? false,
-    bboxRadius:     opts.bboxRadius     ?? 0.35,
+    latitude:        lat,
+    longitude:       lon,
+    solid:           opts.solid           ?? false,
+    bboxRadius:      opts.bboxRadius      ?? 0.35,
     footprintRadius: opts.footprintRadius ?? opts.bboxRadius ?? 0.35,
-    physicsEnabled: opts.physicsEnabled ?? false,
-    physicsRadius:  opts.physicsRadius  ?? 0.35,
-    fixed:          opts.fixed          ?? true,
-    renderHeavy:    true,
-    _lodColor:      opts.lodColor ?? '#2E7D32',
-    altitudeM:         opts.altitudeM         ?? 0,
-    visualAlt:         opts.visualAlt         ?? 0,
-    showAltitudeLine:  opts.showAltitudeLine   ?? false,
-    _bpKey:         bpKey,                     // stored for cache reconstruction
+    physicsEnabled:  opts.physicsEnabled  ?? false,
+    physicsRadius:   opts.physicsRadius   ?? 0.35,
+    fixed:           opts.fixed           ?? true,
+    renderHeavy:     true,
+    _lodColor:       opts.lodColor ?? '#2E7D32',
+    altitudeM:          opts.altitudeM          ?? 0,
+    visualAlt:          opts.visualAlt          ?? 0,
+    showAltitudeLine:   opts.showAltitudeLine    ?? false,
+    _bpKey:          bpKey,
+    _scale:          scale,
 
     renderFn(wr, groundElevPx, extra, entity) {
       const blueprint = Blueprints[bpKey] ?? Blueprints['tree'];
       if (!blueprint) return;
       if (wr.cam.tilt < 0.04) return;
+
+      const s     = entity._scale ?? 1;
       const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
       const elev  = groundElevPx + entity.elevOffset;
-      const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation, entity.footprintRadius ?? entity.bboxRadius ?? 0.35);
+      const depth = tileDepth(
+        entity.tx, entity.ty, wr.cam.rotation,
+        entity.footprintRadius ?? entity.bboxRadius ?? 0.35
+      );
+
       wr.submitWorldObject(depth, () => {
         wr.ctx.globalAlpha = isoA;
-        wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
+
+        if (s !== 1) {
+          // Scale every box coordinate uniformly so the model matches
+          // the real-world height / footprint derived from OSM tags.
+          wr._voxel.beginTile(entity.tx, entity.ty, elev);
+          for (const p of blueprint) {
+            wr._voxel.box(
+              p.x * s, p.y * s, p.z * s,
+              p.w * s, p.h * s, p.d * s,
+              p.top,
+              p.right ?? p.top,
+              p.front ?? p.top,
+            );
+          }
+        } else {
+          wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
+        }
+
         wr.ctx.globalAlpha = 1;
       });
     },
@@ -246,8 +326,7 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
 
 /** Standard 2D icon POI feature — self-contained renderFn, no external resolver */
 function makeFeatureDef(f) {
-  // Find the first candidate (title, label, category) that exists as a key in Blueprints
-  let blueprint = null;
+  let blueprint    = null;
   let blueprintKey = null;
   const candidates = [f.title, f.label, f.category];
   for (const candidate of candidates) {
@@ -255,7 +334,7 @@ function makeFeatureDef(f) {
       const key = candidate.toLowerCase().replace(/\s+/g, '_');
       if (Blueprints[key]) {
         blueprintKey = key;
-        blueprint = Blueprints[key];
+        blueprint    = Blueprints[key];
         break;
       }
     }
@@ -265,7 +344,7 @@ function makeFeatureDef(f) {
   const label = f.label ?? f.title ?? '';
 
   if (!blueprintKey && (f.title || f.label || f.category)) {
-    console.warn(`${f.title}, ${label}, ${f.category}} is missing a blueprint`);
+    console.warn(`[OSMTerrainLoader] Missing blueprint for: ${f.title}, ${label}, ${f.category}`);
   }
 
   return {
@@ -278,8 +357,6 @@ function makeFeatureDef(f) {
     fixed:     true,
     renderHeavy: false,
     type: f.category,
-
-    // Carry metadata for click/HUD/selection display
     label, color,
     category: f.category,
     value:    f.value,
@@ -303,13 +380,11 @@ function makeFeatureDef(f) {
           wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
           ctx.globalAlpha = 1;
         } else {
-          // Glow halo
           ctx.beginPath();
           ctx.arc(x, y, r * 2.2, 0, Math.PI * 2);
           ctx.fillStyle = color + '33';
           ctx.fill();
 
-          // Main dot
           ctx.beginPath();
           ctx.arc(x, y, r, 0, Math.PI * 2);
           ctx.fillStyle = color;
@@ -321,7 +396,6 @@ function makeFeatureDef(f) {
           ctx.stroke();
         }
 
-        // Selection ring
         if (extra.selectedId === entity.id) {
           ctx.beginPath();
           ctx.arc(x, y, r * 1.8, 0, Math.PI * 2);
@@ -330,7 +404,6 @@ function makeFeatureDef(f) {
           ctx.stroke();
         }
 
-        // Label at sufficient zoom
         if (hw > 12 && label && cam.tilt > 0.1) {
           wr.drawLabel(x, y - r * 2.2, label);
         }
@@ -351,11 +424,10 @@ const TREE_BLUEPRINT_KEY = {
 };
 
 function treeSpeciesFromTags(tags = {}) {
-  const genus = (tags.genus ?? '').toLowerCase();
-  const species = (tags.species ?? '').toLowerCase();
+  const genus    = (tags.genus       ?? '').toLowerCase();
   const leafType = (tags['leaf_type'] ?? '').toLowerCase();
   if (genus.includes('pinus') || genus.includes('picea') || leafType === 'needleleaved') return 'conifer';
-  if (genus.includes('palm') || genus.includes('phoenix')) return 'palm';
+  if (genus.includes('palm')  || genus.includes('phoenix'))                              return 'palm';
   if (genus.includes('quercus') || genus.includes('fagus') || leafType === 'broadleaved') return 'deciduous';
   return 'deciduous';
 }
@@ -421,10 +493,10 @@ export function decorateBuildingFacade(ctx, cam, buildingEntry, vr, seed = 0) {
   const isValid = f => f.length === 4 && f.every(p => p && typeof p.x === 'number');
   if (!isValid(faceA) || !isValid(faceB)) return;
 
-  const floors      = Math.max(1, Math.round((engineH / VU) * 0.7));
-  const colsA       = Math.max(2, Math.round(r / VU * 3));
-  const colsB       = Math.max(1, Math.round(r / VU * 2));
-  const winAlpha    = Math.min(1, (hw - 6) / 14) * Math.min(1, cam.tilt * 4);
+  const floors   = Math.max(1, Math.round((engineH / VU) * 0.7));
+  const colsA    = Math.max(2, Math.round(r / VU * 3));
+  const colsB    = Math.max(1, Math.round(r / VU * 2));
+  const winAlpha = Math.min(1, (hw - 6) / 14) * Math.min(1, cam.tilt * 4);
 
   if (winAlpha > 0.05) {
     ctx.globalAlpha = winAlpha;
@@ -467,12 +539,10 @@ export class OSMTerrainLoader extends BaseLoader {
     this._debounceTimer   = null;
     this._pendingResolve  = null;
 
-    // Injected at fetch-time from the engine result pipeline
     this._decorateBuildingFacade = options.decorateBuildingFacade ?? null;
     this._terrainRegistry        = options.terrainRegistry        ?? null;
   }
 
-  /** Allow the engine to inject collaborators after construction. */
   init(engine) {
     this._terrainRegistry = engine.terrainRegistry;
   }
@@ -520,13 +590,17 @@ export class OSMTerrainLoader extends BaseLoader {
         const liveEntities = (cached.entities ?? []).map(e => {
           if (e._type === 'building') {
             return makeBuildingDef(
-              { id: e.id, areaM2: e.areaM2 ?? 16, heightM: e.heightM ?? 8, centroid: { lat: e.latitude, lon: e.longitude } },
+              { id: e.id, areaM2: e.areaM2 ?? 16, heightM: e.heightM ?? 8 },
               e.latitude, e.longitude,
               this._mPerTile, this._terrainRegistry, decorateBuildingFacade
             );
           }
           if (e.bpKey) {
-            return makeBlueprintDef(e.id, e.latitude, e.longitude, e.bpKey, e);
+            // Restore _scale so the landmark draws at the correct real-world size
+            return makeBlueprintDef(e.id, e.latitude, e.longitude, e.bpKey, {
+              ...e,
+              scale: e._scale ?? 1,
+            });
           }
           return makeFeatureDef(e);
         });
@@ -579,9 +653,8 @@ export class OSMTerrainLoader extends BaseLoader {
         const terrainUpdates = new Map();
         const entityDefs     = [];
 
-        // Tracks landmark blueprint keys that have already been placed this
-        // fetch so that duplicate OSM nodes / ways for the same named
-        // structure never produce more than one entity.
+        // Tracks which landmark blueprint keys have already been placed this
+        // fetch so duplicate OSM nodes/ways for the same structure are skipped.
         const renderedLandmarkNames = new Set();
 
         const toTile = (eLat, eLon) => ({
@@ -670,28 +743,34 @@ export class OSMTerrainLoader extends BaseLoader {
             const name    = el.tags?.name || poi.label;
             const nameKey = name.toLowerCase().replace(/\s+/g, '_');
 
-            // If this name resolves to a landmark blueprint, place it once
-            // (preferring the building way centroid if already placed there)
-            // and skip the generic POI dot entirely.
+            // Named landmark node → place blueprint once, skip POI dot always
             if (Blueprints[nameKey]) {
               if (!renderedLandmarkNames.has(nameKey)) {
                 renderedLandmarkNames.add(nameKey);
+
+                const blueprint  = Blueprints[nameKey];
+                const osmHeightM = parseFloat(el.tags?.height ?? el.tags?.['building:height'] ?? 0) || 0;
+                const scale      = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile);
+                const { halfExtentXZ } = blueprintNativeBounds(blueprint);
+                const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
+
                 entityDefs.push(makeBlueprintDef(
                   `landmark:node:${el.id}`,
                   el.lat, el.lon,
                   nameKey,
                   {
+                    scale,
                     solid:           true,
-                    bboxRadius:      4,
-                    footprintRadius: 4,
+                    bboxRadius:      scaledR,
+                    footprintRadius: scaledR,
                     physicsEnabled:  true,
-                    physicsRadius:   4,
+                    physicsRadius:   scaledR,
                     fixed:           true,
                     lodColor:        '#A1887F',
                   }
                 ));
               }
-              continue; // always skip POI fallthrough even if already rendered
+              continue; // skip POI fallthrough even if already rendered by way
             }
 
             entityDefs.push(makeFeatureDef({
@@ -713,54 +792,56 @@ export class OSMTerrainLoader extends BaseLoader {
 
         if (buildingWays.length && this._terrainRegistry) {
           const buildings = preprocessBuildings(buildingWays);
+
           for (const b of buildings) {
             const name    = b.tags?.name ?? '';
-            // Fix: use global replace so multi-word names normalise correctly
-            const nameKey = name.toLowerCase().replace(/\s+/g, '_');
+            const nameKey = name.toLowerCase().replace(/\s+/g, '_'); // global replace
             const blueprint = Blueprints[nameKey];
 
             if (blueprint) {
-              // Prefer building centroid over a previously-placed node, so
-              // replace the node entry if the way comes later in the loop.
+              // Compute real-world scale from OSM height + footprint area.
+              // The building way carries the most complete data (e.g. height=330
+              // on the Eiffel Tower way), so this is the authoritative source.
+              const osmHeightM = parseFloat(b.tags?.height ?? b.tags?.['building:height'] ?? 0) || 0;
+              const osmAreaM2  = b.areaM2 ?? 0;
+              const scale      = computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, this._mPerTile);
+              const { halfExtentXZ } = blueprintNativeBounds(blueprint);
+              const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
+
+              console.log(
+                `[OSMTerrainLoader] Landmark "${name}" — ` +
+                `h=${osmHeightM}m area=${osmAreaM2.toFixed(0)}m² → ` +
+                `scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`
+              );
+
+              const landmarkDef = makeBlueprintDef(
+                `landmark:${b.id}`,
+                b.centroid.lat,
+                b.centroid.lon,
+                nameKey,
+                {
+                  scale,
+                  solid:           true,
+                  bboxRadius:      scaledR,
+                  footprintRadius: scaledR,
+                  physicsEnabled:  true,
+                  physicsRadius:   scaledR,
+                  fixed:           true,
+                  lodColor:        '#A1887F',
+                }
+              );
+
               if (!renderedLandmarkNames.has(nameKey)) {
                 renderedLandmarkNames.add(nameKey);
-                entityDefs.push(makeBlueprintDef(
-                  `landmark:${b.id}`,
-                  b.centroid.lat,
-                  b.centroid.lon,
-                  nameKey,          // ← key string, not the resolved array
-                  {
-                    solid:           true,
-                    bboxRadius:      4,
-                    footprintRadius: 4,
-                    physicsEnabled:  true,
-                    physicsRadius:   4,
-                    fixed:           true,
-                    lodColor:        '#A1887F',
-                  }
-                ));
+                entityDefs.push(landmarkDef);
               } else {
-                // A node already placed this landmark — update to the more
-                // accurate building centroid by swapping the entity in place.
+                // Upgrade any earlier node-placed entry to the richer
+                // building-centroid position and computed scale.
                 const existingIdx = entityDefs.findIndex(
                   e => e._bpKey === nameKey && e.id.startsWith('landmark:node:')
                 );
                 if (existingIdx !== -1) {
-                  entityDefs[existingIdx] = makeBlueprintDef(
-                    `landmark:${b.id}`,
-                    b.centroid.lat,
-                    b.centroid.lon,
-                    nameKey,
-                    {
-                      solid:           true,
-                      bboxRadius:      4,
-                      footprintRadius: 4,
-                      physicsEnabled:  true,
-                      physicsRadius:   4,
-                      fixed:           true,
-                      lodColor:        '#A1887F',
-                    }
-                  );
+                  entityDefs[existingIdx] = landmarkDef;
                 }
               }
             } else {
@@ -778,19 +859,17 @@ export class OSMTerrainLoader extends BaseLoader {
         try {
           await this._cache.set(cacheKey, {
             terrainUpdates: Object.fromEntries(terrainUpdates),
-            entities:       entityDefs.map(e => ({
+            entities: entityDefs.map(e => ({
               id:        e.id,
               latitude:  e.latitude,
               longitude: e.longitude,
               solid:     e.solid,
               bboxRadius: e.bboxRadius,
               _type:     e._isBuildingBox ? 'building' : (e.renderHeavy && e._bpKey ? 'blueprint' : 'poi'),
-              // Building reconstruction data
               areaM2:    e._areaM2   ?? null,
               heightM:   e._heightM  ?? null,
-              // Blueprint reconstruction data
               bpKey:     e._bpKey    ?? null,
-              // POI display data
+              _scale:    e._scale    ?? null,  // ← persisted for cache reconstruction
               label:     e.label,
               color:     e.color,
               category:  e.category,

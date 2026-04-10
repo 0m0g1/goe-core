@@ -222,6 +222,12 @@ class GenericEntity extends Entity {
 
     // Flag used by PlayerEntity collision to choose AABB vs circle
     this._isBuildingBox = def._isBuildingBox ?? false;
+    this._scale  = def._scale  ?? 1;
+    this._bpKey  = def._bpKey  ?? null;
+
+    this._lodColor   = def._lodColor   ?? null;
+    this._areaM2     = def._areaM2     ?? null;
+    this._heightM    = def._heightM    ?? null;
 
     // Whether this entity needs an expensive blueprint draw (affects LOD)
     this.renderHeavy = def.renderHeavy ?? false;
