@@ -1,14 +1,29 @@
 /**
  * GOE Core — Engine (WorldRenderer architecture)
  *
- * Single WorldRenderer orchestrates every canvas operation.
- * No entity or subsystem holds a CanvasRenderingContext2D directly.
+ * The Engine is entity-type agnostic. It has no knowledge of trees, buildings,
+ * fauna, aviation, or any other domain concept. All such logic lives in loaders.
  *
- * Performance optimisations integrated:
+ * Loaders return `entities` — an array of EntityDef plain objects:
+ *   {
+ *     id:             string          — stable unique key
+ *     tx:             number          — tile X
+ *     ty:             number          — tile Y
+ *     solid:          boolean         — blocks player movement
+ *     bboxRadius:     number          — collision radius in tiles
+ *     physicsEnabled: boolean         — attach to physics world
+ *     physicsRadius:  number
+ *     fixed:          boolean         — immovable in physics sim
+ *     elevOffset:     number          — extra height offset (optional)
+ *     renderFn:       (wr, groundElevPx, extra) => void   — how to draw it
+ *     updateFn:       (dt, engine) => void | null         — per-frame logic
+ *   }
+ *
+ * Performance optimisations:
  *   - Frustum culling (CULL_MARGIN = 4)
  *   - Tile cache rebuilt only when camera moves
  *   - Physics world updates only when dynamic entities exist
- *   - LOD for blueprints (trees/buildings) at low zoom
+ *   - LOD at low zoom (renderHeavy flag on EntityDef)
  *   - Camera animation throttle drops expensive geometry
  *   - VoxelRenderer: cached hex colours, no save/restore
  *   - OSMLayerRenderer: concurrent tile fetch limit (6)
@@ -20,11 +35,9 @@ import { TerrainCache }      from './terrain/TerrainCache.js';
 import { createTerrainRegistry, TerrainType } from './terrain/types.js';
 import { TileRenderer }      from './render/TileRenderer.js';
 import { FeatureRenderer, decorateBuildingFacade } from './render/FeatureRenderer.js';
-import { resolveFeatureType } from './terrain/FeatureTypes.js';
 import { OSMLayerRenderer }  from './render/OSMLayerRenderer.js';
 import { WorldRenderer }     from './render/Renderer.js';
 import { drawPlayer }        from './assets/PlayerBlueprint.js';
-import { Blueprints }        from './assets/BluePrintLibrary.js';
 import {
   worldToScreen, screenToWorld, tileHalfWidth, tileHalfHeight,
   getElevOffset, tileDepth,
@@ -32,35 +45,19 @@ import {
 import {
   geoToTile, tileToGeo, lonToGlobalX, latToGlobalY,
 } from './math/geo.js';
-import { preprocessBuildings } from './loaders/geo/BuildingPreprocessor.js';
 import { WeatherSystem } from './render/WeatherSystem.js';
 
 import PhysicsWorld2D from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/physicsworld2d.js';
 import Particle2D     from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/particle2d.js';
-import Spring2D       from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/spring2d.js';
-import Constraint2D   from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/constraint2d.js';
-import Vector2D       from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/vector2d.js';
-
-import { Entity, ENTITY_TYPES } from './core/Entity.js';
-import { Quadtree } from './spatial/Quadtree.js';
+import { Entity }     from './core/Entity.js';
+import { Quadtree }   from './spatial/Quadtree.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tree blueprint key mapping
-// ─────────────────────────────────────────────────────────────────────────────
-const TREE_BLUEPRINT_KEY = {
-  conifer:   'tree_pine',
-  palm:      'tree_palm',
-  forest:    'forest',
-  park:      'park',
-  deciduous: 'tree_oak',
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PlayerEntity
+// PlayerEntity — the one concrete entity the engine knows about
 // ─────────────────────────────────────────────────────────────────────────────
 class PlayerEntity extends Entity {
   constructor(id = 'player', tx = 40, ty = 40) {
-    super(id, ENTITY_TYPES.PLAYER, tx, ty);
+    super(id, 'player', tx, ty);
     this.walkCycle  = 0;
     this.isMoving   = false;
     this.faceAngle  = Math.PI / 2;
@@ -68,12 +65,11 @@ class PlayerEntity extends Entity {
     this.physicsEnabled = true;
     this.physicsRadius  = 0.5;
     this.fixed          = false;
-    this.solid          = false;   // Player is not solid (doesn't block others)
+    this.solid          = true;
     this.bboxRadius     = 0.5;
 
     this._posHistory      = [];
     this._POS_HISTORY_MAX = 10;
-    this.solid = true;
   }
 
   update(dt, engine) {
@@ -81,47 +77,42 @@ class PlayerEntity extends Entity {
     const mv    = input.getMovementVector();
 
     if (mv) {
-        this.isMoving  = true;
-        this.faceAngle = Math.atan2(-mv.dy, mv.dx);
+      this.isMoving  = true;
+      this.faceAngle = Math.atan2(-mv.dy, mv.dx);
 
-        const cam = engine.camera;
-        const hw  = tileHalfWidth(cam.zoom, cam.tileW);
-        const hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-        const cr  = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
-        const rx  = (mv.dx / hw + mv.dy / hh) * 0.5;
-        const ry  = (mv.dy / hh - mv.dx / hw) * 0.5;
-        const wx  = rx * cr - ry * sr;
-        const wy  = rx * sr + ry * cr;
-        const spd = (0.22 * this.speedMult) * dt * 60 / (Math.hypot(wx, wy) || 1);
+      const cam = engine.camera;
+      const hw  = tileHalfWidth(cam.zoom, cam.tileW);
+      const hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+      const cr  = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
+      const rx  = (mv.dx / hw + mv.dy / hh) * 0.5;
+      const ry  = (mv.dy / hh - mv.dx / hw) * 0.5;
+      const wx  = rx * cr - ry * sr;
+      const wy  = rx * sr + ry * cr;
+      const spd = (0.22 * this.speedMult) * dt * 60 / (Math.hypot(wx, wy) || 1);
 
-        this.walkCycle += dt * 15 * this.speedMult;
+      this.walkCycle += dt * 15 * this.speedMult;
 
-        // Try full move, then axis-separated fallbacks
-        const attempts = [
-            { x: this.tx + wx * spd, y: this.ty + wy * spd },  // full
-            { x: this.tx + wx * spd, y: this.ty },              // x only
-            { x: this.tx,            y: this.ty + wy * spd },   // y only
-        ];
+      const attempts = [
+        { x: this.tx + wx * spd, y: this.ty + wy * spd },
+        { x: this.tx + wx * spd, y: this.ty },
+        { x: this.tx,            y: this.ty + wy * spd },
+      ];
 
-        let moved = false;
-        for (const attempt of attempts) {
-            if (!this._isBlocked(attempt.x, attempt.y, engine)) {
-                this.tx = Math.max(0.5, Math.min(engine._mapW - 0.5, attempt.x));
-                this.ty = Math.max(0.5, Math.min(engine._mapH - 0.5, attempt.y));
-                moved = true;
-                break;
-            }
+      for (const attempt of attempts) {
+        if (!this._isBlocked(attempt.x, attempt.y, engine)) {
+          this.tx = Math.max(0.5, Math.min(engine._mapW - 0.5, attempt.x));
+          this.ty = Math.max(0.5, Math.min(engine._mapH - 0.5, attempt.y));
+          break;
         }
-
+      }
     } else {
-        this.isMoving  = false;
-        this.walkCycle = 0;
+      this.isMoving  = false;
+      this.walkCycle = 0;
     }
 
-    // Pushout — if somehow inside a solid, eject
     this._resolveOverlap(engine);
 
-    // Contact-push dynamic physics entities (unchanged)
+    // Contact-push dynamic physics entities
     for (const other of engine.entities) {
       if (other === this || !other._particle || other.fixed) continue;
       const dx   = other.tx - this.tx;
@@ -137,7 +128,7 @@ class PlayerEntity extends Entity {
         const KICK = 0.5;
         const evx = nx * overlap + nx * Math.max(0, dot) * KICK;
         const evy = ny * overlap + ny * Math.max(0, dot) * KICK;
-        const p   = other._particle;
+        const p = other._particle;
         p.prevPosition.x = p.position.x - evx;
         p.prevPosition.y = p.position.y - evy;
         p.position.x += nx * overlap;
@@ -151,60 +142,51 @@ class PlayerEntity extends Entity {
 
   _isBlocked(newX, newY, engine) {
     const queryRadius = this.bboxRadius + 1.5;
-    const range = {
-        x: newX - queryRadius,
-        y: newY - queryRadius,
-        w: queryRadius * 2,
-        h: queryRadius * 2,
-    };
+    const range = { x: newX - queryRadius, y: newY - queryRadius, w: queryRadius * 2, h: queryRadius * 2 };
     const candidates = engine._spatialTree.queryRange(range);
     for (const candidate of candidates) {
-        const other = candidate.entity;
-        if (other === this || !other.solid) continue;
-        if (this._overlaps(newX, newY, other)) return true;
+      const other = candidate.entity;
+      if (other === this || !other.solid) continue;
+      if (this._overlaps(newX, newY, other)) return true;
     }
     return false;
   }
 
   _overlaps(px, py, other) {
-      if (other.type === 'building') {
-          const r = other.bboxRadius;
-          const cx = Math.max(other.tx - r, Math.min(other.tx + r, px));
-          const cy = Math.max(other.ty - r, Math.min(other.ty + r, py));
-          return Math.hypot(px - cx, py - cy) < this.bboxRadius;
-      }
-      // circle-circle
-      const dx = px - other.tx, dy = py - other.ty;
-      const minDist = this.bboxRadius + other.bboxRadius;
-      return dx * dx + dy * dy < minDist * minDist;
+    if (other._isBuildingBox) {
+      const r  = other.bboxRadius;
+      const cx = Math.max(other.tx - r, Math.min(other.tx + r, px));
+      const cy = Math.max(other.ty - r, Math.min(other.ty + r, py));
+      return Math.hypot(px - cx, py - cy) < this.bboxRadius;
+    }
+    const dx = px - other.tx, dy = py - other.ty;
+    const minDist = this.bboxRadius + other.bboxRadius;
+    return dx * dx + dy * dy < minDist * minDist;
   }
 
   _resolveOverlap(engine) {
-      // If currently overlapping any solid, push out along shortest axis
-      for (const e of engine.entities) {
-          if (e === this || !e.solid) continue;
-          if (!this._overlaps(this.tx, this.ty, e)) continue;
-
-          if (e.type === 'building') {
-              const r = e.bboxRadius;
-              // Find which face is closest and push to that face
-              const overlapL = (this.tx + this.bboxRadius) - (e.tx - r);
-              const overlapR = (e.tx + r) - (this.tx - this.bboxRadius);
-              const overlapT = (this.ty + this.bboxRadius) - (e.ty - r);
-              const overlapB = (e.ty + r) - (this.ty - this.bboxRadius);
-              const min = Math.min(overlapL, overlapR, overlapT, overlapB);
-              if (min === overlapL) this.tx -= overlapL;
-              else if (min === overlapR) this.tx += overlapR;
-              else if (min === overlapT) this.ty -= overlapT;
-              else this.ty += overlapB;
-          } else {
-              const dx = this.tx - e.tx, dy = this.ty - e.ty;
-              const dist = Math.hypot(dx, dy) || 0.001;
-              const push = this.bboxRadius + e.bboxRadius - dist;
-              this.tx += (dx / dist) * push;
-              this.ty += (dy / dist) * push;
-          }
+    for (const e of engine.entities) {
+      if (e === this || !e.solid) continue;
+      if (!this._overlaps(this.tx, this.ty, e)) continue;
+      if (e._isBuildingBox) {
+        const r = e.bboxRadius;
+        const overlapL = (this.tx + this.bboxRadius) - (e.tx - r);
+        const overlapR = (e.tx + r) - (this.tx - this.bboxRadius);
+        const overlapT = (this.ty + this.bboxRadius) - (e.ty - r);
+        const overlapB = (e.ty + r) - (this.ty - this.bboxRadius);
+        const min = Math.min(overlapL, overlapR, overlapT, overlapB);
+        if (min === overlapL) this.tx -= overlapL;
+        else if (min === overlapR) this.tx += overlapR;
+        else if (min === overlapT) this.ty -= overlapT;
+        else this.ty += overlapB;
+      } else {
+        const dx = this.tx - e.tx, dy = this.ty - e.ty;
+        const dist = Math.hypot(dx, dy) || 0.001;
+        const push = this.bboxRadius + e.bboxRadius - dist;
+        this.tx += (dx / dist) * push;
+        this.ty += (dy / dist) * push;
       }
+    }
   }
 
   getAverageHistoryPos() {
@@ -221,184 +203,66 @@ class PlayerEntity extends Entity {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FeatureEntity
+// GenericEntity — wraps any EntityDef from a loader
 // ─────────────────────────────────────────────────────────────────────────────
-class FeatureEntity extends Entity {
-  constructor(id, tx, ty, data = {}) {
-    super(id, ENTITY_TYPES.FEATURE, tx, ty);
-    this.data  = data;
-    this.label = data.label || data.title || data.name || '';
-    this.color = data.color || '#60a5fa';
-    this.ftype = resolveFeatureType(this.label, data.tags || {}, this.color);
-    this.assetKey = data.asset || data.data?.asset || null;
+class GenericEntity extends Entity {
+  /**
+   * @param {object} def  EntityDef supplied by a loader
+   */
+  constructor(def) {
+    super(def.id, def.type ?? 'generic', def.tx, def.ty);
+    this.solid          = def.solid          ?? false;
+    this.bboxRadius     = def.bboxRadius     ?? 0.35;
+    this.physicsEnabled = def.physicsEnabled ?? false;
+    this.physicsRadius  = def.physicsRadius  ?? 0.35;
+    this.fixed          = def.fixed          ?? true;
+    this.elevOffset     = def.elevOffset     ?? 0;
+    this.altitudeM      = def.altitudeM      ?? 0;
+    this.visualAlt      = def.visualAlt      ?? 0;
+    this.showAltitudeLine = def.showAltitudeLine ?? false;
 
-    // Forward altitude properties from data
-    this.altitudeM        = data.altitudeM        ?? 0;
-    this.visualAlt        = data.visualAlt        ?? 0;
-    this.showAltitudeLine = data.showAltitudeLine  ?? false;
+    // Flag used by PlayerEntity collision to choose AABB vs circle
+    this._isBuildingBox = def._isBuildingBox ?? false;
 
-    this.bboxRadius     = 0.35;
-    this.physicsEnabled = data.physics === true;
-    this.physicsRadius  = data.physicsRadius || 0.35;
-    this.fixed          = data.fixed ?? true;
-    this.solid          = false;
+    // Whether this entity needs an expensive blueprint draw (affects LOD)
+    this.renderHeavy = def.renderHeavy ?? false;
+
+    // Rendering and update delegates supplied by the loader
+    this._renderFn = def.renderFn ?? null;
+    this._updateFn = def.updateFn ?? null;
+
+    // Carry the raw def for anything callers might need
+    this._def = def;
+  }
+
+  update(dt, engine) {
+    if (this._updateFn) this._updateFn(dt, engine, this);
   }
 
   render(wr, groundElevPx, extra) {
-    // Check if this feature should be rendered as a 3D Voxel Blueprint
-    if (this.data.renderMode === 'blueprint' && this.assetKey) {
-      const blueprint = Blueprints[this.assetKey];
-      
-      if (blueprint) {
-        const depth = tileDepth(this.tx, this.ty, wr.cam.rotation);
-        const elev  = groundElevPx + this.elevOffset;
-
-        wr.submitWorldObject(depth, () => {
-          // You can add logic here to skip rendering if zoom is too low
-          // if (wr.cam.zoom < 0.08) return; 
-
-          wr.drawBlueprint(blueprint, this.tx, this.ty, elev);
-        });
-        return; // Exit so we don't draw the 2D icon/label on top of the model
-      }
-    }
-
-    // Fallback: Standard 2D Icon/Label rendering
-    extra.featureResolver.drawFeature(
-      wr, this, extra.selectedId === this.id, extra.terrainCache, extra.pGX, extra.pGY
-    );
+    if (this._renderFn) this._renderFn(wr, groundElevPx, extra, this);
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BuildingEntity
-// ─────────────────────────────────────────────────────────────────────────────
-class BuildingEntity extends Entity {
-  constructor(id, tx, ty, footprintRadiusTiles, heightM, colorSet = null) {
-    super(id, ENTITY_TYPES.BUILDING, tx, ty);
-    this.footprintRadius = footprintRadiusTiles;
-    this.heightM         = heightM;
-    this.colorSet        = colorSet;
-    this.bboxRadius      = footprintRadiusTiles;
-    this.physicsEnabled  = true;
-    this.fixed           = true;
-    this.physicsRadius   = footprintRadiusTiles;
-    this.solid = true;
-  }
-
-  render(wr, groundElevPx, extra) {
-    const VU    = 8;
-    const rVox  = this.footprintRadius * VU;
-    const hVox  = (this.heightM / extra.mPerTile) * VU;
-    const elev  = groundElevPx + this.elevOffset;
-    const depth = tileDepth(this.tx, this.ty, wr.cam.rotation);
-
-    // 1. Volumetric shadow footprint
-    wr.submitShadow({ p: { x: this.tx, y: this.ty }, elev, r: rVox, engineH: hVox });
-
-    // 2. Voxel geometry
-    wr.submitWorldObject(depth, () => {
-      wr.beginTile(this.tx, this.ty, elev);
-      wr.box(
-        -rVox, 0, -rVox, rVox * 2, hVox, rVox * 2,
-        this.colorSet?.top   || '#b0a090',
-        this.colorSet?.right || '#8a7a6a',
-        this.colorSet?.left  || '#6a5a4a',
-      );
-
-      if (extra.decorateFacade) {
-        const entry = {
-          p: { x: this.tx, y: this.ty },
-          r: rVox, engineH: hVox, elev,
-          tc: this.colorSet ?? { top: '#b0a090' },
-        };
-        extra.decorateFacade(wr.ctx, wr.cam, entry, wr._voxel, this._facadeSeed ?? 0);
-      }
-    });
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// FaunaEntity
-// ─────────────────────────────────────────────────────────────────────────────
-class FaunaEntity extends Entity {
-  constructor(id, tx, ty, assetKey = 'bird') {
-    super(id, 'fauna', tx, ty);
-    this.assetKey       = assetKey;
-    this.bboxRadius     = 0.25;
-    this.physicsEnabled = true;
-    this.fixed          = false; // They can be pushed by the player!
-    this.physicsRadius  = 0.25;
-    this.solid          = true;
-  }
-
-  render(wr, groundElevPx, extra) {
-    const blueprint = Blueprints[this.assetKey];
-    if (!blueprint) return;
-
-    const elev  = groundElevPx + this.elevOffset;
-    const depth = tileDepth(this.tx, this.ty, wr.cam.rotation);
-
-    wr.submitWorldObject(depth, () => {
-      // Fade out at low tilts just like trees
-      if (wr.cam.tilt < 0.04) return;
-      const isoA = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
-      wr.ctx.globalAlpha = isoA;
-      wr.drawBlueprint(blueprint, this.tx, this.ty, elev);
-      wr.ctx.globalAlpha = 1;
-    });
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TreeEntity — blueprint lookup; no TreeRenderer class needed
-// ─────────────────────────────────────────────────────────────────────────────
-class TreeEntity extends Entity {
-  constructor(id, tx, ty, treeType = 'deciduous', scale = 1.0, seed = 0) {
-    super(id, ENTITY_TYPES.TREE, tx, ty);
-    this.treeType       = treeType;
-    this.scale          = scale;
-    this.seed           = seed;
-    this.bboxRadius     = 0.5;
-    this.physicsEnabled = true;
-    this.fixed          = true;
-    this.physicsRadius  = 0.5;
-    this.solid = true;
-  }
-
-  render(wr, groundElevPx, extra) {
-    const bpKey    = TREE_BLUEPRINT_KEY[this.treeType] ?? 'tree_oak';
-    const blueprint = Blueprints[bpKey] ?? Blueprints['tree'];
-    const elev     = groundElevPx + this.elevOffset;
-    const depth    = tileDepth(this.tx, this.ty, wr.cam.rotation);
-
-    wr.submitWorldObject(depth, () => {
-      if (wr.cam.tilt < 0.04) return;
-      const isoA = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
-      wr.ctx.globalAlpha = isoA;
-      wr.drawBlueprint(blueprint, this.tx, this.ty, elev);
-      wr.ctx.globalAlpha = 1;
-    });
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Engine
+// Engine constants
 // ─────────────────────────────────────────────────────────────────────────────
 const MAP_W        = 80;
 const MAP_H        = 80;
 const REFETCH_DIST = 18;
 const M_PER_TILE   = 2;
 
-// Performance tunables
-const CULL_MARGIN             = 4;          // tiles margin for frustum culling
-const LOD_BLUEPRINT_MIN_ZOOM  = 0.05;       // min zoom to draw trees/buildings
-const TILE_CACHE_DIRTY_PX     = 2;          // px movement to rebuild tile cache
+const CULL_MARGIN             = 4;
+const LOD_HEAVY_MIN_ZOOM      = 0.05;   // min zoom to draw renderHeavy entities
+const TILE_CACHE_DIRTY_PX     = 2;
 const TILE_CACHE_DIRTY_ZOOM   = 0.002;
 const TILE_CACHE_DIRTY_TILT   = 0.005;
-const CAMERA_SETTLE_MS        = 120;        // ms before full quality resumes
-const MAX_CONCURRENT_TILES    = 6;          // OSM tile fetch throttle
+const CAMERA_SETTLE_MS        = 120;
+const MAX_CONCURRENT_TILES    = 6;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Engine
+// ─────────────────────────────────────────────────────────────────────────────
 export class Engine extends EventEmitter {
   constructor(opts = {}) {
     super();
@@ -445,35 +309,21 @@ export class Engine extends EventEmitter {
     this.debugLayers = {
       osmTiles:  true,
       overpass:  true,
-      buildings: true,
-      features:  true,
+      entities:  true,
       player:    true,
     };
 
-    this._tileCache    = [];
-    this._tileCacheState = null;          // for dirty tracking
-    this._lastTileCamX = null;
-    this._lastTileCamY = null;
-    this._lastTileZoom = null;
-    this._lastTileRot  = null;
+    this._tileCache      = [];
+    this._tileCacheState = null;
 
     this.weather = null;
-    this.localTreeAsset = 'tree';
-    this._featureCache  = new Map();
+    this._featureCache = new Map();
 
-    // Camera animation flag (throttle heavy geometry)
-    this._cameraAnimating = false;
+    this._cameraAnimating   = false;
     this._cameraSettleTimer = null;
 
     this._spatialTree = null;
-    
   }
-
-  // ── Backward compatibility getters ────────────────────────────────────────
-  get player()    { return this.playerEntity; }
-  get features()  { return this.entities.filter(e => e.type === ENTITY_TYPES.FEATURE); }
-  get buildings() { return this.entities.filter(e => e.type === ENTITY_TYPES.BUILDING); }
-  get trees()     { return this.entities.filter(e => e.type === ENTITY_TYPES.TREE); }
 
   // ── Physics helpers ───────────────────────────────────────────────────────
   _attachPhysics(entity) {
@@ -534,7 +384,6 @@ export class Engine extends EventEmitter {
     }, CAMERA_SETTLE_MS);
   }
 
-  // ── Patch VoxelRenderer (hot‑path optimisations) ─────────────────────────
   _patchVoxelRenderer(voxel) {
     if (voxel.__perfPatched) return;
     voxel.__perfPatched = true;
@@ -543,9 +392,7 @@ export class Engine extends EventEmitter {
     const cachedHex = (hex) => {
       if (hexCache.has(hex)) return hexCache.get(hex);
       let h = hex;
-      if (h.length === 4) {
-        h = '#' + h[1] + h[1] + h[2] + h[2] + h[3] + h[3];
-      }
+      if (h.length === 4) h = '#' + h[1] + h[1] + h[2] + h[2] + h[3] + h[3];
       hexCache.set(hex, h);
       return h;
     };
@@ -569,18 +416,17 @@ export class Engine extends EventEmitter {
     };
   }
 
-  // ── Patch OSMLayerRenderer (concurrent tile throttle) ────────────────────
   _patchOSMLayerRenderer(osmLayer) {
     if (osmLayer.__perfPatched) return;
     osmLayer.__perfPatched = true;
 
-    osmLayer._inFlight = 0;
+    osmLayer._inFlight    = 0;
     osmLayer._pendingLoads = [];
 
     const startLoad = (img, src) => {
       if (osmLayer._inFlight < MAX_CONCURRENT_TILES) {
         osmLayer._inFlight++;
-        img.onload = () => { osmLayer._inFlight--; osmLayer._flushPending(); };
+        img.onload  = () => { osmLayer._inFlight--; osmLayer._flushPending(); };
         img.onerror = () => { osmLayer._inFlight--; osmLayer._flushPending(); };
         img.src = src;
       } else {
@@ -592,7 +438,7 @@ export class Engine extends EventEmitter {
       while (this._inFlight < MAX_CONCURRENT_TILES && this._pendingLoads.length) {
         const { img, src } = this._pendingLoads.shift();
         this._inFlight++;
-        img.onload = () => { this._inFlight--; this._flushPending(); };
+        img.onload  = () => { this._inFlight--; this._flushPending(); };
         img.onerror = () => { this._inFlight--; this._flushPending(); };
         img.src = src;
       }
@@ -600,9 +446,7 @@ export class Engine extends EventEmitter {
 
     if (osmLayer._loadTile) {
       const origLoadTile = osmLayer._loadTile.bind(osmLayer);
-      osmLayer._loadTile = function(img, src) {
-        startLoad(img, src);
-      };
+      osmLayer._loadTile = function(img, src) { startLoad(img, src); };
     } else {
       osmLayer._startLoad = startLoad;
     }
@@ -617,15 +461,13 @@ export class Engine extends EventEmitter {
 
     const cam = this.camera;
 
-    // ── Single WorldRenderer — the only gateway to the canvas ──────────────
     this._renderer = new WorldRenderer(this._ctx, cam, { shadow: this._shadowOpts });
-    this._patchVoxelRenderer(this._renderer._voxel);   // apply hot‑path patch
+    this._patchVoxelRenderer(this._renderer._voxel);
 
-    // Subsystems accept WorldRenderer instead of raw ctx/cam
     this._tileR    = new TileRenderer(this._renderer, this.terrainRegistry);
     this._featR    = new FeatureRenderer(this._renderer, this.terrainRegistry);
     this._osmLayer = new OSMLayerRenderer(this._renderer, this._tileURLFn);
-    this._patchOSMLayerRenderer(this._osmLayer);       // throttle tile loading
+    this._patchOSMLayerRenderer(this._osmLayer);
 
     this.physicsWorld = new PhysicsWorld2D(this._mapW, this._mapH, 0.0);
 
@@ -666,7 +508,6 @@ export class Engine extends EventEmitter {
       this._frameOptimized(ts);
     });
 
-    // WeatherSystem also routes through WorldRenderer
     this.weather = new WeatherSystem(this._renderer);
     this.weather.setMode('none');
 
@@ -690,6 +531,9 @@ export class Engine extends EventEmitter {
     this._osmLayer?.setURLFn(urlFn);
   }
 
+  /**
+   * Add any entity (PlayerEntity, GenericEntity, or custom Entity subclass).
+   */
   addEntity(entity) {
     this.entities.push(entity);
     if (entity.physicsEnabled) this._attachPhysics(entity);
@@ -709,44 +553,8 @@ export class Engine extends EventEmitter {
     if (ent) this._flyToTile(ent.tx + 0.5, ent.ty + 0.5);
   }
 
-  setFeatures(rawFeatures) {
-    const toRemove = this.entities.filter(e => e.type === ENTITY_TYPES.FEATURE);
-    for (const e of toRemove) this._detachPhysics(e);
-    this.entities = this.entities.filter(e => e.type !== ENTITY_TYPES.FEATURE);
-
-    const { x: pGX, y: pGY } = this._pGlobal();
-    const toLocal = (globalX, globalY) => ({
-      x: globalX - pGX + this._mapW / 2,
-      y: globalY - pGY + this._mapH / 2
-    });
-
-    for (const f of rawFeatures) {
-      const lat = f.latitude ?? f.lat;
-      const lon = f.longitude ?? f.lon;
-      if (lat == null || lon == null) continue;
-      const globalX = lonToGlobalX(lon, this.geoCenter.lat, this._mPerTile);
-      const globalY = latToGlobalY(lat, this._mPerTile);
-      const local = toLocal(globalX, globalY);
-      if (local.x < 0 || local.x >= this._mapW || local.y < 0 || local.y >= this._mapH) continue;
-      const feature = new FeatureEntity(f.id, local.x, local.y, f);
-      this.entities.push(feature);
-      if (feature.physicsEnabled) this._attachPhysics(feature);
-    }
-    this.emit('features:changed', this.features);
-  }
-
-  addFeature(f) {
-    const lat = f.latitude ?? f.lat;
-    const lon = f.longitude ?? f.lon;
-    if (lat == null || lon == null) return;
-    const pos     = geoToTile(lat, lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-    const feature = new FeatureEntity(f.id, pos.x, pos.y, f);
-    this.entities.push(feature);
-    if (feature.physicsEnabled) this._attachPhysics(feature);
-  }
-
-  setParcels(parcels) { /* optional */ }
   use(loader) { this._loaders.push(loader); return this; }
+
   setElevationLoader(loader) {
     this._elevation = loader;
     if (this._running && this.geoCenter) loader.prefetch?.(this.geoCenter);
@@ -776,20 +584,17 @@ export class Engine extends EventEmitter {
 
   rotateTo(radians)        { this.camera.rotation = radians; }
   toggleLayer(name, value) { if (name in this.debugLayers) this.debugLayers[name] = value ?? !this.debugLayers[name]; }
-
-  toggleShadows(value)                    { this._renderer.toggleShadows(value); }
-  setSunAngle(angle, elevation)           { this._renderer.setSunAngle(angle, elevation); }
+  toggleShadows(value)     { this._renderer.toggleShadows(value); }
+  setSunAngle(angle, elev) { this._renderer.setSunAngle(angle, elev); }
 
   // ── INTERNAL HELPERS ──────────────────────────────────────────────────────
   _rebuildAllEntitiesGeo(prevGeoCenter = this.geoCenter, shiftX, shiftY) {
     if (shiftX !== undefined && shiftY !== undefined) {
-      // Integer tile shift — no geo math needed, just subtract the same offset
-      // applied to the terrain grid. Entities stay visually locked to the world.
       for (const e of this.entities) {
-        if (e.type === ENTITY_TYPES.PLAYER) continue;
+        if (e.type === 'player') continue;
         e.tx -= shiftX;
         e.ty -= shiftY;
-        e._geoDirty = true;   // geo will be recomputed lazily on next HUD/click
+        e._geoDirty = true;
         if (e._particle) {
           e._particle.position.x     = e.tx;
           e._particle.position.y     = e.ty;
@@ -801,9 +606,8 @@ export class Engine extends EventEmitter {
       }
       return;
     }
-    // Full geo rebuild — only used by panTo / flyTo
     for (const e of this.entities) {
-      if (e.type === ENTITY_TYPES.PLAYER) continue;
+      if (e.type === 'player') continue;
       const geo = e.getGeo(prevGeoCenter, this._mPerTile, this._mapW, this._mapH);
       e.setGeo(geo.lat, geo.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
       e._geoDirty = false;
@@ -839,7 +643,7 @@ export class Engine extends EventEmitter {
 
   _playerElev() {
     if (!this.playerEntity) return 0;
-    const geo  = this.playerEntity.getGeo(this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+    const geo   = this.playerEntity.getGeo(this.geoCenter, this._mPerTile, this._mapW, this._mapH);
     const elevM = this._elevation?.sampleElevation(geo.lat, geo.lon) ?? 0;
     return getElevOffset(this._elevation?.toTileHeight(elevM) ?? 4, this.camera.tilt, this.camera.zoom);
   }
@@ -855,7 +659,6 @@ export class Engine extends EventEmitter {
   }
 
   // ── FETCH ─────────────────────────────────────────────────────────────────
-  // ── FETCH ─────────────────────────────────────────────────────────────────
   _doFetch(center) {
     if (this._fetching) return;
 
@@ -867,19 +670,21 @@ export class Engine extends EventEmitter {
     this.emit('fetch:start');
 
     const fetches = this._loaders.map(l =>
-      l.fetch(center).catch(err => { console.error(`[GOECore] Loader ${l.id} failed:`, err); return {}; })
+      l.fetch(center).catch(err => {
+        console.error(`[GOECore] Loader ${l.id} failed:`, err);
+        return {};
+      })
     );
 
     Promise.all(fetches).then(results => {
-      // Get current global offset of the map centre (in global tile units)
       const { x: pGX, y: pGY } = this._pGlobal();
 
-      // Helper: global tile → local (0..mapW, 0..mapH)
       const toLocal = (globalX, globalY) => ({
         x: globalX - pGX + this._mapW / 2,
-        y: globalY - pGY + this._mapH / 2
+        y: globalY - pGY + this._mapH / 2,
       });
 
+      // ── Merge terrain + weather ────────────────────────────────────────────
       for (const result of results) {
         if (result.terrainUpdates) {
           this.terrainCache.merge(result.terrainUpdates);
@@ -891,102 +696,64 @@ export class Engine extends EventEmitter {
         }
       }
 
+      // ── Entity upsert map ─────────────────────────────────────────────────
       const existing = new Map();
       for (const e of this.entities) {
-        if (e.type !== ENTITY_TYPES.PLAYER) existing.set(e.id, e);
+        if (e.type !== 'player') existing.set(e.id, e);
       }
 
       const upsert = (entity) => {
-          const old = existing.get(entity.id);
-          if (old) {
-              old.tx = entity.tx;
-              old.ty = entity.ty;
-              old.solid = entity.solid;           // sync solid flag
-              old.bboxRadius = entity.bboxRadius; // sync radius
-              if (old._particle) {
-                  old._particle.position.x = old.tx;
-                  old._particle.position.y = old.ty;
-              }
-          } else {
-              this.entities.push(entity);
-              if (entity.physicsEnabled) this._attachPhysics(entity);
-              existing.set(entity.id, entity);
+        const old = existing.get(entity.id);
+        if (old) {
+          old.tx         = entity.tx;
+          old.ty         = entity.ty;
+          old.solid      = entity.solid;
+          old.bboxRadius = entity.bboxRadius;
+          if (old._particle) {
+            old._particle.position.x = old.tx;
+            old._particle.position.y = old.ty;
           }
+        } else {
+          this.entities.push(entity);
+          if (entity.physicsEnabled) this._attachPhysics(entity);
+          existing.set(entity.id, entity);
+        }
       };
 
+      // ── Process loader results ─────────────────────────────────────────────
       for (const result of results) {
-        // ── Buildings ──────────────────────────────────────────────────────
-        if (result.buildingWays) {
-          const buildings = preprocessBuildings(result.buildingWays);
-          for (const b of buildings) {
-            const globalX = lonToGlobalX(b.centroid.lon, this.geoCenter.lat, this._mPerTile);
-            const globalY = latToGlobalY(b.centroid.lat, this._mPerTile);
-            const local = toLocal(globalX, globalY);
-            if (local.x < 0 || local.x >= this._mapW || local.y < 0 || local.y >= this._mapH) continue;
-            const halfSideM     = Math.sqrt(Math.max(16, b.areaM2));  // min 4×4m footprint
-            const halfSideTiles = halfSideM / this._mPerTile / 2;
-            const colorSet      = this.terrainRegistry.colors[TerrainType.BUILDING];
-            const building      = new BuildingEntity(
-              `building_${b.id || Math.random()}`,
-              local.x, local.y, halfSideTiles, b.heightM, colorSet
-            );
-            building._facadeSeed = Math.abs(Math.round(local.x * 31 + local.y * 17)) % 1000;
-            upsert(building);
-          }
-        }
+        if (!result.entities) continue;
 
-        // ── Features (POIs) ────────────────────────────────────────────────
-        if (result.features) {
-          for (const f of result.features) {
-            const lat = f.latitude ?? f.lat;
-            const lon = f.longitude ?? f.lon;
-            if (lat == null || lon == null) continue;
+        for (const def of result.entities) {
+          // Loaders supply geo coordinates; engine converts to local tile space
+          const lat = def.latitude ?? def.lat;
+          const lon = def.longitude ?? def.lon;
+
+          let tx = def.tx, ty = def.ty;
+
+          if (lat != null && lon != null) {
             const globalX = lonToGlobalX(lon, this.geoCenter.lat, this._mPerTile);
             const globalY = latToGlobalY(lat, this._mPerTile);
-            const local = toLocal(globalX, globalY);
+            const local   = toLocal(globalX, globalY);
             if (local.x < 0 || local.x >= this._mapW || local.y < 0 || local.y >= this._mapH) continue;
-            const feature = new FeatureEntity(f.id, local.x, local.y, f);
-            upsert(feature);
+            tx = local.x;
+            ty = local.y;
+          } else if (tx == null || ty == null) {
+            continue;
           }
-        }
 
-        // ── Trees ──────────────────────────────────────────────────────────
-        if (result.trees) {
-          for (const t of result.trees) {
-            const globalX = lonToGlobalX(t.lon, this.geoCenter.lat, this._mPerTile);
-            const globalY = latToGlobalY(t.lat, this._mPerTile);
-            const local = toLocal(globalX, globalY);
-            if (local.x < 0 || local.x >= this._mapW || local.y < 0 || local.y >= this._mapH) continue;
-            const tree = new TreeEntity(
-              `tree_${t.id ?? `${Math.round(t.lat * 1e6)}_${Math.round(t.lon * 1e6)}`}`,
-              local.x, local.y, t.species || 'deciduous', 1.0, t.seed || 0
-            );
-            upsert(tree);
-          }
+          const entity = new GenericEntity({ ...def, tx, ty });
+          upsert(entity);
         }
       }
 
-      this._updateLocalEcosystem();
       this._elevation?.prefetch?.(center);
       this._fetching = false;
       this.emit('fetch:done');
     });
   }
 
-  _updateLocalEcosystem() {
-    const counts = {};
-    for (const e of this.entities) {
-      if (e.type === ENTITY_TYPES.TREE && e.treeType)
-        counts[e.treeType] = (counts[e.treeType] || 0) + 1;
-    }
-    let topType = null, max = 0;
-    for (const [type, cnt] of Object.entries(counts)) {
-      if (cnt > max) { max = cnt; topType = type; }
-    }
-    if (topType) this.localTreeAsset = topType;
-  }
-
-  // ── OPTIMISED RENDER FRAME (replaces old _frame) ──────────────────────────
+  // ── OPTIMISED RENDER FRAME ─────────────────────────────────────────────────
   _frameOptimized(ts) {
     if (!this._running) return;
     this._raf = requestAnimationFrame(ts2 => this._frameOptimized(ts2));
@@ -1000,17 +767,12 @@ export class Engine extends EventEmitter {
     const W      = canvas.width;
     const H      = canvas.height;
 
+    // Rebuild spatial index
     if (this._spatialTree) {
-        // Collect all solid entities (those that block movement)
-        const collidables = this.entities.filter(e => e.solid === true);
-        const byType = {};
-        for (const e of collidables) byType[e.type] = (byType[e.type] || 0) + 1;
-        const objects = collidables.map(e => ({
-            x: e.tx, y: e.ty,
-            entity: e,
-            radius: e.bboxRadius
-        }));
-        this._spatialTree.rebuild(objects);
+      const collidables = this.entities.filter(e => e.solid === true);
+      this._spatialTree.rebuild(collidables.map(e => ({
+        x: e.tx, y: e.ty, entity: e, radius: e.bboxRadius,
+      })));
     }
 
     // 1. Update entities
@@ -1023,10 +785,10 @@ export class Engine extends EventEmitter {
     if (this._input.isRotatingRight()) cam.rotVel += 2.2 * dt;
     if (this.weather) this.weather.update(dt, this.playerEntity?.tx ?? 0, this.playerEntity?.ty ?? 0);
 
-    // 3. Elevations (cached for frame)
+    // 3. Elevations
     const pElev = this._playerElev();
 
-    // 4. Physics – skip if nothing dynamic
+    // 4. Physics
     if (this.physicsWorld && this.physicsEnabled) {
       let hasDynamic = false;
       for (const e of this.entities) {
@@ -1076,8 +838,6 @@ export class Engine extends EventEmitter {
         this.geoCenter = tileToGeo(snapTx, snapTy, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
         this._osmLayer.resetTileCache();
 
-        this._osmLayer.resetTileCache();
-
         this.playerEntity.tx -= shiftX;
         this.playerEntity.ty -= shiftY;
         for (const p of this.playerEntity._posHistory) { p.x -= shiftX; p.y -= shiftY; }
@@ -1092,15 +852,11 @@ export class Engine extends EventEmitter {
 
         this._rebuildAllEntitiesGeo(prevGeo, shiftX, shiftY);
 
-        for (const t of this._tileCache) {
-          t.tx -= shiftX;
-          t.ty -= shiftY;
-        }
-        this._tileCacheState = null; 
+        for (const t of this._tileCache) { t.tx -= shiftX; t.ty -= shiftY; }
 
-        this._tileCacheState = null;   // force full rebuild with new pGX/pGY
-        this._tileCache = [];          // clear stale entries immediately
-        this._skipTileCacheThisFrame = true;  
+        this._tileCacheState = null;
+        this._tileCache      = [];
+        this._skipTileCacheThisFrame = true;
 
         this._doFetch(this.geoCenter);
         this.emit('center:changed', this.geoCenter);
@@ -1132,35 +888,35 @@ export class Engine extends EventEmitter {
       this._osmLayer.draw(canvas, this.geoCenter);
     }
 
-    // 8. Terrain tiles – rebuild cache only when camera moved
+    // 8. Terrain tiles
     const overAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
     if (overAlpha > 0 && this.debugLayers.overpass) {
       const lod = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
 
       if (lod > 1) {
         this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overAlpha);
-      } else {   
-          if (this._isTileCacheDirty()) {
-            this._saveTileCacheState();
-            const hw  = tileHalfWidth(cam.zoom, cam.tileW);
-            const hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-            const txs = Math.min(120, Math.ceil(W / Math.max(1, hw)) + 4);
-            const tys = Math.min(120, Math.ceil(H / Math.max(1, hh)) + 4);
-            const vC  = screenToWorld(W / 2, H / 2, cam);
-            const cx  = Math.round(Math.max(0, Math.min(this._mapW, vC.x)));
-            const cy  = Math.round(Math.max(0, Math.min(this._mapH, vC.y)));
-            this._tileCache = [];
-            for (let ty = Math.max(0, cy - tys); ty < Math.min(this._mapH, cy + tys); ty++) {
-              for (let tx = Math.max(0, cx - txs); tx < Math.min(this._mapW, cx + txs); tx++) {
-                this._tileCache.push({
-                  tx, ty,
-                  terrainId: this.terrainCache.get(
-                    tx - this._mapW / 2 + pGX,
-                    ty - this._mapH / 2 + pGY
-                  ) ?? TerrainType.GRASS,
-                });
-              }
+      } else {
+        if (this._isTileCacheDirty()) {
+          this._saveTileCacheState();
+          const hw  = tileHalfWidth(cam.zoom, cam.tileW);
+          const hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+          const txs = Math.min(120, Math.ceil(W / Math.max(1, hw)) + 4);
+          const tys = Math.min(120, Math.ceil(H / Math.max(1, hh)) + 4);
+          const vC  = screenToWorld(W / 2, H / 2, cam);
+          const cx  = Math.round(Math.max(0, Math.min(this._mapW, vC.x)));
+          const cy  = Math.round(Math.max(0, Math.min(this._mapH, vC.y)));
+          this._tileCache = [];
+          for (let ty = Math.max(0, cy - tys); ty < Math.min(this._mapH, cy + tys); ty++) {
+            for (let tx = Math.max(0, cx - txs); tx < Math.min(this._mapW, cx + txs); tx++) {
+              this._tileCache.push({
+                tx, ty,
+                terrainId: this.terrainCache.get(
+                  tx - this._mapW / 2 + pGX,
+                  ty - this._mapH / 2 + pGY
+                ) ?? TerrainType.GRASS,
+              });
             }
+          }
         }
         this._skipTileCacheThisFrame = false;
         this._tileR.drawLayer(
@@ -1172,28 +928,21 @@ export class Engine extends EventEmitter {
       }
     }
 
-    // 9. Entities – with frustum culling & LOD
-    if (overAlpha > 0) {
-      const featuresOnly = this.entities.filter(e => e.type === ENTITY_TYPES.FEATURE && e.visible);
-      if (this.debugLayers.features && featuresOnly.length > 0) {
-        this._featR.drawAll(this._renderer, featuresOnly, this._selectedId, this.terrainCache, pGX, pGY);
-      }
-
-      const drawBlueprints = cam.zoom >= LOD_BLUEPRINT_MIN_ZOOM;
+    // 9. Entities — frustum culling + LOD
+    if (overAlpha > 0 && this.debugLayers.entities) {
+      const drawHeavy = cam.zoom >= LOD_HEAVY_MIN_ZOOM;
 
       for (const e of this.entities) {
         if (!e.visible) continue;
-        if (e.type === ENTITY_TYPES.FEATURE && this.debugLayers.features) continue;
 
         // Frustum culling
         if (!this._isTileVisible(e.tx, e.ty, cam, W, H)) continue;
 
-        // LOD for heavy blueprints
-        const isHeavy = (e.type === ENTITY_TYPES.TREE || e.type === ENTITY_TYPES.BUILDING);
-        if (isHeavy && !drawBlueprints) continue;
+        // LOD: skip expensive renders at very low zoom
+        if (e.renderHeavy && !drawHeavy) continue;
 
-        // Camera animation throttle: replace heavy geometry with a dot
-        if (isHeavy && this._cameraAnimating) {
+        // Camera animation throttle: replace heavy geometry with a coloured dot
+        if (e.renderHeavy && this._cameraAnimating) {
           const elev = this.terrainRegistry.heights[
             this.terrainCache.getLocal(e.tx, e.ty, pGX, pGY, this._mapW, this._mapH)
           ] ?? 4;
@@ -1204,7 +953,7 @@ export class Engine extends EventEmitter {
             const r  = Math.max(2, cam.zoom * cam.tileW * 0.3);
             ctx.beginPath();
             ctx.arc(sc.x, sc.y, r, 0, Math.PI * 2);
-            ctx.fillStyle = e.type === ENTITY_TYPES.TREE ? '#2E7D32' : '#78909C';
+            ctx.fillStyle = e._lodColor ?? '#78909C';
             ctx.fill();
           });
           continue;
@@ -1215,7 +964,7 @@ export class Engine extends EventEmitter {
         ] ?? 4;
 
         const groundElevPx = getElevOffset(groundH, cam.tilt, cam.zoom);
-        const altPx        = e.getAltitudePx(cam);
+        const altPx        = e.getAltitudePx?.(cam) ?? 0;
         const totalElevPx  = groundElevPx + altPx;
 
         e.render(this._renderer, totalElevPx, {
@@ -1227,16 +976,13 @@ export class Engine extends EventEmitter {
           decorateFacade:  decorateBuildingFacade,
         });
 
-        // Altitude line — any entity can opt in via showAltitudeLine
+        // Altitude line
         if (altPx > 0 && e.showAltitudeLine && cam.zoom > 0.08) {
           const depth = tileDepth(e.tx, e.ty, cam.rotation);
           this._renderer.submitWorldObject(depth, () => {
             const ground = worldToScreen(e.tx + 0.5, e.ty + 0.5, groundElevPx, cam);
             const airPos = worldToScreen(e.tx + 0.5, e.ty + 0.5, totalElevPx, cam);
-            this._renderer.drawLine(
-              ground.x, ground.y, airPos.x, airPos.y,
-              'rgba(180,200,255,0.25)', 1
-            );
+            this._renderer.drawLine(ground.x, ground.y, airPos.x, airPos.y, 'rgba(180,200,255,0.25)', 1);
             this._renderer.drawCircle(ground.x, ground.y, 2, 'rgba(180,200,255,0.4)');
           });
         }
@@ -1264,7 +1010,7 @@ export class Engine extends EventEmitter {
     }
   }
 
-  // ── CLICK HANDLER ────────────────────────────────────────────────────────
+  // ── CLICK HANDLER ─────────────────────────────────────────────────────────
   _handleClick({ x: cx, y: cy, button }) {
     if (button === 2) {
       const wPos = screenToWorld(cx, cy, this.camera);
@@ -1281,7 +1027,7 @@ export class Engine extends EventEmitter {
         this.terrainCache.getLocal(e.tx, e.ty, pGX, pGY, this._mapW, this._mapH)
       ] ?? 4;
       const elev    = getElevOffset(groundH, this.camera.tilt, this.camera.zoom);
-      const { x: sx, y: sy } = worldToScreen(e.tx + 0.5, e.ty + 0.5, elev + e.elevOffset, this.camera);
+      const { x: sx, y: sy } = worldToScreen(e.tx + 0.5, e.ty + 0.5, elev + (e.elevOffset ?? 0), this.camera);
       const dist    = Math.hypot(cx - sx, cy - sy);
       const thresh  = 20 * this.camera.zoom;
       if (dist < thresh && dist < bestDist) { bestDist = dist; best = e; }
@@ -1289,7 +1035,7 @@ export class Engine extends EventEmitter {
 
     if (best) {
       this._selectedId = best.id;
-      best.onInteract(this, cx, cy);
+      best.onInteract?.(this, cx, cy);
       this.emit('entity:click', { entity: best });
     } else {
       this._selectedId = null;

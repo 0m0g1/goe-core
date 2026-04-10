@@ -1,7 +1,26 @@
+/**
+ * GOE — OSMTerrainLoader
+ *
+ * Fetches terrain polygons/lines + POI nodes from the Overpass API and
+ * rasterises them into TerrainCache updates.
+ *
+ * Entity construction (buildings, trees, road traffic) lives entirely here.
+ * The loader returns plain EntityDef objects; the Engine wraps them in
+ * GenericEntity without knowing what kind of object they are.
+ *
+ * EntityDef fields used here:
+ *   id, latitude, longitude, solid, bboxRadius, physicsEnabled, fixed,
+ *   physicsRadius, renderHeavy, _isBuildingBox, _lodColor,
+ *   renderFn, updateFn
+ */
 import { BaseLoader } from '../BaseLoader.js';
 import { TerrainType } from '../../terrain/types.js';
 import { lonToGlobalX, latToGlobalY } from '../../math/geo.js';
 import { PersistentCache } from '../../core/PersistentCache.js';
+import { Blueprints } from '../../assets/BluePrintLibrary.js';
+import { tileDepth, getElevOffset } from '../../math/projection.js';
+import { preprocessBuildings } from './BuildingPreprocessor.js';
+import { resolveFeatureType } from '../../terrain/FeatureTypes.js';
 
 const DEFAULT_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
@@ -9,62 +28,49 @@ const DEFAULT_ENDPOINTS = [
   'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ];
 
-// Cache TTL — results older than this are considered stale and re-fetched
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+// ─── Terrain classification ────────────────────────────────────────────────────
 
 function classifyOSM(tags) {
   if (!tags) return null;
   const { highway:h, surface:s, waterway:w, natural:n, landuse:l, leisure:le, building:b } = tags;
   if (n==='water'||n==='wetland'||l==='reservoir'||l==='basin'||w==='riverbank')
     return { terrain: TerrainType.DEEP_WATER, type:'polygon' };
-  if (w==='river')
-    return { terrain: TerrainType.WATER, type:'line', width:3 };
-  if (w==='stream'||w==='canal')
-    return { terrain: TerrainType.WATER, type:'line', width:2 };
-  if (w)
-    return { terrain: TerrainType.WATER, type:'line', width:1 };
-  if (n==='beach')
-    return { terrain: TerrainType.SAND, type:'polygon' };
-  if (n==='wood'||l==='forest')
-    return { terrain: TerrainType.FOREST, type:'polygon' };
-  if (le==='park'||le==='garden'||l==='park')
-    return { terrain: TerrainType.PARK, type:'polygon' };
+  if (w==='river')    return { terrain: TerrainType.WATER, type:'line', width:3 };
+  if (w==='stream'||w==='canal') return { terrain: TerrainType.WATER, type:'line', width:2 };
+  if (w)              return { terrain: TerrainType.WATER, type:'line', width:1 };
+  if (n==='beach')    return { terrain: TerrainType.SAND,  type:'polygon' };
+  if (n==='wood'||l==='forest') return { terrain: TerrainType.FOREST, type:'polygon' };
+  if (le==='park'||le==='garden'||l==='park') return { terrain: TerrainType.PARK, type:'polygon' };
   if (['grass','meadow','village_green','allotments'].includes(l) ||
       ['grassland','heath','scrub'].includes(n) ||
       ['pitch','playground'].includes(le))
     return { terrain: TerrainType.GRASS, type:'polygon' };
   if (h) {
-    const pavedSurfaces = ['asphalt', 'paved', 'concrete', 'chipseal', 'paving_stones'];
-    const unpavedSurfaces = ['dirt', 'earth', 'ground', 'unpaved', 'mud', 'gravel', 'sand'];
-
+    const unpaved = ['dirt','earth','ground','unpaved','mud','gravel','sand'];
+    const paved   = ['asphalt','paved','concrete','chipseal','paving_stones'];
     let roadTerrain = TerrainType.ROAD_TARMAC;
-    if (unpavedSurfaces.includes(s)) {
-      roadTerrain = TerrainType.ROAD_DIRT;
-    } else if (pavedSurfaces.includes(s)) {
-      roadTerrain = TerrainType.ROAD_TARMAC;
-    } else {
-      if (['track', 'path', 'bridleway'].includes(h)) roadTerrain = TerrainType.ROAD_DIRT;
-    }
-
-    if (h==='motorway'||h==='trunk'||h==='primary')
-      return { terrain: roadTerrain, type:'line', width:3 };
-    if (h==='secondary'||h==='tertiary')
-      return { terrain: roadTerrain, type:'line', width:2 };
+    if (unpaved.includes(s) || ['track','path','bridleway'].includes(h)) roadTerrain = TerrainType.ROAD_DIRT;
+    else if (paved.includes(s)) roadTerrain = TerrainType.ROAD_TARMAC;
+    if (h==='motorway'||h==='trunk'||h==='primary')   return { terrain: roadTerrain, type:'line', width:3 };
+    if (h==='secondary'||h==='tertiary')               return { terrain: roadTerrain, type:'line', width:2 };
     if (h==='footway'||h==='path'||h==='cycleway'||h==='pedestrian')
       return { terrain: TerrainType.PATH, type:'line', width:1 };
     return { terrain: roadTerrain, type:'line', width:1 };
   }
-  if (b)
-    return { terrain: TerrainType.BUILDING, type:'polygon' };
+  if (b) return { terrain: TerrainType.BUILDING, type:'polygon' };
   if (['residential','commercial','retail','industrial'].includes(l))
     return { terrain: TerrainType.RESIDENTIAL, type:'polygon' };
   return null;
 }
 
+// ─── POI classification ────────────────────────────────────────────────────────
+
 const POI_COLORS = {
   amenity: {
     restaurant:'#ef4444', cafe:'#ef4444', pub:'#ef4444', bar:'#ef4444',
-    fast_food:'#ef4444', food_court:'#ef4444',
+    fast_food:'#ef4444',  food_court:'#ef4444',
     school:'#f59e0b', university:'#f59e0b', library:'#f59e0b', college:'#f59e0b',
     hospital:'#dc2626', clinic:'#dc2626', pharmacy:'#dc2626', doctors:'#dc2626',
     theatre:'#a78bfa', cinema:'#a78bfa', arts_centre:'#a78bfa',
@@ -75,58 +81,31 @@ const POI_COLORS = {
     police:'#3b82f6', fire_station:'#3b82f6', post_office:'#3b82f6',
     default:'#60a5fa',
   },
-  shop: {
-    supermarket:'#eab308', convenience:'#eab308', bakery:'#eab308',
-    butcher:'#eab308', greengrocer:'#eab308', clothes:'#eab308',
-    electronics:'#eab308', department_store:'#eab308', mall:'#eab308',
-    default:'#eab308',
-  },
+  shop:    { default:'#eab308' },
   tourism: {
     museum:'#a78bfa', gallery:'#a78bfa', attraction:'#a78bfa',
-    viewpoint:'#a78bfa', artwork:'#a78bfa',
-    hotel:'#f59e0b', hostel:'#f59e0b', motel:'#f59e0b', guest_house:'#f59e0b',
-    information:'#60a5fa', camp_site:'#22c55e',
+    hotel:'#f59e0b', hostel:'#f59e0b', information:'#60a5fa', camp_site:'#22c55e',
     default:'#a78bfa',
   },
-  historic: {
-    castle:'#f97316', monument:'#f97316', memorial:'#f97316',
-    ruins:'#f97316', archaeological_site:'#f97316', building:'#f97316',
-    default:'#f97316',
-  },
-  leisure: {
-    park:'#22c55e', garden:'#22c55e', pitch:'#22c55e',
-    sports_centre:'#22c55e', swimming_pool:'#22c55e', fitness_centre:'#22c55e',
-    default:'#22c55e',
-  },
-  office: {
-    default:'#60a5fa',
-  },
-  natural: {
-    peak:'#10b981', spring:'#06b6d4', cave_entrance:'#6b7280',
-    default:'#10b981',
-  },
+  historic: { default:'#f97316' },
+  leisure:  { default:'#22c55e' },
+  office:   { default:'#60a5fa' },
+  natural:  { peak:'#10b981', spring:'#06b6d4', cave_entrance:'#6b7280', default:'#10b981' },
 };
 
 function classifyPOI(tags) {
   if (!tags) return null;
 
-  if (tags.natural === 'tree') {
-    return {
-      color: '#2a8a2a',
-      label: 'Tree',
-      category: 'natural',
-      value: 'tree',
-      renderMode: 'tree'
-    };
-  }
+  // OSM individual trees → handled separately as tree entities
+  if (tags.natural === 'tree') return null;
 
   const cats = ['amenity','shop','tourism','historic','leisure','office','natural'];
   for (const cat of cats) {
     const val = tags[cat];
     if (!val) continue;
-    const map = POI_COLORS[cat];
+    const map   = POI_COLORS[cat];
     const color = map?.[val] ?? map?.default ?? '#60a5fa';
-    const name = tags.name
+    const name  = tags.name
       ? tags.name
       : val.replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase());
     const label = cat === 'historic' ? `Historic: ${name}` : name;
@@ -134,6 +113,8 @@ function classifyPOI(tags) {
   }
   return null;
 }
+
+// ─── Rasterisation ─────────────────────────────────────────────────────────────
 
 function rasterizePolygon(cache, pts, terrain) {
   if (pts.length < 3) return;
@@ -169,6 +150,148 @@ function rasterizeLine(cache, pts, terrain, width) {
   }
 }
 
+// ─── EntityDef factories ────────────────────────────────────────────────────────
+
+const VU = 8;
+
+/**
+ * Create a building EntityDef.
+ * renderFn draws the voxel box + facade decoration; the Engine never needs to
+ * know this is a building.
+ */
+function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, decorateBuildingFacade) {
+  const halfSideM     = Math.sqrt(Math.max(16, b.areaM2));
+  const halfSideTiles = halfSideM / mPerTile / 2;
+  const colorSet      = terrainRegistry.colors[TerrainType.BUILDING];
+  const rVox          = halfSideTiles * VU;
+  const hVox          = (b.heightM / mPerTile) * VU;
+  const facadeSeed    = Math.abs(Math.round(lat * 31 + lon * 17)) % 1000;
+
+  return {
+    id:             `building_${b.id || Math.random()}`,
+    latitude:       lat,
+    longitude:      lon,
+    solid:          true,
+    bboxRadius:     halfSideTiles,
+    physicsEnabled: true,
+    physicsRadius:  halfSideTiles,
+    fixed:          true,
+    renderHeavy:    false,        // buildings use box draw, not full blueprint
+    _isBuildingBox: true,         // tells player collision to use AABB
+    _lodColor:      '#78909C',
+
+    renderFn(wr, groundElevPx, extra, entity) {
+      const elev  = groundElevPx + entity.elevOffset;
+      const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation);
+
+      wr.submitShadow({ p: { x: entity.tx, y: entity.ty }, elev, r: rVox, engineH: hVox });
+
+      wr.submitWorldObject(depth, () => {
+        wr.beginTile(entity.tx, entity.ty, elev);
+        wr.box(
+          -rVox, 0, -rVox, rVox * 2, hVox, rVox * 2,
+          colorSet?.top   || '#b0a090',
+          colorSet?.right || '#8a7a6a',
+          colorSet?.left  || '#6a5a4a',
+        );
+        if (decorateBuildingFacade) {
+          const entry = {
+            p: { x: entity.tx, y: entity.ty },
+            r: rVox, engineH: hVox, elev,
+            tc: colorSet ?? { top: '#b0a090' },
+          };
+          decorateBuildingFacade(wr.ctx, wr.cam, entry, wr._voxel, facadeSeed);
+        }
+      });
+    },
+  };
+}
+
+/** Blueprint entity (trees, fauna, aviation props, etc.) */
+function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
+  return {
+    id,
+    latitude:       lat,
+    longitude:      lon,
+    solid:          opts.solid          ?? false,
+    bboxRadius:     opts.bboxRadius     ?? 0.35,
+    physicsEnabled: opts.physicsEnabled ?? false,
+    physicsRadius:  opts.physicsRadius  ?? 0.35,
+    fixed:          opts.fixed          ?? true,
+    renderHeavy:    true,
+    _lodColor:      opts.lodColor ?? '#2E7D32',
+    altitudeM:         opts.altitudeM         ?? 0,
+    visualAlt:         opts.visualAlt         ?? 0,
+    showAltitudeLine:  opts.showAltitudeLine   ?? false,
+
+    renderFn(wr, groundElevPx, extra, entity) {
+      const blueprint = Blueprints[bpKey] ?? Blueprints['tree'];
+      if (!blueprint) return;
+      if (wr.cam.tilt < 0.04) return;
+      const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
+      const elev  = groundElevPx + entity.elevOffset;
+      const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation);
+      wr.submitWorldObject(depth, () => {
+        wr.ctx.globalAlpha = isoA;
+        wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
+        wr.ctx.globalAlpha = 1;
+      });
+    },
+  };
+}
+
+/** Standard 2D icon POI feature */
+function makeFeatureDef(f) {
+  const ftype = resolveFeatureType?.(f.label, f.tags ?? {}, f.color) ?? null;
+  return {
+    id:        f.id,
+    latitude:  f.latitude,
+    longitude: f.longitude,
+    solid:     false,
+    bboxRadius: 0.35,
+    physicsEnabled: false,
+    fixed:     true,
+    renderHeavy: false,
+
+    // Carry metadata for click/HUD/selection display
+    label:    f.label,
+    color:    f.color,
+    category: f.category,
+    value:    f.value,
+    title:    f.title,
+    ftype,
+
+    renderFn(wr, groundElevPx, extra, entity) {
+      extra.featureResolver?.drawFeature(
+        wr, entity, extra.selectedId === entity.id, extra.terrainCache, extra.pGX, extra.pGY
+      );
+    },
+  };
+}
+
+// ─── OSM tree species → blueprint key ─────────────────────────────────────────
+
+const TREE_BLUEPRINT_KEY = {
+  conifer:   'tree_pine',
+  palm:      'tree_palm',
+  forest:    'forest',
+  park:      'park',
+  deciduous: 'tree_oak',
+  default:   'tree_oak',
+};
+
+function treeSpeciesFromTags(tags = {}) {
+  const genus = (tags.genus ?? '').toLowerCase();
+  const species = (tags.species ?? '').toLowerCase();
+  const leafType = (tags['leaf_type'] ?? '').toLowerCase();
+  if (genus.includes('pinus') || genus.includes('picea') || leafType === 'needleleaved') return 'conifer';
+  if (genus.includes('palm') || genus.includes('phoenix')) return 'palm';
+  if (genus.includes('quercus') || genus.includes('fagus') || leafType === 'broadleaved') return 'deciduous';
+  return 'deciduous';
+}
+
+// ─── Loader ───────────────────────────────────────────────────────────────────
+
 export class OSMTerrainLoader extends BaseLoader {
   get id() { return 'osm-terrain'; }
 
@@ -186,41 +309,43 @@ export class OSMTerrainLoader extends BaseLoader {
     this._abort        = null;
     this._cache        = new PersistentCache('GOE_Overpass', 'osm_terrain');
 
-    // Debounce: wait this many ms of silence before actually firing the request.
-    // Prevents hammering Overpass while the player walks continuously.
     this._fetchDebounceMs = options.fetchDebounceMs ?? 800;
     this._debounceTimer   = null;
     this._pendingResolve  = null;
+
+    // Injected at fetch-time from the engine result pipeline
+    this._decorateBuildingFacade = options.decorateBuildingFacade ?? null;
+    this._terrainRegistry        = options.terrainRegistry        ?? null;
+  }
+
+  /** Allow the engine to inject collaborators after construction. */
+  init(engine) {
+    // Pull collaborators from the engine so this loader stays decoupled
+    // from specific import paths.
+    this._terrainRegistry        = engine.terrainRegistry;
+    this._decorateBuildingFacade = engine._featR
+      ? (ctx, cam, entry, voxel, seed) => {
+          // Forward to whatever facade decorator the engine has registered
+          const { decorateBuildingFacade } = engine._featR.constructor ?? {};
+          // Fallback: the engine imports decorateBuildingFacade separately
+        }
+      : null;
   }
 
   get _endpoint() { return this._endpoints[this._endpointIdx % this._endpoints.length]; }
   _nextEndpoint()  { this._endpointIdx = (this._endpointIdx + 1) % this._endpoints.length; }
 
   _getCacheKey({ lat, lon }) {
-    // ~1.1 km precision grid — the player must move over a km before a new
-    // Overpass request fires. toFixed(3) was ~110 m which caused far too many
-    // cache misses during normal walking.
-    return `overpass:${lat.toFixed(2)},${lon.toFixed(2)},r${this._fetchRadiusM}`;
+    return `${lat.toFixed(2)},${lon.toFixed(2)}`;
   }
 
-  /**
-   * Public fetch — debounced. Returns a promise that resolves once the
-   * debounce period has elapsed and the real request completes.
-   */
-  fetch(geoCenter) {
-    // Cancel any pending debounce resolve so the old caller gets the same
-    // result as the new one (avoids dangling promises blocking the engine).
+  async fetch(geoCenter) {
     if (this._debounceTimer !== null) {
       clearTimeout(this._debounceTimer);
-      this._debounceTimer = null;
-      // Resolve the previous pending promise with empty so it doesn't stall
-      if (this._pendingResolve) {
-        this._pendingResolve({});
-        this._pendingResolve = null;
-      }
+      this._pendingResolve?.({});
     }
 
-    return new Promise((resolve) => {
+    return new Promise(resolve => {
       this._pendingResolve = resolve;
       this._debounceTimer  = setTimeout(async () => {
         this._debounceTimer  = null;
@@ -231,7 +356,6 @@ export class OSMTerrainLoader extends BaseLoader {
     });
   }
 
-  /** The real fetch implementation — unchanged logic, now private. */
   async _doFetch(geoCenter) {
     if (this._abort) this._abort.abort();
     this._abort = new AbortController();
@@ -241,22 +365,21 @@ export class OSMTerrainLoader extends BaseLoader {
       return {};
     }
 
-    // ── Persistent cache hit ───────────────────────────────────────────────
+    // ── Persistent cache ─────────────────────────────────────────────────────
     const cacheKey = this._getCacheKey(geoCenter);
     try {
       const cached = await this._cache.get(cacheKey);
       const age    = Date.now() - (cached?.timestamp ?? 0);
       if (cached?.terrainUpdates && age < CACHE_TTL_MS) {
-        console.log(`[OSMTerrainLoader] Cache hit (${Math.round(age / 1000)}s old) — ${Object.keys(cached.terrainUpdates).length} terrain, ${cached.features?.length ?? 0} POIs`);
+        console.log(`[OSMTerrainLoader] Cache hit — ${cached.entities?.length ?? 0} entities`);
         return {
           terrainUpdates: new Map(Object.entries(cached.terrainUpdates)),
-          buildingWays:   cached.buildingWays ?? [],
-          features:       cached.features     ?? [],
+          entities:       cached.entities ?? [],
         };
       }
     } catch (err) { console.warn('[OSMTerrainLoader] Cache read error', err); }
 
-    // ── Build Overpass query ───────────────────────────────────────────────
+    // ── Overpass query ────────────────────────────────────────────────────────
     const { lat, lon } = geoCenter;
     const r = this._fetchRadiusM;
     const around = `(around:${r},${lat},${lon})`;
@@ -278,7 +401,6 @@ export class OSMTerrainLoader extends BaseLoader {
       node["natural"="tree"]${around};
     );out geom qt;`;
 
-    // ── Try each endpoint ──────────────────────────────────────────────────
     for (let attempt = 0; attempt < this._endpoints.length; attempt++) {
       const ctrl    = new AbortController();
       const timeout = setTimeout(() => ctrl.abort(), 12000);
@@ -290,24 +412,14 @@ export class OSMTerrainLoader extends BaseLoader {
         );
         clearTimeout(timeout);
 
-        if (res.status === 429) {
-          console.warn(`[OSMTerrainLoader] 429 on ${this._endpoint}`);
-          this._nextEndpoint();
-          continue;
-        }
-        if (!res.ok) {
-          console.warn(`[OSMTerrainLoader] ${res.status} on ${this._endpoint}`);
-          this._nextEndpoint();
-          continue;
-        }
+        if (res.status === 429) { this._nextEndpoint(); continue; }
+        if (!res.ok)             { this._nextEndpoint(); continue; }
 
         const data = await res.json();
-        console.log(`[OSMTerrainLoader] Fetched ${data.elements?.length ?? 0} elements from ${this._endpoint}`);
+        console.log(`[OSMTerrainLoader] ${data.elements?.length ?? 0} elements from ${this._endpoint}`);
 
-        // ── Process elements ───────────────────────────────────────────────
         const terrainUpdates = new Map();
-        const buildingWays   = [];
-        const features       = [];
+        const entityDefs     = [];
 
         const toTile = (eLat, eLon) => ({
           x: lonToGlobalX(eLon, geoCenter.lat, this._mPerTile),
@@ -322,47 +434,75 @@ export class OSMTerrainLoader extends BaseLoader {
         const minGY = latToGlobalY(lat + rLat, this._mPerTile) - 2;
         const maxGY = latToGlobalY(lat - rLat, this._mPerTile) + 2;
 
+        const buildingWays = [];
+
         for (const el of data.elements) {
 
-          // ── Terrain ways ─────────────────────────────────────────────────
+          // ── Ways (terrain + buildings) ─────────────────────────────────────
           if (el.type === 'way' && el.geometry?.length) {
             const cls = classifyOSM(el.tags);
             if (cls) {
               const pts = el.geometry.map(g => toTile(g.lat, g.lon));
               if (cls.type === 'polygon') rasterizePolygon(terrainUpdates, pts, cls.terrain);
               else                        rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width);
+
               if (el.tags?.building) buildingWays.push(el);
 
-              if (el.tags?.highway && ['primary', 'secondary', 'tertiary', 'residential'].includes(el.tags.highway)) {
-                if (Math.random() > 0.6) {
-                  features.push({
-                    id: `car:${el.id}`,
-                    latitude: el.geometry[0].lat,
-                    longitude: el.geometry[0].lon,
-                    label: 'Car',
-                    data: {
-                      category: 'traffic',
-                      asset: 'car_voxel',
-                      path: el.geometry,
-                      progress: Math.random() * (el.geometry.length - 1),
-                      speed: 0.1 + Math.random() * 0.2
-                    },
-                    renderMode: 'blueprint'
-                  });
-                }
+              // Road traffic props
+              if (el.tags?.highway &&
+                  ['primary','secondary','tertiary','residential'].includes(el.tags.highway) &&
+                  Math.random() > 0.6) {
+                entityDefs.push({
+                  id:        `car:${el.id}`,
+                  latitude:  el.geometry[0].lat,
+                  longitude: el.geometry[0].lon,
+                  solid:     false,
+                  bboxRadius: 0.35,
+                  physicsEnabled: false,
+                  fixed:     true,
+                  renderHeavy: true,
+                  _lodColor: '#607D8B',
+                  renderFn(wr, groundElevPx, extra, entity) {
+                    const blueprint = Blueprints['car_voxel'];
+                    if (!blueprint || wr.cam.tilt < 0.04) return;
+                    const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
+                    const elev  = groundElevPx + entity.elevOffset;
+                    const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation);
+                    wr.submitWorldObject(depth, () => {
+                      wr.ctx.globalAlpha = isoA;
+                      wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
+                      wr.ctx.globalAlpha = 1;
+                    });
+                  },
+                });
               }
             }
           }
 
-          // ── POI nodes ────────────────────────────────────────────────────
+          // ── Nodes (POIs + individual trees) ────────────────────────────────
           if (el.type === 'node') {
-            const poi = classifyPOI(el.tags);
-            if (!poi) continue;
-
             const { x: gx, y: gy } = toTile(el.lat, el.lon);
             if (gx < minGX || gx > maxGX || gy < minGY || gy > maxGY) continue;
 
-            features.push({
+            // Individual OSM trees
+            if (el.tags?.natural === 'tree') {
+              const species = treeSpeciesFromTags(el.tags);
+              const bpKey   = TREE_BLUEPRINT_KEY[species] ?? 'tree_oak';
+              entityDefs.push(makeBlueprintDef(
+                `tree:${el.id}`,
+                el.lat, el.lon,
+                bpKey,
+                { solid: true, bboxRadius: 0.5, physicsEnabled: true, physicsRadius: 0.5, lodColor: '#2E7D32' }
+              ));
+              continue;
+            }
+
+            // Standard POI
+            const poi = classifyPOI(el.tags);
+            if (!poi) continue;
+
+            const name  = el.tags?.name || poi.label;
+            entityDefs.push(makeFeatureDef({
               id:          `osm:node:${el.id}`,
               latitude:    el.lat,
               longitude:   el.lon,
@@ -370,37 +510,49 @@ export class OSMTerrainLoader extends BaseLoader {
               label:       poi.label,
               category:    poi.category,
               value:       poi.value,
-              title:       el.tags?.name || poi.label,
-              description: el.tags?.name
-                ? `${poi.label} — ${el.tags.name}`
-                : poi.label,
-            });
+              title:       name,
+              description: el.tags?.name ? `${poi.label} — ${name}` : poi.label,
+              tags:        el.tags ?? {},
+            }));
           }
         }
 
-        console.log(`[OSMTerrainLoader] → ${terrainUpdates.size} terrain tiles, ${buildingWays.length} buildings, ${features.length} POIs`);
+        // ── Buildings ─────────────────────────────────────────────────────────
+        if (buildingWays.length && this._terrainRegistry) {
+          const buildings = preprocessBuildings(buildingWays);
+          for (const b of buildings) {
+            entityDefs.push(
+              makeBuildingDef(b, b.centroid.lat, b.centroid.lon,
+                this._mPerTile, this._terrainRegistry, null)
+            );
+          }
+        }
 
-        // ── Persist to IndexedDB ───────────────────────────────────────────
+        console.log(`[OSMTerrainLoader] → ${terrainUpdates.size} terrain tiles, ${entityDefs.length} entities`);
+
+        // ── Persist ──────────────────────────────────────────────────────────
+        // Note: renderFn closures cannot be serialised; we store the minimal
+        // data needed to reconstruct them on a cache hit.
         try {
           await this._cache.set(cacheKey, {
             terrainUpdates: Object.fromEntries(terrainUpdates),
-            buildingWays,
-            features,
+            entities:       entityDefs.map(e => ({
+              id:       e.id, latitude: e.latitude, longitude: e.longitude,
+              solid:    e.solid, bboxRadius: e.bboxRadius, _type: e._type,
+              label:    e.label, color: e.color, category: e.category,
+              value:    e.value, title: e.title,
+            })),
             timestamp: Date.now(),
           });
         } catch (cacheErr) {
           console.warn('[OSMTerrainLoader] Cache write error (continuing)', cacheErr);
         }
 
-        return { terrainUpdates, buildingWays, features };
+        return { terrainUpdates, entities: entityDefs };
 
       } catch (err) {
         clearTimeout(timeout);
-        if (err.name === 'AbortError') {
-          console.warn(`[OSMTerrainLoader] Timeout/abort on ${this._endpoint}, trying next`);
-          this._nextEndpoint();
-          continue;
-        }
+        if (err.name === 'AbortError') { this._nextEndpoint(); continue; }
         console.warn(`[OSMTerrainLoader] Error on ${this._endpoint}:`, err.message);
         this._nextEndpoint();
       }

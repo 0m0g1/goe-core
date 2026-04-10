@@ -1,53 +1,88 @@
+/**
+ * GOE — AviationLoader
+ *
+ * Polls OpenSky for live aircraft in the local bounding box and returns
+ * EntityDef objects the Engine renders — no airplane-specific code in Engine.
+ *
+ * Poll strategy: returns last cached result immediately so the engine never
+ * waits on network I/O; refreshes in the background every POLL_INTERVAL_MS.
+ */
 import { BaseLoader } from '../BaseLoader.js';
+import { Blueprints } from '../../assets/BluePrintLibrary.js';
+import { tileDepth } from '../../math/projection.js';
 
 const PROXY_URL    = 'https://corsproxy.io/?';
 const OPENSKY_BASE = 'https://opensky-network.org/api/states/all';
 
-const ALTITUDE_SCALE = 0.04;
-
-// OpenSky rate limits:
-//   Anonymous : 1 request / 10 s, max 400 credits/day
-//   Registered: 1 request /  5 s
-// We poll every 12 s to stay safely under the anonymous limit.
-// fetch() returns the last cached result immediately so the engine never
-// waits on network I/O.
 const POLL_INTERVAL_MS = 12_000;
+
+// ─── EntityDef factory ────────────────────────────────────────────────────────
+
+function makeAircraftDef(id, lat, lon, callsign, altM, visualAlt, heading) {
+  return {
+    id,
+    latitude:         lat,
+    longitude:        lon,
+    solid:            false,
+    bboxRadius:       0.5,
+    physicsEnabled:   false,
+    fixed:            false,
+    renderHeavy:      true,
+    _lodColor:        '#64B5F6',
+
+    // Metadata
+    label:            callsign,
+    altitudeM:        altM,
+    visualAlt:        visualAlt,
+    showAltitudeLine: true,
+    heading,
+
+    renderFn(wr, groundElevPx, extra, entity) {
+      const blueprint = Blueprints['airplane_jet'];
+      if (!blueprint) return;
+      if (wr.cam.tilt < 0.04) return;
+      const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
+      const elev  = groundElevPx + entity.elevOffset + entity.visualAlt;
+      const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation);
+      wr.submitWorldObject(depth, () => {
+        wr.ctx.globalAlpha = isoA;
+        wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
+        wr.ctx.globalAlpha = 1;
+      });
+    },
+  };
+}
+
+// ─── Loader ───────────────────────────────────────────────────────────────────
 
 export class AviationLoader extends BaseLoader {
   get id() { return 'aviation-loader'; }
 
   constructor(options = {}) {
     super(options);
-    this._lastResult      = { features: [] };
-    this._geoCenter       = null;
-    this._timer           = null;
-    this._polling         = false;
+    this._lastResult     = { entities: [] };
+    this._geoCenter      = null;
+    this._timer          = null;
+    this._polling        = false;
     this.realisticAltitude = false;
-    this._pollIntervalMs  = options.pollIntervalMs ?? POLL_INTERVAL_MS;
+    this._pollIntervalMs = options.pollIntervalMs ?? POLL_INTERVAL_MS;
   }
 
-  /**
-   * Called by the engine whenever it wants aviation data.
-   * Returns the most-recently fetched result immediately (no await on network).
-   * Starts the background poll loop on first call.
-   */
   async fetch(geoCenter) {
     this._geoCenter = geoCenter;
     if (!this._polling) this._startPolling();
     return this._lastResult;
   }
 
-  // ── Background poll ────────────────────────────────────────────────────────
+  // ── Background poll ───────────────────────────────────────────────────────
 
   _startPolling() {
     this._polling = true;
-    // Fire immediately, then schedule recurring polls
     this._poll();
   }
 
   async _poll() {
     if (!this._polling) return;
-
     if (this._geoCenter) {
       try {
         this._lastResult = await this._fetchLive(this._geoCenter);
@@ -55,15 +90,12 @@ export class AviationLoader extends BaseLoader {
         console.warn('[AviationLoader] Poll error:', e.message);
       }
     }
-
-    // Schedule next poll (clearTimeout-safe — if destroy() was called between
-    // the async fetch above and here, _polling will be false)
     if (this._polling) {
       this._timer = setTimeout(() => this._poll(), this._pollIntervalMs);
     }
   }
 
-  // ── Live fetch (moved from the old public fetch()) ─────────────────────────
+  // ── Live fetch ────────────────────────────────────────────────────────────
 
   async _fetchLive(geoCenter) {
     const { lat, lon } = geoCenter;
@@ -82,54 +114,44 @@ export class AviationLoader extends BaseLoader {
       console.warn('[AviationLoader] Live fetch failed, using mock:', e.message);
     }
 
-    const features = states
+    const entities = states
       ? states
           .filter(s => s[6] != null && s[5] != null)
-          .map(s => this._mapState(s, geoCenter))
-      : this._mockStates(geoCenter);
+          .map(s => this._stateToEntityDef(s))
+      : this._mockEntityDefs(geoCenter);
 
-    return { features };
+    return { entities };
   }
 
-  // ── Helpers ────────────────────────────────────────────────────────────────
+  // ── Helpers ───────────────────────────────────────────────────────────────
 
   _visualAlt(realMetres) {
-    if (this.realisticAltitude) return realMetres;
-    return Math.log1p(realMetres) * 5;
+    return this.realisticAltitude ? realMetres : Math.log1p(realMetres) * 5;
   }
 
-  _mapState(s, geoCenter) {
-    const altM = s[7] ?? 500;
-    return {
-      id:        `plane:${s[0]}`,
-      latitude:  s[6],
-      longitude: s[5],
-      label:     (s[1] || 'UNK').trim(),
-      tags:      { aviation: 'yes' },
-      data: {
-        category:         'aviation',
-        altitudeM:        altM,
-        visualAlt:        this._visualAlt(altM),
-        showAltitudeLine: true,
-        heading:          s[10] ?? 0,
-        velocity:         s[9]  ?? 200,
-        asset:            'airplane_jet',
-        physics:          false,
-        fixed:            false,
-      },
-      renderMode: 'blueprint',
-    };
+  _stateToEntityDef(s) {
+    const altM    = s[7] ?? 500;
+    const heading = s[10] ?? 0;
+    return makeAircraftDef(
+      `plane:${s[0]}`,
+      s[6],
+      s[5],
+      (s[1] || 'UNK').trim(),
+      altM,
+      this._visualAlt(altM),
+      heading,
+    );
   }
 
-  _mockStates(geoCenter) {
+  _mockEntityDefs(geoCenter) {
     const { lat, lon } = geoCenter;
     return [
-      [null, 'MOCK01', null, null, null, lon + 0.002, lat + 0.002, 800,  false, 150, 120, null, null, null, null, null, null],
-      [null, 'MOCK02', null, null, null, lon - 0.001, lat + 0.003, 1200, false, 200, 280, null, null, null, null, null, null],
-    ].map(s => this._mapState(s, geoCenter));
+      makeAircraftDef('plane:MOCK01', lat + 0.002, lon + 0.002, 'MOCK01',  800, this._visualAlt( 800), 120),
+      makeAircraftDef('plane:MOCK02', lat + 0.003, lon - 0.001, 'MOCK02', 1200, this._visualAlt(1200), 280),
+    ];
   }
 
-  // ── Lifecycle ──────────────────────────────────────────────────────────────
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   destroy() {
     this._polling = false;
