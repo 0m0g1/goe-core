@@ -26,6 +26,10 @@ export class Entity {
     this.visible = true;
     this.solid = false;
 
+    this.altitudeM  = 0;       //   real-world metres above ground
+    this.visualAlt  = 0;       // overrides altitudeM for rendering if > 0
+    this.showAltitudeLine = false; // draw ground-to-entity thread
+
     // Physics properties (Yaphe)
     this.blocking = true;
     this.physicsEnabled = false;     // whether this entity participates in physics
@@ -75,6 +79,12 @@ export class Entity {
 
   onInteract(engine, screenX, screenY) {
     engine.emit('entity:interact', { entity: this, screenX, screenY });
+  }
+
+  getAltitudePx(cam) {
+    const alt = this.visualAlt > 0 ? this.visualAlt : this.altitudeM;
+    if (alt === 0) return 0;
+    return alt * cam.zoom * cam.tileW * cam.tilt * 0.5;
   }
 }
 

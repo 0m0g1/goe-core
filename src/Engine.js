@@ -230,11 +230,17 @@ class FeatureEntity extends Entity {
     this.label = data.label || data.title || data.name || '';
     this.color = data.color || '#60a5fa';
     this.ftype = resolveFeatureType(this.label, data.tags || {}, this.color);
+
+    // Forward altitude properties from data
+    this.altitudeM        = data.altitudeM        ?? 0;
+    this.visualAlt        = data.visualAlt        ?? 0;
+    this.showAltitudeLine = data.showAltitudeLine  ?? false;
+
     this.bboxRadius     = 0.35;
     this.physicsEnabled = data.physics === true;
     this.physicsRadius  = data.physicsRadius || 0.35;
     this.fixed          = data.fixed ?? true;
-    this.solid = false;
+    this.solid          = false;
   }
 
   render(wr, groundElevPx, extra) {
@@ -900,7 +906,7 @@ export class Engine extends EventEmitter {
             const local = toLocal(globalX, globalY);
             if (local.x < 0 || local.x >= this._mapW || local.y < 0 || local.y >= this._mapH) continue;
             const tree = new TreeEntity(
-              `tree_${t.id || Math.random()}`,
+              `tree_${t.id ?? `${Math.round(t.lat * 1e6)}_${Math.round(t.lon * 1e6)}`}`,
               local.x, local.y, t.species || 'deciduous', 1.0, t.seed || 0
             );
             upsert(tree);
@@ -947,7 +953,6 @@ export class Engine extends EventEmitter {
         const collidables = this.entities.filter(e => e.solid === true);
         const byType = {};
         for (const e of collidables) byType[e.type] = (byType[e.type] || 0) + 1;
-        console.log('[Quadtree]', byType);
         const objects = collidables.map(e => ({
             x: e.tx, y: e.ty,
             entity: e,
@@ -1156,9 +1161,12 @@ export class Engine extends EventEmitter {
         const groundH = this.terrainRegistry.heights[
           this.terrainCache.getLocal(e.tx, e.ty, pGX, pGY, this._mapW, this._mapH)
         ] ?? 4;
-        const groundElevPx = getElevOffset(groundH, cam.tilt, cam.zoom);
 
-        e.render(this._renderer, groundElevPx, {
+        const groundElevPx = getElevOffset(groundH, cam.tilt, cam.zoom);
+        const altPx        = e.getAltitudePx(cam);
+        const totalElevPx  = groundElevPx + altPx;
+
+        e.render(this._renderer, totalElevPx, {
           selectedId:      this._selectedId,
           terrainCache:    this.terrainCache,
           pGX, pGY,
@@ -1166,6 +1174,20 @@ export class Engine extends EventEmitter {
           featureResolver: this._featR,
           decorateFacade:  decorateBuildingFacade,
         });
+
+        // Altitude line — any entity can opt in via showAltitudeLine
+        if (altPx > 0 && e.showAltitudeLine && cam.zoom > 0.08) {
+          const depth = tileDepth(e.tx, e.ty, cam.rotation);
+          this._renderer.submitWorldObject(depth, () => {
+            const ground = worldToScreen(e.tx + 0.5, e.ty + 0.5, groundElevPx, cam);
+            const airPos = worldToScreen(e.tx + 0.5, e.ty + 0.5, totalElevPx, cam);
+            this._renderer.drawLine(
+              ground.x, ground.y, airPos.x, airPos.y,
+              'rgba(180,200,255,0.25)', 1
+            );
+            this._renderer.drawCircle(ground.x, ground.y, 2, 'rgba(180,200,255,0.4)');
+          });
+        }
       }
     }
 
