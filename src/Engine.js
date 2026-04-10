@@ -34,7 +34,7 @@ import { InputManager }      from './core/InputManager.js';
 import { TerrainCache }      from './terrain/TerrainCache.js';
 import { createTerrainRegistry, TerrainType } from './terrain/types.js';
 import { TileRenderer }      from './render/TileRenderer.js';
-import { FeatureRenderer, decorateBuildingFacade } from './render/FeatureRenderer.js';
+import { FeatureRenderer } from './render/FeatureRenderer.js';
 import { OSMLayerRenderer }  from './render/OSMLayerRenderer.js';
 import { WorldRenderer }     from './render/Renderer.js';
 import { drawPlayer }        from './assets/PlayerBlueprint.js';
@@ -973,7 +973,6 @@ export class Engine extends EventEmitter {
           pGX, pGY,
           mPerTile:        this._mPerTile,
           featureResolver: this._featR,
-          decorateFacade:  decorateBuildingFacade,
         });
 
         // Altitude line

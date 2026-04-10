@@ -231,23 +231,26 @@
             this.solid = true;
         }
 
-        render(ctx, cam, groundElevPx, extra) {
-            const { x, y } = worldToScreen(this.tx + 0.5, this.ty + 0.5, groundElevPx + this.elevOffset, cam);
-            const r = 10 * cam.zoom;
-            const grad = ctx.createRadialGradient(x-3, y-3, 2, x, y, r);
-            grad.addColorStop(0, '#ff8888');
-            grad.addColorStop(1, '#cc2222');
-            ctx.beginPath();
-            ctx.arc(x, y, r, 0, Math.PI*2);
-            ctx.fillStyle = grad;
-            ctx.fill();
-            ctx.shadowBlur = 0;
-            // Optional: add a small highlight
-            ctx.beginPath();
-            ctx.arc(x-2, y-2, r*0.25, 0, Math.PI*2);
-            ctx.fillStyle = 'rgba(255,255,200,0.6)';
-            ctx.fill();
-        }
+        render(wr, groundElevPx, extra) {
+            const { ctx, cam } = wr;
+            const { x, y } = worldToScreen(
+                this.tx + 0.5, this.ty + 0.5,
+                groundElevPx + (this.elevOffset ?? 0),
+                cam
+            );
+            const r = Math.max(3, cam.zoom * cam.tileW * 0.4);
+            const depth = this.tx * Math.cos(cam.rotation) + this.ty * Math.sin(cam.rotation);
+            wr.submitWorldObject(depth, () => {
+                ctx.beginPath();
+                ctx.arc(x, y, r, 0, Math.PI * 2);
+                ctx.fillStyle = '#ff4444';
+                ctx.fill();
+                ctx.beginPath();
+                ctx.arc(x - r * 0.25, y - r * 0.25, r * 0.25, 0, Math.PI * 2);
+                ctx.fillStyle = 'rgba(255,230,200,0.6)';
+                ctx.fill();
+            });
+            }
     }
 
     // --------------------------------------------------------------
@@ -368,8 +371,16 @@
         2
     );
     engine.setElevationLoader(elevationLoader);
+    
+    engine.use({
+        id: 'events',
+        init() {},
+        destroy() {},
+        async fetch() {
+            return { entities: buildFeatures(sampleEvents) };
+        },
+    });
 
-    // engine.setFeatures(buildFeatures(sampleEvents));
     engine.mount(canvas);
 
     // --------------------------------------------------------------

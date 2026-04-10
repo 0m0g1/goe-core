@@ -18,7 +18,7 @@ import { TerrainType } from '../../terrain/types.js';
 import { lonToGlobalX, latToGlobalY } from '../../math/geo.js';
 import { PersistentCache } from '../../core/PersistentCache.js';
 import { Blueprints } from '../../assets/BluePrintLibrary.js';
-import { tileDepth, getElevOffset } from '../../math/projection.js';
+import { tileDepth, getElevOffset, tileHalfWidth, shadeHex, worldToScreen } from '../../math/projection.js';
 import { preprocessBuildings } from './BuildingPreprocessor.js';
 import { resolveFeatureType } from '../../terrain/FeatureTypes.js';
 
@@ -179,6 +179,8 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, decorateBuildin
     renderHeavy:    false,        // buildings use box draw, not full blueprint
     _isBuildingBox: true,         // tells player collision to use AABB
     _lodColor:      '#78909C',
+    _areaM2:        b.areaM2,      // stored for cache reconstruction
+    _heightM:       b.heightM,     // stored for cache reconstruction
 
     renderFn(wr, groundElevPx, extra, entity) {
       const elev  = groundElevPx + entity.elevOffset;
@@ -223,6 +225,7 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
     altitudeM:         opts.altitudeM         ?? 0,
     visualAlt:         opts.visualAlt         ?? 0,
     showAltitudeLine:  opts.showAltitudeLine   ?? false,
+    _bpKey:         bpKey,                     // stored for cache reconstruction
 
     renderFn(wr, groundElevPx, extra, entity) {
       const blueprint = Blueprints[bpKey] ?? Blueprints['tree'];
@@ -240,9 +243,12 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
   };
 }
 
-/** Standard 2D icon POI feature */
+/** Standard 2D icon POI feature — self-contained renderFn, no external resolver */
 function makeFeatureDef(f) {
   const ftype = resolveFeatureType?.(f.label, f.tags ?? {}, f.color) ?? null;
+  const color = f.color ?? '#60a5fa';
+  const label = f.label ?? f.title ?? '';
+
   return {
     id:        f.id,
     latitude:  f.latitude,
@@ -254,17 +260,55 @@ function makeFeatureDef(f) {
     renderHeavy: false,
 
     // Carry metadata for click/HUD/selection display
-    label:    f.label,
-    color:    f.color,
+    label, color,
     category: f.category,
     value:    f.value,
     title:    f.title,
     ftype,
 
     renderFn(wr, groundElevPx, extra, entity) {
-      extra.featureResolver?.drawFeature(
-        wr, entity, extra.selectedId === entity.id, extra.terrainCache, extra.pGX, extra.pGY
-      );
+      const { cam } = wr;
+      if (cam.tilt < 0.02) return;
+      const elev  = groundElevPx + (entity.elevOffset ?? 0);
+      const depth = entity.tx * Math.cos(cam.rotation) + entity.ty * Math.sin(cam.rotation);
+      const hw    = tileHalfWidth(cam.zoom, cam.tileW);
+      const r     = Math.max(3, hw * 0.7);
+
+      wr.submitWorldObject(depth, () => {
+        const { x, y } = worldToScreen(entity.tx + 0.5, entity.ty + 0.5, elev, cam);
+        const ctx = wr.ctx;
+
+        // Glow halo
+        ctx.beginPath();
+        ctx.arc(x, y, r * 2.2, 0, Math.PI * 2);
+        ctx.fillStyle = color + '33';
+        ctx.fill();
+
+        // Main dot
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Selection ring
+        if (extra.selectedId === entity.id) {
+          ctx.beginPath();
+          ctx.arc(x, y, r * 1.8, 0, Math.PI * 2);
+          ctx.strokeStyle = color + 'aa';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+
+        // Label at sufficient zoom
+        if (hw > 12 && label && cam.tilt > 0.1) {
+          wr.drawLabel(x, y - r * 2.2, label);
+        }
+      });
     },
   };
 }
@@ -288,6 +332,90 @@ function treeSpeciesFromTags(tags = {}) {
   if (genus.includes('palm') || genus.includes('phoenix')) return 'palm';
   if (genus.includes('quercus') || genus.includes('fagus') || leafType === 'broadleaved') return 'deciduous';
   return 'deciduous';
+}
+
+function hash(n) {
+  const x = Math.sin(n + 1) * 43758.5453;
+  return x - Math.floor(x);
+}
+
+function drawFacadeWindows(ctx, faceQuad, rows, cols, color, seed) {
+  const lerp  = (a, b, t) => a + (b - a) * t;
+  const lerpP = (p1, p2, t) => ({ x: lerp(p1.x, p2.x, t), y: lerp(p1.y, p2.y, t) });
+  const litColor  = '#fffcd0bb';
+  const darkColor = '#1a2a3a99';
+
+  ctx.save();
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      const u0 = (col + 0.15) / cols, u1 = (col + 0.85) / cols;
+      const v0 = (row + 0.12) / rows, v1 = (row + 0.82) / rows;
+      const [A, B, C, D] = faceQuad;
+      const tl = lerpP(lerpP(A, B, u0), lerpP(D, C, u0), v0);
+      const tr = lerpP(lerpP(A, B, u1), lerpP(D, C, u1), v0);
+      const br = lerpP(lerpP(A, B, u1), lerpP(D, C, u1), v1);
+      const bl = lerpP(lerpP(A, B, u0), lerpP(D, C, u0), v1);
+      const isLit  = hash(seed * 31 + row * 7  + col * 13) > 0.35;
+      const isDark = hash(seed * 17 + row * 11 + col * 5)  > 0.8;
+      ctx.beginPath();
+      ctx.moveTo(tl.x, tl.y); ctx.lineTo(tr.x, tr.y);
+      ctx.lineTo(br.x, br.y); ctx.lineTo(bl.x, bl.y);
+      ctx.closePath();
+      ctx.fillStyle = isDark ? darkColor : (isLit ? litColor : color + 'bb');
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+export function decorateBuildingFacade(ctx, cam, buildingEntry, vr, seed = 0) {
+  const { p, r, engineH, tc } = buildingEntry;
+  const VU = 8;
+
+  const hw = tileHalfWidth(cam.zoom, cam.tileW);
+  if (hw < 6 || cam.tilt < 0.1) return;
+  if (!p || typeof p.x !== 'number' || !tc || !vr?.proj) return;
+
+  const snap = ((Math.round(cam.rotation / (Math.PI / 2)) % 4) + 4) % 4;
+  const [x, z, w, d, h] = [-r, -r, r * 2, r * 2, engineH];
+
+  const vp = (px, py, pz) => {
+    if (typeof buildingEntry.elev !== 'number') return null;
+    vr.beginTile(p.x, p.y, buildingEntry.elev);
+    const pt = vr.proj(px, py, pz);
+    return pt && typeof pt.x === 'number' ? pt : null;
+  };
+
+  let faceA, faceB;
+  if      (snap === 0) { faceA = [vp(x+w,0,z),   vp(x+w,h,z),   vp(x+w,h,z+d), vp(x+w,0,z+d)]; faceB = [vp(x,0,z+d),   vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)]; }
+  else if (snap === 1) { faceA = [vp(x,0,z+d),   vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)]; faceB = [vp(x,0,z),     vp(x,h,z),     vp(x,h,z+d),   vp(x,0,z+d)]; }
+  else if (snap === 2) { faceA = [vp(x,0,z),     vp(x,h,z),     vp(x,h,z+d),   vp(x,0,z+d)]; faceB = [vp(x,0,z),     vp(x+w,0,z),   vp(x+w,h,z),   vp(x,h,z)]; }
+  else                 { faceA = [vp(x,0,z),     vp(x+w,0,z),   vp(x+w,h,z),   vp(x,h,z)]; faceB = [vp(x+w,0,z),   vp(x+w,h,z),   vp(x+w,h,z+d), vp(x+w,0,z+d)]; }
+
+  const isValid = f => f.length === 4 && f.every(p => p && typeof p.x === 'number');
+  if (!isValid(faceA) || !isValid(faceB)) return;
+
+  const floors      = Math.max(1, Math.round((engineH / VU) * 0.7));
+  const colsA       = Math.max(2, Math.round(r / VU * 3));
+  const colsB       = Math.max(1, Math.round(r / VU * 2));
+  const winAlpha    = Math.min(1, (hw - 6) / 14) * Math.min(1, cam.tilt * 4);
+
+  if (winAlpha > 0.05) {
+    ctx.globalAlpha = winAlpha;
+    drawFacadeWindows(ctx, faceA, floors, colsA, '#c8e8ff', seed);
+    drawFacadeWindows(ctx, faceB, floors, colsB, '#c8e8ff', seed + 100);
+    ctx.globalAlpha = 1;
+  }
+
+  if (hw > 10) {
+    const pts = [vp(x,h,z), vp(x+w,h,z), vp(x+w,h,z+d), vp(x,h,z+d)];
+    if (pts.some(p => !p)) return;
+    ctx.beginPath();
+    pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+    ctx.closePath();
+    ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle   = shadeHex(tc.top, 0.85) + '88'; ctx.fill();
+  }
 }
 
 // ─── Loader ───────────────────────────────────────────────────────────────────
@@ -323,13 +451,6 @@ export class OSMTerrainLoader extends BaseLoader {
     // Pull collaborators from the engine so this loader stays decoupled
     // from specific import paths.
     this._terrainRegistry        = engine.terrainRegistry;
-    this._decorateBuildingFacade = engine._featR
-      ? (ctx, cam, entry, voxel, seed) => {
-          // Forward to whatever facade decorator the engine has registered
-          const { decorateBuildingFacade } = engine._featR.constructor ?? {};
-          // Fallback: the engine imports decorateBuildingFacade separately
-        }
-      : null;
   }
 
   get _endpoint() { return this._endpoints[this._endpointIdx % this._endpoints.length]; }
@@ -366,15 +487,32 @@ export class OSMTerrainLoader extends BaseLoader {
     }
 
     // ── Persistent cache ─────────────────────────────────────────────────────
+    // ── Persistent cache ─────────────────────────────────────────────────────
     const cacheKey = this._getCacheKey(geoCenter);
     try {
       const cached = await this._cache.get(cacheKey);
       const age    = Date.now() - (cached?.timestamp ?? 0);
       if (cached?.terrainUpdates && age < CACHE_TTL_MS) {
-        console.log(`[OSMTerrainLoader] Cache hit — ${cached.entities?.length ?? 0} entities`);
+        console.log(`[OSMTerrainLoader] Cache hit — rebuilding ${cached.entities?.length ?? 0} entities`);
+        // Reconstruct live entity defs from serialised data
+        const liveEntities = (cached.entities ?? []).map(e => {
+          // Only rebuild as a building if the stored type is 'building'
+          if (e._type === 'building') {
+            return makeBuildingDef(
+              { id: e.id, areaM2: e.areaM2 ?? 16, heightM: e.heightM ?? 8, centroid: { lat: e.latitude, lon: e.longitude } },
+              e.latitude, e.longitude,
+              this._mPerTile, this._terrainRegistry, decorateBuildingFacade
+            );
+          }
+          if (e.bpKey) {
+            return makeBlueprintDef(e.id, e.latitude, e.longitude, e.bpKey, e);
+          }
+          // POI
+          return makeFeatureDef(e);
+        });
         return {
           terrainUpdates: new Map(Object.entries(cached.terrainUpdates)),
-          entities:       cached.entities ?? [],
+          entities: liveEntities,
         };
       }
     } catch (err) { console.warn('[OSMTerrainLoader] Cache read error', err); }
@@ -523,7 +661,7 @@ export class OSMTerrainLoader extends BaseLoader {
           for (const b of buildings) {
             entityDefs.push(
               makeBuildingDef(b, b.centroid.lat, b.centroid.lon,
-                this._mPerTile, this._terrainRegistry, null)
+                this._mPerTile, this._terrainRegistry, decorateBuildingFacade)
             );
           }
         }
@@ -531,16 +669,28 @@ export class OSMTerrainLoader extends BaseLoader {
         console.log(`[OSMTerrainLoader] → ${terrainUpdates.size} terrain tiles, ${entityDefs.length} entities`);
 
         // ── Persist ──────────────────────────────────────────────────────────
-        // Note: renderFn closures cannot be serialised; we store the minimal
-        // data needed to reconstruct them on a cache hit.
+        // Store enough data to reconstruct entity defs on cache hit.
         try {
           await this._cache.set(cacheKey, {
             terrainUpdates: Object.fromEntries(terrainUpdates),
             entities:       entityDefs.map(e => ({
-              id:       e.id, latitude: e.latitude, longitude: e.longitude,
-              solid:    e.solid, bboxRadius: e.bboxRadius, _type: e._type,
-              label:    e.label, color: e.color, category: e.category,
-              value:    e.value, title: e.title,
+              id:        e.id,
+              latitude:  e.latitude,
+              longitude: e.longitude,
+              solid:     e.solid,
+              bboxRadius: e.bboxRadius,
+              _type:     e._isBuildingBox ? 'building' : (e.renderHeavy && e._bpKey ? 'blueprint' : 'poi'),
+              // Building reconstruction data
+              areaM2:    e._areaM2   ?? null,
+              heightM:   e._heightM  ?? null,
+              // Blueprint reconstruction data
+              bpKey:     e._bpKey    ?? null,
+              // POI display data
+              label:     e.label,
+              color:     e.color,
+              category:  e.category,
+              value:     e.value,
+              title:     e.title,
             })),
             timestamp: Date.now(),
           });

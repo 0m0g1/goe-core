@@ -33,39 +33,6 @@ function makeFlatDot(color) {
 
 // ─── Building facade helpers ─────────────────────────────────────────────────
 
-function hash(n) {
-  const x = Math.sin(n + 1) * 43758.5453;
-  return x - Math.floor(x);
-}
-
-function drawFacadeWindows(ctx, faceQuad, rows, cols, color, seed) {
-  const lerp  = (a, b, t) => a + (b - a) * t;
-  const lerpP = (p1, p2, t) => ({ x: lerp(p1.x, p2.x, t), y: lerp(p1.y, p2.y, t) });
-  const litColor  = '#fffcd0bb';
-  const darkColor = '#1a2a3a99';
-
-  ctx.save();
-  for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < cols; col++) {
-      const u0 = (col + 0.15) / cols, u1 = (col + 0.85) / cols;
-      const v0 = (row + 0.12) / rows, v1 = (row + 0.82) / rows;
-      const [A, B, C, D] = faceQuad;
-      const tl = lerpP(lerpP(A, B, u0), lerpP(D, C, u0), v0);
-      const tr = lerpP(lerpP(A, B, u1), lerpP(D, C, u1), v0);
-      const br = lerpP(lerpP(A, B, u1), lerpP(D, C, u1), v1);
-      const bl = lerpP(lerpP(A, B, u0), lerpP(D, C, u0), v1);
-      const isLit  = hash(seed * 31 + row * 7  + col * 13) > 0.35;
-      const isDark = hash(seed * 17 + row * 11 + col * 5)  > 0.8;
-      ctx.beginPath();
-      ctx.moveTo(tl.x, tl.y); ctx.lineTo(tr.x, tr.y);
-      ctx.lineTo(br.x, br.y); ctx.lineTo(bl.x, bl.y);
-      ctx.closePath();
-      ctx.fillStyle = isDark ? darkColor : (isLit ? litColor : color + 'bb');
-      ctx.fill();
-    }
-  }
-  ctx.restore();
-}
 
 // ─── Tree-type → blueprint key mapping ───────────────────────────────────────
 
@@ -301,52 +268,3 @@ export class FeatureRenderer {
 
 // ─── Building facade decorator ────────────────────────────────────────────────
 
-export function decorateBuildingFacade(ctx, cam, buildingEntry, vr, seed = 0) {
-  const { p, r, engineH, tc } = buildingEntry;
-  const VU = 8;
-
-  const hw = tileHalfWidth(cam.zoom, cam.tileW);
-  if (hw < 6 || cam.tilt < 0.1) return;
-  if (!p || typeof p.x !== 'number' || !tc || !vr?.proj) return;
-
-  const snap = ((Math.round(cam.rotation / (Math.PI / 2)) % 4) + 4) % 4;
-  const [x, z, w, d, h] = [-r, -r, r * 2, r * 2, engineH];
-
-  const vp = (px, py, pz) => {
-    if (typeof buildingEntry.elev !== 'number') return null;
-    vr.beginTile(p.x, p.y, buildingEntry.elev);
-    const pt = vr.proj(px, py, pz);
-    return pt && typeof pt.x === 'number' ? pt : null;
-  };
-
-  let faceA, faceB;
-  if      (snap === 0) { faceA = [vp(x+w,0,z),   vp(x+w,h,z),   vp(x+w,h,z+d), vp(x+w,0,z+d)]; faceB = [vp(x,0,z+d),   vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)]; }
-  else if (snap === 1) { faceA = [vp(x,0,z+d),   vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)]; faceB = [vp(x,0,z),     vp(x,h,z),     vp(x,h,z+d),   vp(x,0,z+d)]; }
-  else if (snap === 2) { faceA = [vp(x,0,z),     vp(x,h,z),     vp(x,h,z+d),   vp(x,0,z+d)]; faceB = [vp(x,0,z),     vp(x+w,0,z),   vp(x+w,h,z),   vp(x,h,z)]; }
-  else                 { faceA = [vp(x,0,z),     vp(x+w,0,z),   vp(x+w,h,z),   vp(x,h,z)]; faceB = [vp(x+w,0,z),   vp(x+w,h,z),   vp(x+w,h,z+d), vp(x+w,0,z+d)]; }
-
-  const isValid = f => f.length === 4 && f.every(p => p && typeof p.x === 'number');
-  if (!isValid(faceA) || !isValid(faceB)) return;
-
-  const floors      = Math.max(1, Math.round((engineH / VU) * 0.7));
-  const colsA       = Math.max(2, Math.round(r / VU * 3));
-  const colsB       = Math.max(1, Math.round(r / VU * 2));
-  const winAlpha    = Math.min(1, (hw - 6) / 14) * Math.min(1, cam.tilt * 4);
-
-  if (winAlpha > 0.05) {
-    ctx.globalAlpha = winAlpha;
-    drawFacadeWindows(ctx, faceA, floors, colsA, '#c8e8ff', seed);
-    drawFacadeWindows(ctx, faceB, floors, colsB, '#c8e8ff', seed + 100);
-    ctx.globalAlpha = 1;
-  }
-
-  if (hw > 10) {
-    const pts = [vp(x,h,z), vp(x+w,h,z), vp(x+w,h,z+d), vp(x,h,z+d)];
-    if (pts.some(p => !p)) return;
-    ctx.beginPath();
-    pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
-    ctx.closePath();
-    ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 1; ctx.stroke();
-    ctx.fillStyle   = shadeHex(tc.top, 0.85) + '88'; ctx.fill();
-  }
-}
