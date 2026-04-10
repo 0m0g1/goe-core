@@ -9,6 +9,9 @@ const DEFAULT_ENDPOINTS = [
   'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ];
 
+// Cache TTL — results older than this are considered stale and re-fetched
+const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
 function classifyOSM(tags) {
   if (!tags) return null;
   const { highway:h, surface:s, waterway:w, natural:n, landuse:l, leisure:le, building:b } = tags;
@@ -31,33 +34,24 @@ function classifyOSM(tags) {
       ['pitch','playground'].includes(le))
     return { terrain: TerrainType.GRASS, type:'polygon' };
   if (h) {
-    // 1. Identify Material
     const pavedSurfaces = ['asphalt', 'paved', 'concrete', 'chipseal', 'paving_stones'];
     const unpavedSurfaces = ['dirt', 'earth', 'ground', 'unpaved', 'mud', 'gravel', 'sand'];
 
-    let roadTerrain = TerrainType.ROAD_TARMAC; // Default
-    
-    // Check explicit surface tag
+    let roadTerrain = TerrainType.ROAD_TARMAC;
     if (unpavedSurfaces.includes(s)) {
       roadTerrain = TerrainType.ROAD_DIRT;
     } else if (pavedSurfaces.includes(s)) {
       roadTerrain = TerrainType.ROAD_TARMAC;
     } else {
-      // Fallback: Guess based on highway importance if surface is missing
       if (['track', 'path', 'bridleway'].includes(h)) roadTerrain = TerrainType.ROAD_DIRT;
     }
 
-    // 2. Determine Width/Importance
     if (h==='motorway'||h==='trunk'||h==='primary')
       return { terrain: roadTerrain, type:'line', width:3 };
-    
     if (h==='secondary'||h==='tertiary')
       return { terrain: roadTerrain, type:'line', width:2 };
-
     if (h==='footway'||h==='path'||h==='cycleway'||h==='pedestrian')
       return { terrain: TerrainType.PATH, type:'line', width:1 };
-
-    // Residential, Service, Tracks, and generic fallbacks
     return { terrain: roadTerrain, type:'line', width:1 };
   }
   if (b)
@@ -117,15 +111,15 @@ function classifyPOI(tags) {
   if (!tags) return null;
 
   if (tags.natural === 'tree') {
-    return { 
-      color: '#2a8a2a', 
-      label: 'Tree', 
-      category: 'natural', 
+    return {
+      color: '#2a8a2a',
+      label: 'Tree',
+      category: 'natural',
       value: 'tree',
-      renderMode: 'tree' // This tells FeatureRenderer to use TreeRenderer
+      renderMode: 'tree'
     };
   }
-  
+
   const cats = ['amenity','shop','tourism','historic','leisure','office','natural'];
   for (const cat of cats) {
     const val = tags[cat];
@@ -191,17 +185,54 @@ export class OSMTerrainLoader extends BaseLoader {
     this._backoffUntil = 0;
     this._abort        = null;
     this._cache        = new PersistentCache('GOE_Overpass', 'osm_terrain');
+
+    // Debounce: wait this many ms of silence before actually firing the request.
+    // Prevents hammering Overpass while the player walks continuously.
+    this._fetchDebounceMs = options.fetchDebounceMs ?? 800;
+    this._debounceTimer   = null;
+    this._pendingResolve  = null;
   }
 
   get _endpoint() { return this._endpoints[this._endpointIdx % this._endpoints.length]; }
   _nextEndpoint()  { this._endpointIdx = (this._endpointIdx + 1) % this._endpoints.length; }
 
   _getCacheKey({ lat, lon }) {
-    // ~100m precision grid — nearby positions share the same cache entry
-    return `overpass:${lat.toFixed(3)},${lon.toFixed(3)},r${this._fetchRadiusM}`;
+    // ~1.1 km precision grid — the player must move over a km before a new
+    // Overpass request fires. toFixed(3) was ~110 m which caused far too many
+    // cache misses during normal walking.
+    return `overpass:${lat.toFixed(2)},${lon.toFixed(2)},r${this._fetchRadiusM}`;
   }
 
-  async fetch(geoCenter) {
+  /**
+   * Public fetch — debounced. Returns a promise that resolves once the
+   * debounce period has elapsed and the real request completes.
+   */
+  fetch(geoCenter) {
+    // Cancel any pending debounce resolve so the old caller gets the same
+    // result as the new one (avoids dangling promises blocking the engine).
+    if (this._debounceTimer !== null) {
+      clearTimeout(this._debounceTimer);
+      this._debounceTimer = null;
+      // Resolve the previous pending promise with empty so it doesn't stall
+      if (this._pendingResolve) {
+        this._pendingResolve({});
+        this._pendingResolve = null;
+      }
+    }
+
+    return new Promise((resolve) => {
+      this._pendingResolve = resolve;
+      this._debounceTimer  = setTimeout(async () => {
+        this._debounceTimer  = null;
+        this._pendingResolve = null;
+        const result = await this._doFetch(geoCenter);
+        resolve(result);
+      }, this._fetchDebounceMs);
+    });
+  }
+
+  /** The real fetch implementation — unchanged logic, now private. */
+  async _doFetch(geoCenter) {
     if (this._abort) this._abort.abort();
     this._abort = new AbortController();
 
@@ -214,8 +245,9 @@ export class OSMTerrainLoader extends BaseLoader {
     const cacheKey = this._getCacheKey(geoCenter);
     try {
       const cached = await this._cache.get(cacheKey);
-      if (cached?.terrainUpdates) {
-        console.log(`[OSMTerrainLoader] Cache hit — ${Object.keys(cached.terrainUpdates).length} terrain, ${cached.features?.length ?? 0} POIs`);
+      const age    = Date.now() - (cached?.timestamp ?? 0);
+      if (cached?.terrainUpdates && age < CACHE_TTL_MS) {
+        console.log(`[OSMTerrainLoader] Cache hit (${Math.round(age / 1000)}s old) — ${Object.keys(cached.terrainUpdates).length} terrain, ${cached.features?.length ?? 0} POIs`);
         return {
           terrainUpdates: new Map(Object.entries(cached.terrainUpdates)),
           buildingWays:   cached.buildingWays ?? [],
@@ -229,9 +261,6 @@ export class OSMTerrainLoader extends BaseLoader {
     const r = this._fetchRadiusM;
     const around = `(around:${r},${lat},${lon})`;
 
-    // Split into two queries: terrain/buildings first, then POIs
-    // Using a union query — all in one request to avoid rate limits
-    // Using a union query — all in one request to avoid rate limits
     const q = `[out:json][timeout:60];(
       way["natural"~"^(water|wetland|beach|wood|grassland|heath|scrub)$"]${around};
       way["landuse"~"^(reservoir|basin|grass|meadow|village_green|allotments|forest|park|commercial|residential|retail|industrial)$"]${around};
@@ -280,14 +309,11 @@ export class OSMTerrainLoader extends BaseLoader {
         const buildingWays   = [];
         const features       = [];
 
-        // toTile converts lat/lon → global integer grid coords
-        // These match what TerrainCache.get(gx, gy) expects
         const toTile = (eLat, eLon) => ({
           x: lonToGlobalX(eLon, geoCenter.lat, this._mPerTile),
           y: latToGlobalY(eLat, this._mPerTile),
         });
 
-        // Precompute bounding box in global coords for fast POI culling
         const mLat = 111320;
         const mLon = 111320 * Math.cos(lat * Math.PI / 180);
         const rLat = r / mLat, rLon = r / mLon;
@@ -308,22 +334,21 @@ export class OSMTerrainLoader extends BaseLoader {
               if (el.tags?.building) buildingWays.push(el);
 
               if (el.tags?.highway && ['primary', 'secondary', 'tertiary', 'residential'].includes(el.tags.highway)) {
-                // Only spawn a car on roughly every 3rd road way to keep performance up
                 if (Math.random() > 0.6) {
-                   features.push({
-                      id: `car:${el.id}`,
-                      latitude: el.geometry[0].lat,
-                      longitude: el.geometry[0].lon,
-                      label: 'Car',
-                      data: {
-                        category: 'traffic',
-                        asset: 'car_voxel',
-                        path: el.geometry, // The actual GPS nodes of the road
-                        progress: Math.random() * (el.geometry.length - 1),
-                        speed: 0.1 + Math.random() * 0.2 // Variable speed
-                      },
-                      renderMode: 'blueprint'
-                   });
+                  features.push({
+                    id: `car:${el.id}`,
+                    latitude: el.geometry[0].lat,
+                    longitude: el.geometry[0].lon,
+                    label: 'Car',
+                    data: {
+                      category: 'traffic',
+                      asset: 'car_voxel',
+                      path: el.geometry,
+                      progress: Math.random() * (el.geometry.length - 1),
+                      speed: 0.1 + Math.random() * 0.2
+                    },
+                    renderMode: 'blueprint'
+                  });
                 }
               }
             }
@@ -334,7 +359,6 @@ export class OSMTerrainLoader extends BaseLoader {
             const poi = classifyPOI(el.tags);
             if (!poi) continue;
 
-            // Use global coords for bounds check — correct coordinate space
             const { x: gx, y: gy } = toTile(el.lat, el.lon);
             if (gx < minGX || gx > maxGX || gy < minGY || gy > maxGY) continue;
 
@@ -387,6 +411,15 @@ export class OSMTerrainLoader extends BaseLoader {
     return {};
   }
 
-  destroy()            { this._abort?.abort(); }
-  async clearCache()   { await this._cache.clear(); }
+  destroy() {
+    if (this._debounceTimer !== null) {
+      clearTimeout(this._debounceTimer);
+      this._debounceTimer = null;
+      this._pendingResolve?.({});
+      this._pendingResolve = null;
+    }
+    this._abort?.abort();
+  }
+
+  async clearCache() { await this._cache.clear(); }
 }

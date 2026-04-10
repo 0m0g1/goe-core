@@ -230,6 +230,7 @@ class FeatureEntity extends Entity {
     this.label = data.label || data.title || data.name || '';
     this.color = data.color || '#60a5fa';
     this.ftype = resolveFeatureType(this.label, data.tags || {}, this.color);
+    this.assetKey = data.asset || data.data?.asset || null;
 
     // Forward altitude properties from data
     this.altitudeM        = data.altitudeM        ?? 0;
@@ -244,6 +245,25 @@ class FeatureEntity extends Entity {
   }
 
   render(wr, groundElevPx, extra) {
+    // Check if this feature should be rendered as a 3D Voxel Blueprint
+    if (this.data.renderMode === 'blueprint' && this.assetKey) {
+      const blueprint = Blueprints[this.assetKey];
+      
+      if (blueprint) {
+        const depth = tileDepth(this.tx, this.ty, wr.cam.rotation);
+        const elev  = groundElevPx + this.elevOffset;
+
+        wr.submitWorldObject(depth, () => {
+          // You can add logic here to skip rendering if zoom is too low
+          // if (wr.cam.zoom < 0.08) return; 
+
+          wr.drawBlueprint(blueprint, this.tx, this.ty, elev);
+        });
+        return; // Exit so we don't draw the 2D icon/label on top of the model
+      }
+    }
+
+    // Fallback: Standard 2D Icon/Label rendering
     extra.featureResolver.drawFeature(
       wr, this, extra.selectedId === this.id, extra.terrainCache, extra.pGX, extra.pGY
     );
@@ -294,6 +314,38 @@ class BuildingEntity extends Entity {
         };
         extra.decorateFacade(wr.ctx, wr.cam, entry, wr._voxel, this._facadeSeed ?? 0);
       }
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FaunaEntity
+// ─────────────────────────────────────────────────────────────────────────────
+class FaunaEntity extends Entity {
+  constructor(id, tx, ty, assetKey = 'bird') {
+    super(id, 'fauna', tx, ty);
+    this.assetKey       = assetKey;
+    this.bboxRadius     = 0.25;
+    this.physicsEnabled = true;
+    this.fixed          = false; // They can be pushed by the player!
+    this.physicsRadius  = 0.25;
+    this.solid          = true;
+  }
+
+  render(wr, groundElevPx, extra) {
+    const blueprint = Blueprints[this.assetKey];
+    if (!blueprint) return;
+
+    const elev  = groundElevPx + this.elevOffset;
+    const depth = tileDepth(this.tx, this.ty, wr.cam.rotation);
+
+    wr.submitWorldObject(depth, () => {
+      // Fade out at low tilts just like trees
+      if (wr.cam.tilt < 0.04) return;
+      const isoA = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
+      wr.ctx.globalAlpha = isoA;
+      wr.drawBlueprint(blueprint, this.tx, this.ty, elev);
+      wr.ctx.globalAlpha = 1;
     });
   }
 }

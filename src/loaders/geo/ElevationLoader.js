@@ -9,6 +9,10 @@
  *   • AWS Terrarium (S3 elevation-tiles-prod) — same formula as Nextzen
  *
  * Persistent cache stores raw pixel data in IndexedDB to avoid re-downloading.
+ *
+ * Concurrency: tile fetches are limited to MAX_CONCURRENT_FETCHES in-flight at
+ * once. Without this, a large PRE_RADIUS triggers a burst that can hit provider
+ * rate limits and slow down the initial load.
  */
 import { latLonToSlippy } from '../../math/geo.js';
 import { PersistentCache } from '../../core/PersistentCache.js';
@@ -18,10 +22,11 @@ export const ElevationFormat = Object.freeze({
   MAPBOX:    'mapbox',
 });
 
-const TILE_ZOOM   = 13;   // ~10 m/px resolution
-const PRE_RADIUS  = 1;    // pre-warm N tiles in each direction
+const TILE_ZOOM            = 13;   // ~10 m/px resolution
+const PRE_RADIUS           = 1;    // pre-warm N tiles in each direction
+const MAX_CONCURRENT_FETCHES = 4;  // max in-flight tile requests at once
 
-// In‑memory promise cache (for concurrent requests)
+// In-memory promise cache (for concurrent requests within a single session)
 const _inFlight = new Map();
 
 // ─── DECODE ──────────────────────────────────────────────────────────────────
@@ -41,7 +46,7 @@ export class ElevationLoader {
     this._urlFn    = urlFn;
     this._format   = format;
     this._mPerTile = mPerTile;
-    this._resolved = new Map(); // key → ImageData (in‑memory)
+    this._resolved = new Map(); // key → ImageData (in-memory)
     this._status   = 'idle';
     this._lastCenter = null;
     this._persistCache = new PersistentCache('GOE_Elevation', 'tiles');
@@ -55,15 +60,15 @@ export class ElevationLoader {
   }
 
   /**
-   * Load a single tile from network or cache.
+   * Load a single tile from in-memory cache → IndexedDB → network.
    * @param {string} url
-   * @param {string} key   e.g. "13/123/456"
+   * @param {string} key  e.g. "13/123/456"
    * @returns {Promise<ImageData>}
    */
   async _loadTile(url, key) {
-    // 1. In‑memory cache (fast)
+    // 1. In-memory cache (fast path)
     if (this._resolved.has(key)) return this._resolved.get(key);
-    // 2. Prevent duplicate concurrent requests
+    // 2. Prevent duplicate concurrent requests for the same tile
     if (_inFlight.has(key)) return _inFlight.get(key);
 
     const promise = (async () => {
@@ -93,11 +98,10 @@ export class ElevationLoader {
           const ctx = c.getContext('2d');
           ctx.drawImage(img, 0, 0, 256, 256);
           const imageData = ctx.getImageData(0, 0, 256, 256);
-          // Store in persistent cache (convert typed array to plain array)
           const toStore = {
-            data: Array.from(imageData.data),
-            width: imageData.width,
-            height: imageData.height
+            data:   Array.from(imageData.data),
+            width:  imageData.width,
+            height: imageData.height,
           };
           this._persistCache.set(key, toStore).catch(err => {
             console.warn(`[ElevationLoader] Failed to cache ${key}:`, err);
@@ -111,40 +115,65 @@ export class ElevationLoader {
     })();
 
     _inFlight.set(key, promise);
-    const result = await promise;
-    _inFlight.delete(key);
-    return result;
+    try {
+      return await promise;
+    } finally {
+      _inFlight.delete(key);
+    }
+  }
+
+  /**
+   * Run an array of async task factories with at most `limit` in-flight.
+   * Each element of `tasks` is a zero-argument function returning a Promise.
+   * @param {Array<()=>Promise<any>>} tasks
+   * @param {number} limit
+   * @returns {Promise<void>}
+   */
+  async _pooled(tasks, limit = MAX_CONCURRENT_FETCHES) {
+    let idx = 0;
+    const worker = async () => {
+      while (idx < tasks.length) {
+        const i = idx++;
+        await tasks[i]().catch(() => {}); // missing tile → silent
+      }
+    };
+    // Spin up `limit` workers that each pull from the shared idx counter
+    await Promise.all(
+      Array.from({ length: Math.min(limit, tasks.length) }, worker)
+    );
   }
 
   /**
    * Pre-fetch tiles around a geo centre.
+   * Uses a concurrency pool so at most MAX_CONCURRENT_FETCHES tiles are
+   * in-flight at once instead of launching them all simultaneously.
    * @param {{ lat:number, lon:number }} geoCenter
    * @returns {Promise<void>}
    */
   async prefetch(geoCenter) {
     // Skip if centre hasn't moved meaningfully
     const prev = this._lastCenter;
-    if (prev && Math.abs(prev.lat-geoCenter.lat)<0.001 && Math.abs(prev.lon-geoCenter.lon)<0.001)
+    if (prev && Math.abs(prev.lat - geoCenter.lat) < 0.001 && Math.abs(prev.lon - geoCenter.lon) < 0.001)
       return;
     this._lastCenter = geoCenter;
     this._status = 'loading';
 
     const { tileX, tileY } = latLonToSlippy(geoCenter.lat, geoCenter.lon, TILE_ZOOM);
-    const fetches = [];
 
+    // Collect tasks (factories, not promises — so we can control concurrency)
+    const tasks = [];
     for (let dx = -PRE_RADIUS; dx <= PRE_RADIUS; dx++) {
       for (let dy = -PRE_RADIUS; dy <= PRE_RADIUS; dy++) {
-        const x = tileX + dx, y = tileY + dy;
+        const x   = tileX + dx;
+        const y   = tileY + dy;
         const key = `${TILE_ZOOM}/${x}/${y}`;
-        if (this._resolved.has(key)) continue;
+        if (this._resolved.has(key)) continue; // already loaded
         const url = this._urlFn(TILE_ZOOM, x, y);
-        fetches.push(
-          this._loadTile(url, key).catch(() => {}) // missing tile → silent
-        );
+        tasks.push(() => this._loadTile(url, key));
       }
     }
 
-    await Promise.allSettled(fetches);
+    await this._pooled(tasks, MAX_CONCURRENT_FETCHES);
     this._status = 'ready';
   }
 
@@ -161,9 +190,9 @@ export class ElevationLoader {
     const id  = this._resolved.get(key);
     if (!id) return 0;
 
-    const px  = Math.min(255, Math.floor((x - tileX) * 256));
-    const py  = Math.min(255, Math.floor((y - tileY) * 256));
-    const idx = (py * 256 + px) * 4;
+    const px    = Math.min(255, Math.floor((x - tileX) * 256));
+    const py    = Math.min(255, Math.floor((y - tileY) * 256));
+    const idx   = (py * 256 + px) * 4;
     const elevM = this._decode(id.data[idx], id.data[idx+1], id.data[idx+2]);
     return Math.max(-50, Math.min(8850, elevM));
   }
@@ -182,10 +211,10 @@ export class ElevationLoader {
     return this.toTileHeight(this.sampleElevation(lat, lon));
   }
 
-  /** Clear both in‑memory and persistent caches. */
+  /** Clear both in-memory and persistent caches. */
   async clearCache() {
     this._resolved.clear();
-    _inFlight.clear(); // clear pending promise cache
+    _inFlight.clear();
     await this._persistCache.clear();
     this._lastCenter = null;
     this._status = 'idle';
