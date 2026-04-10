@@ -245,9 +245,27 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
 
 /** Standard 2D icon POI feature — self-contained renderFn, no external resolver */
 function makeFeatureDef(f) {
-  const ftype = resolveFeatureType?.(f.label, f.tags ?? {}, f.color) ?? null;
+  // Find the first candidate (title, label, category) that exists as a key in Blueprints
+  let blueprint = null;
+  let blueprintKey = null;
+  const candidates = [f.title, f.label, f.category];
+  for (const candidate of candidates) {
+    if (candidate && typeof candidate === 'string') {
+      const key = candidate.toLowerCase().replace(/\s+/g, '_'); // replace all spaces with underscore
+      if (Blueprints[key]) {
+        blueprintKey = key;
+        blueprint = Blueprints[key];
+        break;
+      }
+    }
+  }
+
   const color = f.color ?? '#60a5fa';
   const label = f.label ?? f.title ?? '';
+
+  if (!blueprintKey && (f.title || f.label || f.category)) {
+    console.warn(`${f.title}, ${label}, ${f.category}} is missing a blueprint`);
+  }
 
   return {
     id:        f.id,
@@ -264,7 +282,6 @@ function makeFeatureDef(f) {
     category: f.category,
     value:    f.value,
     title:    f.title,
-    ftype,
 
     renderFn(wr, groundElevPx, extra, entity) {
       const { cam } = wr;
@@ -273,8 +290,16 @@ function makeFeatureDef(f) {
       const depth = entity.tx * Math.cos(cam.rotation) + entity.ty * Math.sin(cam.rotation);
       const hw    = tileHalfWidth(cam.zoom, cam.tileW);
       const r     = Math.max(3, hw * 0.7);
+      const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
 
       wr.submitWorldObject(depth, () => {
+        if (blueprint) {
+          wr.submitWorldObject(depth, () => {
+            wr.ctx.globalAlpha = isoA;
+            wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
+            wr.ctx.globalAlpha = 1;
+          });
+        }
         const { x, y } = worldToScreen(entity.tx + 0.5, entity.ty + 0.5, elev, cam);
         const ctx = wr.ctx;
 
@@ -486,7 +511,6 @@ export class OSMTerrainLoader extends BaseLoader {
       return {};
     }
 
-    // ── Persistent cache ─────────────────────────────────────────────────────
     // ── Persistent cache ─────────────────────────────────────────────────────
     const cacheKey = this._getCacheKey(geoCenter);
     try {

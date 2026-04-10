@@ -528,6 +528,595 @@ const NPC_PERSON = [
   { x: -0.5, y:  4.9,z: -0.5, w:  1,  h:  0.4,d:  1,  ...C('#5D4037','#3E2723','#4E342E') },
 ];
 
+// ── Missing from original "Utilities" ──────────────────────────────────────
+
+const RECYCLING = [
+  { x: -3, y: 0, z: -1, w: 2, h: 3, d: 2, top: '#2266cc', right: '#1155bb', front: '#1155bb' }, // Blue Bin
+  { x: 1, y: 0, z: -1, w: 2, h: 3, d: 2, top: '#5a8a5a', right: '#4a7a4a', front: '#4a7a4a' } // Green Bin
+];
+
+const TOILETS = [
+  { x: -3, y: 0, z: -2, w: 6, h: 6, d: 4, top: '#f0f0f0', right: '#d0d0d0', front: '#e0e0e0' }, // Building
+  { x: -2, y: 1, z: 2, w: 1.5, h: 4, d: 0.2, top: '#6688cc', right: '#4466aa', front: '#4466aa' }, // Door M
+  { x: 0.5, y: 1, z: 2, w: 1.5, h: 4, d: 0.2, top: '#ee66aa', right: '#cc4488', front: '#cc4488' } // Door F
+];
+
+// ── Missing from "Food & Drink" ────────────────────────────────────────────
+
+const CAFE = [
+  { x: -4, y: 0, z: -4, w: 8, h: 6, d: 8, top: '#f5f5f5', right: '#ddd', front: '#eee' }, // Building
+  { x: -5, y: 5, z: -5, w: 10, h: 1, d: 2, top: '#d4813a', right: '#a06030', front: '#c8843c' }, // Awning
+  { x: -3, y: 0, z: 5,  w: 2, h: 2, d: 2, top: '#8D6E63', right: '#5D4037', front: '#6D4C41' }  // Outside Table
+];
+
+const RESTAURANT = [
+  { x: -6, y: 0, z: -5, w: 12, h: 7, d: 10, top: '#e8e8e8', right: '#cccccc', front: '#dddddd' }, // Building
+  { x: -7, y: 5, z: -6, w: 14, h: 1, d: 2, top: '#cc2222', right: '#aa1111', front: '#bb1111' } // Red Awning
+];
+
+const FAST_FOOD = [
+  { x: -5, y: 0, z: -5, w: 10, h: 6, d: 10, top: '#fff', right: '#ddd', front: '#eee' }, // Building
+  { x: -1, y: 6, z: -1, w: 2, h: 4, d: 2, top: '#e0a020', right: '#c08010', front: '#d09015' } // Yellow Sign Pillar
+];
+
+const BAR = [
+  { x: -4, y: 0, z: -4, w: 8, h: 6, d: 8, top: '#4a3a30', right: '#2a1a10', front: '#3a2a20' }, // Dark Wood Building
+  { x: -2, y: 4, z: 4, w: 4, h: 1.5, d: 0.5, top: '#aa6622', right: '#884411', front: '#ffaa44' } // Neon Sign Area
+];
+
+const PUB = [
+  { x: -5, y: 0, z: -4, w: 10, h: 7, d: 8, top: '#5c4033', right: '#3c2013', front: '#4c3023' }, // Brick/Wood
+  { x: -1.5, y: 2, z: 4, w: 3, h: 4, d: 0.2, top: '#222', right: '#111', front: '#333' } // Pub Door
+];
+
+const FOOD_COURT = [
+  { x: -8, y: 0, z: -8, w: 16, h: 5, d: 16, top: '#eee', right: '#ccc', front: '#ddd' }, // Large Hall
+  { x: -4, y: 5, z: -4, w: 8, h: 2, d: 8, top: '#cc8822', right: '#aa6611', front: '#bb771a' } // Raised Roof
+];
+
+const ICE_CREAM = [
+  { x: -2, y: 0, z: -2, w: 4, h: 3, d: 4, top: '#fff', right: '#eee', front: '#f5f5f5' }, // Stand Base
+  { x: -2.5, y: 3, z: -2.5, w: 5, h: 1, d: 5, top: '#f0a0c0', right: '#d080a0', front: '#e090b0' } // Pink Canopy
+];
+
+// ── Missing from "Health" ───────────────────────────────────────────────────
+
+const HOSPITAL = [
+  { x: -6, y: 0, z: -6, w: 12, h: 12, d: 12, top: '#fff', right: '#ccc', front: '#eee' }, // Main Block
+  { x: -1, y: 5, z: 6,  w: 2, h: 6,  d: 1, top: '#ee2222', right: '#cc0000', front: '#cc0000' }, // Red Cross V
+  { x: -3, y: 7, z: 6,  w: 6, h: 2,  d: 1, top: '#ee2222', right: '#cc0000', front: '#cc0000' }  // Red Cross H
+];
+
+const DOCTORS = [
+  { x: -4, y: 0, z: -4, w: 8, h: 6, d: 8, top: '#f0f4f8', right: '#d0d4d8', front: '#e0e4e8' }, // Clean Building
+  { x: -2, y: 6, z: -1, w: 4, h: 1, d: 2, top: '#2244cc', right: '#1133aa', front: '#1133aa' } // Blue Sign
+];
+
+const DENTIST = [
+  { x: -3, y: 0, z: -3, w: 6, h: 6, d: 6, top: '#ffffff', right: '#e0e0e0', front: '#f0f0f0' }, // White Building
+  { x: -1, y: 2, z: 3, w: 2, h: 2, d: 0.5, top: '#3366dd', right: '#2255bb', front: '#3366dd' } // Tooth/Sign Plate
+];
+
+const PHARMACY = [
+  { x: -3, y: 0, z: -3, w: 6, h: 5, d: 6, top: '#fff', right: '#ddd', front: '#eee' }, // Shop
+  { x: -0.5, y: 5, z: -0.5, w: 1, h: 3, d: 1, top: '#22cc44', right: '#11aa33', front: '#11aa33' }, // Green Cross V
+  { x: -1.5, y: 6, z: -0.5, w: 3, h: 1, d: 1, top: '#22cc44', right: '#11aa33', front: '#11aa33' }  // Green Cross H
+];
+
+const VETERINARY = [
+  { x: -4, y: 0, z: -4, w: 8, h: 5, d: 8, top: '#eef8ee', right: '#cce8cc', front: '#ddf0dd' }, // Light Green Building
+  { x: -1.5, y: 5, z: -1.5, w: 3, h: 1.5, d: 3, top: '#44aa44', right: '#338833', front: '#338833' } // Dark Green Roof Acc.
+];
+
+const CLINIC = [
+  { x: -5, y: 0, z: -4, w: 10, h: 7, d: 8, top: '#f5f5f5', right: '#d5d5d5', front: '#e5e5e5' },
+  { x: -2, y: 7, z: -1, w: 4, h: 1.5, d: 2, top: '#2288cc', right: '#1166aa', front: '#1166aa' } // Light Blue Sign
+];
+
+// ── Missing from "Education" ────────────────────────────────────────────────
+
+const SCHOOL = [
+  { x: -6, y: 0, z: -3, w: 12, h: 6, d: 6, top: '#d2b48c', right: '#b09070', front: '#c0a080' }, // Brick Main
+  { x: -1, y: 6, z: -1, w: 2, h: 3, d: 2, top: '#e0a020', right: '#c08010', front: '#c08010' } // Bell Tower
+];
+
+const UNIVERSITY = [
+  { x: -8, y: 0, z: -6, w: 16, h: 8, d: 12, top: '#c8b8a8', right: '#a89888', front: '#b8a898' }, // Stone Building
+  { x: -3, y: 8, z: -3, w: 6, h: 4, d: 6, top: '#cc8800', right: '#aa6600', front: '#aa6600' } // Dome/Gold Top
+];
+
+const COLLEGE = [
+  { x: -7, y: 0, z: -5, w: 14, h: 7, d: 10, top: '#ddd', right: '#bbb', front: '#ccc' },
+  { x: -5, y: 7, z: -4, w: 10, h: 2, d: 8, top: '#cc9900', right: '#aa7700', front: '#bb8800' } // Roof
+];
+
+const LIBRARY = [
+  { x: -5, y: 0, z: -4, w: 10, h: 6, d: 8, top: '#eee', right: '#ccc', front: '#ddd' }, // Building
+  { x: -4, y: 0, z: 4, w: 1, h: 6, d: 1, top: '#8866aa', right: '#664488', front: '#664488' }, // Pillar L
+  { x: 3, y: 0, z: 4, w: 1, h: 6, d: 1, top: '#8866aa', right: '#664488', front: '#664488' } // Pillar R
+];
+
+const KINDERGARTEN = [
+  { x: -4, y: 0, z: -3, w: 4, h: 4, d: 6, top: '#ff99aa', right: '#dd7788', front: '#ee8899' }, // Pink Block
+  { x: 0, y: 0, z: -3, w: 4, h: 3, d: 6, top: '#88ccff', right: '#66aadd', front: '#77bbdd' } // Blue Block
+];
+
+// ── Missing from "Civic/Religion" ───────────────────────────────────────────
+
+const PLACE_OF_WORSHIP = [
+  { x: -5, y: 0, z: -5, w: 10, h: 6, d: 10, top: '#f0e8d0', right: '#d0c8b0', front: '#e0d8c0' }, // Base
+  { x: -3, y: 6, z: -3, w: 6,  h: 12, d: 6,  top: '#f0e8d0', right: '#d0c8b0', front: '#e0d8c0' }, // Tower
+  { x: -0.5, y: 18, z: -0.5, w: 1, h: 4, d: 1, top: '#8a6020', right: '#6a4010', front: '#7a5010' } // Spire/Cross
+];
+
+const POLICE = [
+  { x: -5, y: 0, z: -4, w: 10, h: 6, d: 8, top: '#ddd', right: '#bbb', front: '#ccc' }, // Station
+  { x: -1, y: 6, z: -1, w: 2, h: 1.5, d: 2, top: '#2244aa', right: '#113388', front: '#113388' } // Blue Light
+];
+
+const FIRE_STATION = [
+  { x: -6, y: 0, z: -5, w: 12, h: 6, d: 10, top: '#e0dede', right: '#c0c0c0', front: '#d0d0d0' }, // Station
+  { x: -4, y: 0, z: 5, w: 3, h: 4, d: 0.5, top: '#cc2200', right: '#aa1100', front: '#bb1100' }, // Red Door 1
+  { x: 1, y: 0, z: 5, w: 3, h: 4, d: 0.5, top: '#cc2200', right: '#aa1100', front: '#bb1100' }  // Red Door 2
+];
+
+const TOWNHALL = [
+  { x: -6, y: 0, z: -5, w: 12, h: 8, d: 10, top: '#e0d8c8', right: '#c0b8a8', front: '#d0c8b8' }, // Hall
+  { x: -2, y: 8, z: -2, w: 4, h: 6, d: 4, top: '#887744', right: '#665522', front: '#776633' } // Dome/Tower
+];
+
+const COURTHOUSE = [
+  { x: -7, y: 0, z: -6, w: 14, h: 6, d: 12, top: '#cfcfcf', right: '#afafaf', front: '#bfbfbf' }, // Base
+  { x: -7, y: 6, z: -6, w: 14, h: 2, d: 12, top: '#998855', right: '#776633', front: '#887744' } // Heavy Roof
+];
+
+const POST_OFFICE = [
+  { x: -4, y: 0, z: -4, w: 8, h: 5, d: 8, top: '#eee', right: '#ccc', front: '#ddd' }, // Office
+  { x: -4, y: 4, z: 4, w: 8, h: 1, d: 0.5, top: '#cc4400', right: '#aa3300', front: '#bb3300' } // Red/Orange Trim
+];
+
+// ── Missing from "Transport" ────────────────────────────────────────────────
+
+const FUEL = [
+  { x: -3, y: 0, z: -2, w: 6, h: 8, d: 4, top: '#ee8822', right: '#cc6600', front: '#dd7711' }, // Pump Body
+  { x: -2, y: 4, z: 2, w: 4, h: 3, d: 0.5, top: '#111', right: '#000', front: '#000' }         // Screen
+];
+
+const PARKING = [
+  { x: -8, y: 0, z: -8, w: 16, h: 0.2, d: 16, top: '#555', right: '#333', front: '#444' }, // Asphalt Flat
+  { x: -6, y: 0.2, z: -6, w: 0.5, h: 0.1, d: 4, top: '#fff', right: '#eee', front: '#eee' }, // Line 1
+  { x: -2, y: 0.2, z: -6, w: 0.5, h: 0.1, d: 4, top: '#fff', right: '#eee', front: '#eee' }, // Line 2
+  { x: 2, y: 0.2, z: -6, w: 0.5, h: 0.1, d: 4, top: '#fff', right: '#eee', front: '#eee' }   // Line 3
+];
+
+const BICYCLE_PARKING = [
+  { x: -3, y: 0, z: -0.5, w: 6, h: 0.2, d: 1, top: '#888', right: '#666', front: '#777' }, // Base Slab
+  { x: -2, y: 0, z: -0.2, w: 0.5, h: 2, d: 0.4, top: '#4488aa', right: '#336688', front: '#336688' }, // Rack 1
+  { x: 0, y: 0, z: -0.2, w: 0.5, h: 2, d: 0.4, top: '#4488aa', right: '#336688', front: '#336688' },  // Rack 2
+  { x: 2, y: 0, z: -0.2, w: 0.5, h: 2, d: 0.4, top: '#4488aa', right: '#336688', front: '#336688' }   // Rack 3
+];
+
+// ── Missing from "Shops" ────────────────────────────────────────────────────
+
+const SUPERMARKET = [
+  { x: -8, y: 0, z: -8, w: 16, h: 7, d: 16, top: '#e0e0e0', right: '#c0c0c0', front: '#d0d0d0' }, // Big Box
+  { x: -4, y: 5, z: 8, w: 8, h: 2, d: 0.5, top: '#2266cc', right: '#1155bb', front: '#1155bb' } // Blue Branding
+];
+
+const CONVENIENCE = [
+  { x: -4, y: 0, z: -4, w: 8, h: 5, d: 8, top: '#f0f0f0', right: '#d0d0d0', front: '#e0e0e0' }, // Shop
+  { x: -5, y: 4, z: -5, w: 10, h: 1, d: 2, top: '#e05080', right: '#c03060', front: '#d04070' } // Pink Awning
+];
+
+const CLOTHES = [
+  { x: -4, y: 0, z: -4, w: 8, h: 6, d: 8, top: '#eee', right: '#ccc', front: '#ddd' }, 
+  { x: -5, y: 4, z: -5, w: 10, h: 1, d: 2, top: '#cc44cc', right: '#aa22aa', front: '#bb33bb' } // Purple Awning
+];
+
+const BAKERY = [
+  { x: -3, y: 0, z: -3, w: 6, h: 5, d: 6, top: '#f5f5f5', right: '#d5d5d5', front: '#e5e5e5' },
+  { x: -4, y: 3, z: -4, w: 8, h: 1, d: 2, top: '#cc8833', right: '#aa6611', front: '#bb7722' } // Orange Awning
+];
+
+const BUTCHER = [
+  { x: -3, y: 0, z: -3, w: 6, h: 5, d: 6, top: '#f0f0f0', right: '#d0d0d0', front: '#e0e0e0' },
+  { x: -4, y: 3, z: -4, w: 8, h: 1, d: 2, top: '#cc4444', right: '#aa2222', front: '#bb3333' } // Red Awning
+];
+
+const BOOKSHOP = [
+  { x: -4, y: 0, z: -4, w: 8, h: 5, d: 8, top: '#e8e8e8', right: '#c8c8c8', front: '#d8d8d8' },
+  { x: -5, y: 4, z: -5, w: 10, h: 1, d: 2, top: '#885588', right: '#663366', front: '#774477' } // Plumb Awning
+];
+
+const ELECTRONICS = [
+  { x: -5, y: 0, z: -4, w: 10, h: 6, d: 8, top: '#ddd', right: '#bbb', front: '#ccc' },
+  { x: -5, y: 5, z: 4, w: 10, h: 1.5, d: 0.5, top: '#2299cc', right: '#1177aa', front: '#1188bb' } // Cyan Sign
+];
+
+const HARDWARE = [
+  { x: -6, y: 0, z: -5, w: 12, h: 6, d: 10, top: '#dcdcdc', right: '#bcbcbc', front: '#cccccc' },
+  { x: -6, y: 5, z: 5, w: 12, h: 1.5, d: 0.5, top: '#997733', right: '#775511', front: '#886622' } // Brown Sign
+];
+
+const FLORIST = [
+  { x: -3, y: 0, z: -3, w: 6, h: 5, d: 6, top: '#f0f8f0', right: '#d0e8d0', front: '#e0f0e0' },
+  { x: -4, y: 3, z: -4, w: 8, h: 1, d: 2, top: '#ee66aa', right: '#cc4488', front: '#dd5599' }, // Pink Awning
+  { x: -2, y: 0, z: 3, w: 4, h: 2, d: 2, top: '#3a9a3a', right: '#2a7a2a', front: '#2a8a2a' } // Outside Plants
+];
+
+const HAIRDRESSER = [
+  { x: -3, y: 0, z: -3, w: 6, h: 5, d: 6, top: '#fafafa', right: '#dadada', front: '#eaeaea' },
+  { x: -4, y: 4, z: -4, w: 8, h: 1, d: 2, top: '#aa66cc', right: '#8844aa', front: '#9955bb' } // Lavender Awning
+];
+
+// ── Missing from "Leisure / Parks / Nature" ─────────────────────────────────
+
+const GARDEN = [
+  { x: -4, y: 0, z: -4, w: 8, h: 0.2, d: 8, top: '#4aaa2a', right: '#3a8a1a', front: '#3a9a1a' }, // Grass
+  { x: -3, y: 0.2, z: -1, w: 2, h: 1, d: 2, top: '#e05080', right: '#c03060', front: '#d04070' }, // Flower Bed 1
+  { x: 1, y: 0.2, z: -1, w: 2, h: 1, d: 2, top: '#ee66aa', right: '#cc4488', front: '#dd5599' }   // Flower Bed 2
+];
+
+const PLAYGROUND = [
+  { x: -4, y: 0, z: -4, w: 8, h: 0.2, d: 8, top: '#ddaa77', right: '#bb8855', front: '#cc9966' }, // Sand Base
+  { x: -2, y: 0.2, z: -1, w: 4, h: 3, d: 2, top: '#e08833', right: '#c06611', front: '#d07722' } // Play Structure
+];
+
+const SPORTS_CENTRE = [
+  { x: -8, y: 0, z: -6, w: 16, h: 6, d: 12, top: '#eee', right: '#ccc', front: '#ddd' }, // Hall
+  { x: -6, y: 6, z: -4, w: 12, h: 2, d: 8, top: '#2288aa', right: '#116688', front: '#117799' } // Curved/Blue Roof
+];
+
+const SWIMMING_POOL = [
+  { x: -6, y: 0, z: -4, w: 12, h: 0.5, d: 8, top: '#f0f0f0', right: '#d0d0d0', front: '#e0e0e0' }, // Tiling
+  { x: -5, y: 0.1, z: -3, w: 10, h: 0.5, d: 6, top: '#22aacc', right: '#1188aa', front: '#1199bb' } // Water Area
+];
+
+const PITCH = [
+  { x: -8, y: 0, z: -5, w: 16, h: 0.2, d: 10, top: '#2a8a2a', right: '#1a6a1a', front: '#1a7a1a' }, // Grass Field
+  { x: -7, y: 0.2, z: -2, w: 1, h: 2, d: 4, top: '#fff', right: '#eee', front: '#eee' }, // Goal 1
+  { x: 6, y: 0.2, z: -2, w: 1, h: 2, d: 4, top: '#fff', right: '#eee', front: '#eee' }   // Goal 2
+];
+
+const WOOD = [ // Alias of forest for variety
+  { x: -1, y: 0, z: -1, w: 2, h: 4, d: 2, top: '#4c3023', right: '#2c1003', front: '#3c2013' }, // Thick Trunk
+  { x: -3, y: 4, z: -3, w: 6, h: 5, d: 6, top: '#1a5a1a', right: '#0a3a0a', front: '#0a4a0a' } // Dense Canopy
+];
+
+// ── Missing from "Tourism" ──────────────────────────────────────────────────
+
+const ATTRACTION = [
+  { x: -4, y: 0, z: -4, w: 8, h: 2, d: 8, top: '#ccc', right: '#aaa', front: '#bbb' }, // Base
+  { x: -2, y: 2, z: -2, w: 4, h: 10, d: 4, top: '#dd8800', right: '#bb6600', front: '#cc7700' }, // Tower/Feature
+  { x: -3, y: 12, z: -3, w: 6, h: 2, d: 6, top: '#ffaa22', right: '#dd8800', front: '#ee9911' } // Top Accent
+];
+
+const MUSEUM = [
+  { x: -6, y: 0, z: -5, w: 12, h: 6, d: 10, top: '#f0f0f0', right: '#d0d0d0', front: '#e0e0e0' }, // Classic Build
+  { x: -5, y: 0, z: 5, w: 1.5, h: 6, d: 1.5, top: '#996633', right: '#774411', front: '#885522' }, // Column L
+  { x: 3.5, y: 0, z: 5, w: 1.5, h: 6, d: 1.5, top: '#996633', right: '#774411', front: '#885522' } // Column R
+];
+
+const HOTEL  = [
+  { x: -5, y: 0, z: -5, w: 10, h: 12, d: 10, top: '#e8e4e0', right: '#c8c4c0', front: '#d8d4d0' }, // Tall Tower
+  { x: -6, y: 0, z: -6, w: 12, h: 2, d: 12, top: '#886622', right: '#664400', front: '#775511' } // Lobby/Base Gold Theme
+];
+
+const VIEWPOINT = [
+  { x: -3, y: 0, z: -3, w: 6, h: 1, d: 6, top: '#8a6020', right: '#6a4010', front: '#7a5010' }, // Wooden Deck
+  { x: -2, y: 1, z: 2, w: 4, h: 3, d: 0.5, top: '#ff8844', right: '#dd6622', front: '#ee7733' } // Info/Viewing Board
+];
+
+const INFORMATION = [
+  { x: -2, y: 0, z: -2, w: 4, h: 4, d: 4, top: '#eee', right: '#ccc', front: '#ddd' }, // Booth
+  { x: -2.5, y: 4, z: -2.5, w: 5, h: 1, d: 5, top: '#2288aa', right: '#116688', front: '#117799' } // Blue Roof (i sign)
+]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC SHOP  (approx. 8 m wide × 6 m deep × 5 m tall → 32 × 24 × 20 VU)
+// ─────────────────────────────────────────────────────────────────────────────
+const SHOP = [
+  // Main building
+  { x: -16, y: 0, z: -12, w: 32, h: 20, d: 24, top: '#F5F5F5', right: '#E0E0E0', front: '#EEEEEE' },
+  // Roof / canopy
+  { x: -18, y: 20, z: -14, w: 36, h: 2, d: 28, top: '#FFB74D', right: '#FFA726', front: '#FF9800' },
+  // Shop window (front)
+  { x: -14, y: 4, z: 12, w: 28, h: 12, d: 0.5, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' },
+  // Door
+  { x: -2, y: 0, z: 12, w: 4, h: 8, d: 0.5, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
+  // Signboard
+  { x: -10, y: 17, z: 12.2, w: 20, h: 3, d: 0.3, top: '#FDD835', right: '#F9A825', front: '#FFEE58' },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC AMENITIES  (e.g., public restroom / shelter, ~4 m × 4 m × 3 m)
+// ─────────────────────────────────────────────────────────────────────────────
+const AMENITIES = [
+  // Base platform
+  { x: -8, y: 0, z: -8, w: 16, h: 1, d: 16, top: '#BDBDBD', right: '#9E9E9E', front: '#ADADAD' },
+  // Building body
+  { x: -6, y: 1, z: -6, w: 12, h: 10, d: 12, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' },
+  // Roof
+  { x: -7, y: 11, z: -7, w: 14, h: 1.5, d: 14, top: '#795548', right: '#6D4C41', front: '#5D4037' },
+  // Door (left)
+  { x: -5, y: 1, z: 6, w: 3, h: 7, d: 0.3, top: '#4E342E', right: '#3E2723', front: '#2D1A11' },
+  // Door (right)
+  { x: 2, y: 1, z: 6, w: 3, h: 7, d: 0.3, top: '#4E342E', right: '#3E2723', front: '#2D1A11' },
+  // Sign
+  { x: -2, y: 9, z: 6.2, w: 4, h: 1.5, d: 0.2, top: '#4CAF50', right: '#388E3C', front: '#2E7D32' },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC TOURISM  (e.g., information centre / landmark, ~6 m × 6 m × 4 m)
+// ─────────────────────────────────────────────────────────────────────────────
+const TOURISM = [
+  // Main structure
+  { x: -12, y: 0, z: -12, w: 24, h: 16, d: 24, top: '#FFF3E0', right: '#FFE0B2', front: '#FFCC80' },
+  // Decorative roof / dome
+  { x: -8, y: 16, z: -8, w: 16, h: 4, d: 16, top: '#FFB74D', right: '#FFA726', front: '#FF9800' },
+  // Large glass front
+  { x: -10, y: 3, z: 12, w: 20, h: 10, d: 0.5, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' },
+  // Entrance
+  { x: -2, y: 0, z: 12, w: 4, h: 7, d: 0.5, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
+  // 'i' information sign
+  { x: -1, y: 14, z: 12.2, w: 2, h: 2, d: 0.2, top: '#1E88E5', right: '#1565C0', front: '#1976D2' },
+  // Flag / spire on top
+  { x: -0.5, y: 20, z: -0.5, w: 1, h: 6, d: 1, top: '#9E9E9E', right: '#757575', front: '#8D8D8D' },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC OFFICE  (approx. 8 m wide × 8 m deep × 6 m tall → 32 × 32 × 24 VU)
+// ─────────────────────────────────────────────────────────────────────────────
+const OFFICE = [
+  // Main building
+  { x: -16, y: 0, z: -16, w: 32, h: 24, d: 32, top: '#CFD8DC', right: '#B0BEC5', front: '#90A4AE' },
+  // Flat roof / parapet
+  { x: -17, y: 24, z: -17, w: 34, h: 1.5, d: 34, top: '#78909C', right: '#546E7A', front: '#607D8B' },
+  // Front entrance door
+  { x: -3, y: 0, z: 16, w: 6, h: 8, d: 0.5, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
+  // Windows (repeating pattern)
+  { x: -12, y: 8, z: 16, w: 6, h: 4, d: 0.5, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' },
+  { x: 6, y: 8, z: 16, w: 6, h: 4, d: 0.5, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' },
+  { x: -12, y: 15, z: 16, w: 6, h: 4, d: 0.5, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' },
+  { x: 6, y: 15, z: 16, w: 6, h: 4, d: 0.5, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' },
+  // Side windows
+  { x: -16, y: 8, z: -4, w: 0.5, h: 4, d: 6, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' },
+  { x: -16, y: 8, z: 4, w: 0.5, h: 4, d: 6, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' },
+  // Logo/Sign area
+  { x: -5, y: 20, z: 16.2, w: 10, h: 3, d: 0.3, top: '#FDD835', right: '#F9A825', front: '#FFEE58' },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC LANDUSE (e.g., residential, commercial, industrial)
+// Flat ground area with a simple boundary marker
+// ─────────────────────────────────────────────────────────────────────────────
+const LANDUSE = [
+  { x: -20, y: 0, z: -20, w: 40, h: 0.5, d: 40, top: '#8D6E63', right: '#6D4C41', front: '#795548' }, // dirt/ground
+  { x: -18, y: 0.5, z: -18, w: 36, h: 0.2, d: 36, top: '#A1887F', right: '#8D6E63', front: '#795548' }, // surface
+  { x: -22, y: 0.2, z: -22, w: 44, h: 0.4, d: 0.5, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' }, // boundary line
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC LEISURE (park / recreation area)
+// ─────────────────────────────────────────────────────────────────────────────
+const LEISURE = [
+  { x: -16, y: 0, z: -16, w: 32, h: 1, d: 32, top: '#81C784', right: '#66BB6A', front: '#4CAF50' }, // grass
+  { x: -4, y: 1, z: -4, w: 8, h: 2, d: 8, top: '#388E3C', right: '#2E7D32', front: '#1B5E20' }, // central tree group
+  { x: -8, y: 0.5, z: -8, w: 1, h: 0.5, d: 16, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' }, // path
+  { x: -8, y: 0.5, z: -2, w: 16, h: 0.5, d: 1, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' }, // path cross
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC HISTORIC (castle / ruins)
+// ─────────────────────────────────────────────────────────────────────────────
+const HISTORIC = [
+  { x: -12, y: 0, z: -12, w: 24, h: 8, d: 24, top: '#BDBDBD', right: '#9E9E9E', front: '#ADADAD' }, // stone base
+  { x: -8, y: 8, z: -8, w: 16, h: 6, d: 16, top: '#9E9E9E', right: '#757575', front: '#8D8D8D' }, // upper wall
+  { x: -3, y: 14, z: -3, w: 6, h: 8, d: 6, top: '#8D8D8D', right: '#616161', front: '#757575' }, // tower
+  { x: -1, y: 22, z: -1, w: 2, h: 4, d: 2, top: '#616161', right: '#424242', front: '#545454' }, // turret top
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC CRAFT (workshop / artisan)
+// ─────────────────────────────────────────────────────────────────────────────
+const CRAFT = [
+  { x: -10, y: 0, z: -8, w: 20, h: 6, d: 16, top: '#E0E0E0', right: '#C0C0C0', front: '#D0D0D0' }, // workshop
+  { x: -12, y: 6, z: -10, w: 24, h: 1, d: 20, top: '#B0BEC5', right: '#90A4AE', front: '#78909C' }, // roof
+  { x: -6, y: 2, z: 8, w: 12, h: 4, d: 0.5, top: '#FFCC80', right: '#FFB74D', front: '#FFA726' }, // large door/garage
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC MILITARY (barracks / base)
+// ─────────────────────────────────────────────────────────────────────────────
+const MILITARY = [
+  { x: -16, y: 0, z: -16, w: 32, h: 6, d: 32, top: '#A1887F', right: '#8D6E63', front: '#795548' }, // ground
+  { x: -12, y: 6, z: -12, w: 24, h: 4, d: 24, top: '#78909C', right: '#546E7A', front: '#607D8B' }, // building
+  { x: -2, y: 10, z: -2, w: 4, h: 8, d: 4, top: '#455A64', right: '#263238', front: '#37474F' }, // watchtower
+  { x: -1, y: 18, z: -1, w: 2, h: 2, d: 2, top: '#1E88E5', right: '#1565C0', front: '#1976D2' }, // antenna/light
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC NATURAL (forest / mountain)
+// ─────────────────────────────────────────────────────────────────────────────
+const NATURAL = [
+  { x: -20, y: 0, z: -20, w: 40, h: 2, d: 40, top: '#2E7D32', right: '#1B5E20', front: '#256029' }, // ground
+  { x: -8, y: 2, z: -8, w: 16, h: 12, d: 16, top: '#388E3C', right: '#2E7D32', front: '#2E7D32' }, // hill / trees
+  { x: -4, y: 14, z: -4, w: 8, h: 8, d: 8, top: '#43A047', right: '#388E3C', front: '#388E3C' }, // peak
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC WATERWAY (river / canal segment)
+// ─────────────────────────────────────────────────────────────────────────────
+const WATERWAY = [
+  { x: -24, y: 0, z: -2, w: 48, h: 1, d: 4, top: '#29B6F6', right: '#03A9F4', front: '#0288D1' }, // water
+  { x: -24, y: 0.8, z: -2.5, w: 48, h: 0.5, d: 0.5, top: '#8D6E63', right: '#6D4C41', front: '#795548' }, // left bank
+  { x: -24, y: 0.8, z: 2, w: 48, h: 0.5, d: 0.5, top: '#8D6E63', right: '#6D4C41', front: '#795548' }, // right bank
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC RAILWAY (rail line + platform)
+// ─────────────────────────────────────────────────────────────────────────────
+const RAILWAY = [
+  { x: -24, y: 0, z: -1, w: 48, h: 0.5, d: 2, top: '#9E9E9E', right: '#757575', front: '#8D8D8D' }, // gravel
+  { x: -24, y: 0.5, z: -0.8, w: 48, h: 0.3, d: 0.4, top: '#616161', right: '#424242', front: '#545454' }, // rail L
+  { x: -24, y: 0.5, z: 0.4, w: 48, h: 0.3, d: 0.4, top: '#616161', right: '#424242', front: '#545454' }, // rail R
+  { x: -4, y: 0.8, z: -1.5, w: 8, h: 1.2, d: 3, top: '#BDBDBD', right: '#9E9E9E', front: '#ADADAD' }, // platform
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC AEROWAY (small runway segment)
+// ─────────────────────────────────────────────────────────────────────────────
+const AEROWAY = [
+  { x: -32, y: 0, z: -6, w: 64, h: 0.5, d: 12, top: '#BDBDBD', right: '#9E9E9E', front: '#ADADAD' }, // pavement
+  { x: -32, y: 0.5, z: -1, w: 64, h: 0.1, d: 2, top: '#FFFFFF', right: '#EEEEEE', front: '#F5F5F5' }, // center line
+  { x: -30, y: 0.5, z: -6.5, w: 4, h: 0.1, d: 1, top: '#FFFFFF', right: '#EEEEEE', front: '#F5F5F5' }, // threshold mark
+  { x: 26, y: 0.5, z: -6.5, w: 4, h: 0.1, d: 1, top: '#FFFFFF', right: '#EEEEEE', front: '#F5F5F5' },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC HIGHWAY (road segment with lane markings)
+// ─────────────────────────────────────────────────────────────────────────────
+const HIGHWAY = [
+  { x: -24, y: 0, z: -3, w: 48, h: 0.5, d: 6, top: '#455A64', right: '#263238', front: '#37474F' }, // asphalt
+  { x: -24, y: 0.5, z: -0.8, w: 48, h: 0.1, d: 0.3, top: '#FFCA28', right: '#FFC107', front: '#FFB300' }, // center line
+  { x: -24, y: 0.5, z: -2.5, w: 48, h: 0.1, d: 0.3, top: '#FFFFFF', right: '#EEEEEE', front: '#F5F5F5' }, // edge line L
+  { x: -24, y: 0.5, z: 2.2, w: 48, h: 0.1, d: 0.3, top: '#FFFFFF', right: '#EEEEEE', front: '#F5F5F5' }, // edge line R
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC BARRIER (fence / wall segment)
+// ─────────────────────────────────────────────────────────────────────────────
+const BARRIER = [
+  { x: -20, y: 0, z: -0.5, w: 40, h: 3, d: 0.5, top: '#8D6E63', right: '#6D4C41', front: '#795548' }, // wooden fence
+  { x: -20, y: 3, z: -0.6, w: 40, h: 0.3, d: 0.7, top: '#A1887F', right: '#8D6E63', front: '#795548' }, // top rail
+  { x: -15, y: 0, z: -0.7, w: 0.5, h: 3.5, d: 0.3, top: '#6D4C41', right: '#5D4037', front: '#4E342E' }, // post
+  { x: -5, y: 0, z: -0.7, w: 0.5, h: 3.5, d: 0.3, top: '#6D4C41', right: '#5D4037', front: '#4E342E' },
+  { x: 5, y: 0, z: -0.7, w: 0.5, h: 3.5, d: 0.3, top: '#6D4C41', right: '#5D4037', front: '#4E342E' },
+  { x: 15, y: 0, z: -0.7, w: 0.5, h: 3.5, d: 0.3, top: '#6D4C41', right: '#5D4037', front: '#4E342E' },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC BUILDING (simple rectangular block)
+// ─────────────────────────────────────────────────────────────────────────────
+const BUILDING = [
+  { x: -12, y: 0, z: -10, w: 24, h: 12, d: 20, top: '#CFD8DC', right: '#B0BEC5', front: '#90A4AE' },
+  { x: -13, y: 12, z: -11, w: 26, h: 1.5, d: 22, top: '#78909C', right: '#546E7A', front: '#607D8B' },
+  { x: -4, y: 0, z: 10, w: 8, h: 6, d: 0.5, top: '#5D4037', right: '#4E342E', front: '#3E2723' }, // door
+  { x: -10, y: 5, z: 10, w: 4, h: 3, d: 0.5, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' }, // window
+  { x: 6, y: 5, z: 10, w: 4, h: 3, d: 0.5, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC MAN_MADE (tower / mast)
+// ─────────────────────────────────────────────────────────────────────────────
+const MAN_MADE = [
+  { x: -1.5, y: 0, z: -1.5, w: 3, h: 1.5, d: 3, top: '#BDBDBD', right: '#9E9E9E', front: '#ADADAD' }, // base
+  { x: -1, y: 1.5, z: -1, w: 2, h: 20, d: 2, top: '#9E9E9E', right: '#757575', front: '#8D8D8D' }, // tower
+  { x: -1.5, y: 21.5, z: -1.5, w: 3, h: 1, d: 3, top: '#757575', right: '#616161', front: '#696969' }, // top cap
+  { x: -0.5, y: 22.5, z: -0.5, w: 1, h: 4, d: 1, top: '#616161', right: '#424242', front: '#545454' }, // antenna
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC POWER (power pole / line)
+// ─────────────────────────────────────────────────────────────────────────────
+const POWER = [
+  { x: -0.5, y: 0, z: -0.5, w: 1, h: 12, d: 1, top: '#78909C', right: '#546E7A', front: '#607D8B' }, // pole
+  { x: -4, y: 11, z: -0.5, w: 8, h: 0.5, d: 1, top: '#455A64', right: '#263238', front: '#37474F' }, // crossarm
+  { x: -4, y: 11.8, z: -0.5, w: 0.3, h: 0.2, d: 1, top: '#B0BEC5', right: '#90A4AE', front: '#78909C' }, // wire guide
+  { x: -0.5, y: 12.5, z: -4, w: 1, h: 0.2, d: 8, top: '#CFD8DC', right: '#B0BEC5', front: '#90A4AE' }, // top wire
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC TELECOM (cell tower)
+// ─────────────────────────────────────────────────────────────────────────────
+const TELECOM = [
+  { x: -1.2, y: 0, z: -1.2, w: 2.4, h: 2, d: 2.4, top: '#757575', right: '#616161', front: '#696969' }, // base
+  { x: -0.8, y: 2, z: -0.8, w: 1.6, h: 18, d: 1.6, top: '#9E9E9E', right: '#757575', front: '#8D8D8D' }, // mast
+  { x: -2.5, y: 16, z: -0.5, w: 5, h: 0.8, d: 1, top: '#BDBDBD', right: '#9E9E9E', front: '#ADADAD' }, // dish mount
+  { x: -3, y: 16.5, z: -1, w: 1.2, h: 0.4, d: 1.2, top: '#E0E0E0', right: '#C0C0C0', front: '#D0D0D0' }, // dish
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC PLACE (town/village marker)
+// ─────────────────────────────────────────────────────────────────────────────
+const PLACE = [
+  { x: -1, y: 0, z: -1, w: 2, h: 6, d: 2, top: '#BDBDBD', right: '#9E9E9E', front: '#ADADAD' }, // sign post
+  { x: -3, y: 6, z: -1.2, w: 6, h: 2, d: 0.3, top: '#FFFFFF', right: '#EEEEEE', front: '#F5F5F5' }, // sign board
+  { x: -2, y: 6.5, z: -1.1, w: 1, h: 1, d: 0.2, top: '#FDD835', right: '#F9A825', front: '#FFEE58' }, // star/emblem
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC BOUNDARY (abstract – just a marker)
+// ─────────────────────────────────────────────────────────────────────────────
+const BOUNDARY = [
+  { x: -0.5, y: 0, z: -0.5, w: 1, h: 2, d: 1, top: '#D32F2F', right: '#B71C1C', front: '#C62828' }, // red marker
+  { x: -1, y: 2, z: -1, w: 2, h: 0.5, d: 2, top: '#F44336', right: '#E53935', front: '#EF5350' }, // cap
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC CLUB (clubhouse)
+// ─────────────────────────────────────────────────────────────────────────────
+const CLUB = [
+  { x: -8, y: 0, z: -6, w: 16, h: 6, d: 12, top: '#FFCCBC', right: '#FFAB91', front: '#FF8A65' }, // warm tone
+  { x: -9, y: 6, z: -7, w: 18, h: 1.5, d: 14, top: '#E64A19', right: '#D84315', front: '#F4511E' }, // roof
+  { x: -2, y: 2, z: 6, w: 4, h: 4, d: 0.5, top: '#5D4037', right: '#4E342E', front: '#3E2723' }, // door
+  { x: -1, y: 5, z: 6.2, w: 2, h: 1, d: 0.2, top: '#FFCA28', right: '#FFC107', front: '#FFB300' }, // club sign
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC HEALTHCARE (small clinic – generic)
+// ─────────────────────────────────────────────────────────────────────────────
+const HEALTHCARE = [
+  { x: -10, y: 0, z: -8, w: 20, h: 8, d: 16, top: '#F5F5F5', right: '#E0E0E0', front: '#EEEEEE' }, // clean white
+  { x: -11, y: 8, z: -9, w: 22, h: 1.5, d: 18, top: '#E0E0E0', right: '#C0C0C0', front: '#D0D0D0' }, // roof
+  { x: -1, y: 0, z: 8, w: 2, h: 6, d: 0.5, top: '#4FC3F7', right: '#29B6F6', front: '#03A9F4' }, // blue cross (vertical)
+  { x: -2, y: 3, z: 8, w: 4, h: 0.5, d: 0.5, top: '#4FC3F7', right: '#29B6F6', front: '#03A9F4' }, // blue cross (horizontal)
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC PUBLIC_TRANSPORT (bus/tram stop shelter)
+// ─────────────────────────────────────────────────────────────────────────────
+const PUBLIC_TRANSPORT = [
+  { x: -3, y: 0, z: -1.5, w: 6, h: 0.5, d: 3, top: '#BDBDBD', right: '#9E9E9E', front: '#ADADAD' }, // platform
+  { x: -2.5, y: 0.5, z: 1.5, w: 0.5, h: 5, d: 0.5, top: '#546E7A', right: '#37474F', front: '#455A64' }, // pole
+  { x: -2, y: 5, z: 1.5, w: 4, h: 0.5, d: 1, top: '#1E88E5', right: '#1565C0', front: '#1976D2' }, // sign
+  { x: -2, y: 2, z: -1.2, w: 4, h: 3, d: 0.2, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' }, // glass panel
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC EMERGENCY (fire hydrant / emergency point)
+// ─────────────────────────────────────────────────────────────────────────────
+const EMERGENCY = [
+  { x: -0.6, y: 0, z: -0.6, w: 1.2, h: 1.5, d: 1.2, top: '#D32F2F', right: '#B71C1C', front: '#C62828' }, // red body
+  { x: -0.8, y: 1.5, z: -0.8, w: 1.6, h: 0.5, d: 1.6, top: '#F44336', right: '#E53935', front: '#EF5350' }, // top cap
+  { x: -1, y: 1.8, z: -0.3, w: 2, h: 0.3, d: 0.6, top: '#9E9E9E', right: '#757575', front: '#8D8D8D' }, // nozzle
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERIC SPORT (multi-purpose field)
+// ─────────────────────────────────────────────────────────────────────────────
+const SPORT = [
+  { x: -20, y: 0, z: -14, w: 40, h: 0.5, d: 28, top: '#4CAF50', right: '#388E3C', front: '#2E7D32' }, // grass
+  { x: -18, y: 0.5, z: -12, w: 36, h: 0.2, d: 24, top: '#81C784', right: '#66BB6A', front: '#4CAF50' }, // playing surface
+  { x: -4, y: 0.7, z: -12, w: 0.5, h: 0.2, d: 24, top: '#FFFFFF', right: '#EEEEEE', front: '#F5F5F5' }, // center line
+  { x: -20, y: 0.7, z: -2, w: 40, h: 0.2, d: 0.5, top: '#FFFFFF', right: '#EEEEEE', front: '#F5F5F5' }, // half line
+];
+
+const AMENITY = [
+  // Base slab
+  { x: -8, y: 0, z: -10, w: 16, h: 0.5, d: 20, top: '#BDBDBD', right: '#9E9E9E', front: '#ADADAD' },
+  // Main walls
+  { x: -7, y: 0.5, z: -9, w: 14, h: 12, d: 18, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' },
+  // Roof (slightly overhanging)
+  { x: -8.5, y: 12.5, z: -10.5, w: 17, h: 1.5, d: 21, top: '#795548', right: '#6D4C41', front: '#5D4037' },
+  // Door (centred)
+  { x: -2, y: 0.5, z: 9, w: 4, h: 7, d: 0.5, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
+  // Small window (side)
+  { x: 6, y: 4, z: -8, w: 2, h: 2.5, d: 0.5, top: '#B3E5FC', right: '#81D4FA', front: '#E1F5FE' },
+  // Sign / pictogram area
+  { x: -1.5, y: 10, z: 9.2, w: 3, h: 1.5, d: 0.2, top: '#4CAF50', right: '#388E3C', front: '#2E7D32' },
+];
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Export
 // ─────────────────────────────────────────────────────────────────────────────
@@ -574,4 +1163,86 @@ export const Blueprints = {
 
   // NPCs
   npc_person:   NPC_PERSON,
+
+  // ── Missing from original (now added) ─────────────────────────────────────
+  recycling:      RECYCLING,
+  toilets:        TOILETS,
+  cafe:           CAFE,
+  restaurant:     RESTAURANT,
+  fast_food:      FAST_FOOD,
+  bar:            BAR,
+  pub:            PUB,
+  food_court:     FOOD_COURT,
+  ice_cream:      ICE_CREAM,
+  hospital:       HOSPITAL,
+  doctors:        DOCTORS,
+  dentist:        DENTIST,
+  pharmacy:       PHARMACY,
+  veterinary:     VETERINARY,
+  clinic:         CLINIC,
+  school:         SCHOOL,
+  university:     UNIVERSITY,
+  college:        COLLEGE,
+  library:        LIBRARY,
+  kindergarten:   KINDERGARTEN,
+  place_of_worship: PLACE_OF_WORSHIP,
+  police:         POLICE,
+  fire_station:   FIRE_STATION,
+  townhall:       TOWNHALL,
+  courthouse:     COURTHOUSE,
+  post_office:    POST_OFFICE,
+  fuel:           FUEL,
+  parking:        PARKING,
+  bicycle_parking: BICYCLE_PARKING,
+  supermarket:    SUPERMARKET,
+  convenience:    CONVENIENCE,
+  clothes:        CLOTHES,
+  bakery:         BAKERY,
+  butcher:        BUTCHER,
+  bookshop:       BOOKSHOP,
+  electronics:    ELECTRONICS,
+  hardware:       HARDWARE,
+  florist:        FLORIST,
+  hairdresser:    HAIRDRESSER,
+  garden:         GARDEN,
+  playground:     PLAYGROUND,
+  sports_centre:  SPORTS_CENTRE,
+  swimming_pool:  SWIMMING_POOL,
+  pitch:          PITCH,
+  wood:           WOOD,
+  attraction:     ATTRACTION,
+  museum:         MUSEUM,
+  hotel:          HOTEL,
+  viewpoint:      VIEWPOINT,
+  information:    INFORMATION,
+
+  // CATEGORIES
+  shop:      SHOP,
+  amenities: AMENITIES,
+  amenity: AMENITY,
+  tourism:   TOURISM,
+
+  office: OFFICE,
+  landuse:          LANDUSE,
+  leisure:          LEISURE,
+  historic:         HISTORIC,
+  craft:            CRAFT,
+  military:         MILITARY,
+  natural:          NATURAL,
+  waterway:         WATERWAY,
+  railway:          RAILWAY,
+  aeroway:          AEROWAY,
+  highway:          HIGHWAY,
+  barrier:          BARRIER,
+  building:         BUILDING,
+  man_made:         MAN_MADE,
+  power:            POWER,
+  telecom:          TELECOM,
+  place:            PLACE,
+  boundary:         BOUNDARY,
+  club:             CLUB,
+  healthcare:       HEALTHCARE,
+  public_transport: PUBLIC_TRANSPORT,
+  emergency:        EMERGENCY,
+  sport:            SPORT,
 };

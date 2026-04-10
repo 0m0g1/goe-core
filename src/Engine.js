@@ -34,7 +34,6 @@ import { InputManager }      from './core/InputManager.js';
 import { TerrainCache }      from './terrain/TerrainCache.js';
 import { createTerrainRegistry, TerrainType } from './terrain/types.js';
 import { TileRenderer }      from './render/TileRenderer.js';
-import { FeatureRenderer } from './render/FeatureRenderer.js';
 import { OSMLayerRenderer }  from './render/OSMLayerRenderer.js';
 import { WorldRenderer }     from './render/Renderer.js';
 import { drawPlayer }        from './assets/PlayerBlueprint.js';
@@ -465,7 +464,6 @@ export class Engine extends EventEmitter {
     this._patchVoxelRenderer(this._renderer._voxel);
 
     this._tileR    = new TileRenderer(this._renderer, this.terrainRegistry);
-    this._featR    = new FeatureRenderer(this._renderer, this.terrainRegistry);
     this._osmLayer = new OSMLayerRenderer(this._renderer, this._tileURLFn);
     this._patchOSMLayerRenderer(this._osmLayer);
 
@@ -881,7 +879,6 @@ export class Engine extends EventEmitter {
     ctx.fillRect(0, 0, W, H);
 
     this._renderer.beginFrame();
-    this._featR.frameNow = ts;
 
     // 7. OSM tiles
     if (this.debugLayers.osmTiles) {

@@ -238,7 +238,7 @@
                 groundElevPx + (this.elevOffset ?? 0),
                 cam
             );
-            const r = Math.max(3, cam.zoom * cam.tileW * 0.4);
+            const r = Math.max(3, cam.zoom * cam.tileW * 0.4) / 2;
             const depth = this.tx * Math.cos(cam.rotation) + this.ty * Math.sin(cam.rotation);
             wr.submitWorldObject(depth, () => {
                 ctx.beginPath();

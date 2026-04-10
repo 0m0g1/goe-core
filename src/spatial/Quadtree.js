@@ -1,23 +1,20 @@
 // spatial/Quadtree.js
 class QuadtreeNode {
     constructor(bounds, capacity) {
-        this.bounds = bounds;   // { x, y, w, h } in tile units
+        this.bounds = bounds;
         this.capacity = capacity;
         this.objects = [];
         this.children = null;
     }
     isLeaf() { return this.children === null; }
     subdivide() {
-        const x = this.bounds.x;
-        const y = this.bounds.y;
-        const w = this.bounds.w / 2;
-        const h = this.bounds.h / 2;
-
+        const { x, y, w, h } = this.bounds;
+        const hw = w / 2, hh = h / 2;
         this.children = [
-            new QuadtreeNode({ x: x,     y: y,     w, h }, this.capacity),  // NW
-            new QuadtreeNode({ x: x + w, y: y,     w, h }, this.capacity),  // NE
-            new QuadtreeNode({ x: x,     y: y + h, w, h }, this.capacity),  // SW
-            new QuadtreeNode({ x: x + w, y: y + h, w, h }, this.capacity),  // SE
+            new QuadtreeNode({ x: x,      y: y,      w: hw, h: hh }, this.capacity),
+            new QuadtreeNode({ x: x + hw, y: y,      w: hw, h: hh }, this.capacity),
+            new QuadtreeNode({ x: x,      y: y + hh, w: hw, h: hh }, this.capacity),
+            new QuadtreeNode({ x: x + hw, y: y + hh, w: hw, h: hh }, this.capacity),
         ];
     }
 }
@@ -27,9 +24,7 @@ export class Quadtree {
         this.root = new QuadtreeNode(bounds, capacity);
     }
 
-    clear() {
-        this._clearNode(this.root);
-    }
+    clear() { this._clearNode(this.root); }
 
     _clearNode(node) {
         node.objects = [];
@@ -39,50 +34,59 @@ export class Quadtree {
         }
     }
 
-    insert(object) {
-        this._insert(object, this.root);
-    }
+    insert(object) { this._insert(object, this.root); }
 
     _insert(object, node) {
         if (!this._contains(node.bounds, object)) return;
 
-        if (node.isLeaf() && node.objects.length < node.capacity) {
-            node.objects.push(object);
-        } else {
-            if (node.isLeaf()) node.subdivide();
-            for (const child of node.children) {
-                this._insert(object, child);
+        if (node.isLeaf()) {
+            if (node.objects.length < node.capacity) {
+                node.objects.push(object);
+                return;
             }
+            // At capacity — subdivide and redistribute ALL existing items
+            node.subdivide();
+            const existing = node.objects;
+            node.objects = [];                          // ← clear parent list
+            for (const obj of existing) {
+                for (const child of node.children) {
+                    this._insert(obj, child);
+                }
+            }
+        }
+
+        // Non-leaf: insert into whichever children contain the object
+        for (const child of node.children) {
+            this._insert(object, child);
         }
     }
 
     queryRange(range, result = []) {
-        this._query(this.root, range, result);
+        const seen = new Set();                         // ← dedup guard
+        this._query(this.root, range, seen);
+        for (const item of seen) result.push(item);
         return result;
     }
 
-    _query(node, range, result) {
+    _query(node, range, seen) {
         if (!this._intersects(node.bounds, range)) return;
         for (const obj of node.objects) {
-            // expand the check by the object's own radius
             const r = obj.radius ?? 0;
             if (obj.x + r >= range.x && obj.x - r <= range.x + range.w &&
                 obj.y + r >= range.y && obj.y - r <= range.y + range.h) {
-                result.push(obj);
+                seen.add(obj);                          // Set ignores duplicates
             }
         }
         if (!node.isLeaf()) {
-            for (const child of node.children) this._query(child, range, result);
+            for (const child of node.children) this._query(child, range, seen);
         }
     }
 
-    // rebuild the whole tree from a list of objects
     rebuild(objects) {
         this.clear();
         for (const obj of objects) this.insert(obj);
     }
 
-    // helpers
     _contains(rect, obj) {
         return obj.x >= rect.x && obj.x <= rect.x + rect.w &&
                obj.y >= rect.y && obj.y <= rect.y + rect.h;
