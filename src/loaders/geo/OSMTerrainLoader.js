@@ -221,13 +221,37 @@ function blueprintNativeBounds(blueprint) {
   return { maxY, halfExtentXZ: halfXZ };
 }
 
-function computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile) {
+function computeWaySpanM(geometry) {
+  if (!geometry || geometry.length < 2) return 0;
+  const a = geometry[0];
+  const b = geometry[geometry.length - 1];
+  const dLat = (b.lat - a.lat) * 111320;
+  const dLon = (b.lon - a.lon) * 111320 * Math.cos(a.lat * Math.PI / 180);
+  return Math.hypot(dLat, dLon);
+}
+
+function computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile, osmSpanM = 0) {
   const { maxY, halfExtentXZ } = blueprintNativeBounds(blueprint);
+
+  // Linear landmarks (bridges): scale by tip-to-tip span — highest priority
+  if (osmSpanM > 0 && halfExtentXZ > 0) {
+    const nativeTileSpan = (halfExtentXZ * 2) / VU;
+    const targetTileSpan = osmSpanM / mPerTile;
+    return targetTileSpan / nativeTileSpan;
+  }
+  // Both height and area known — use diagonal for best fit
+  if (osmHeightM > 0 && osmAreaM2 > 0 && maxY > 0 && halfExtentXZ > 0) {
+    const targetDiag = Math.hypot(osmHeightM, Math.sqrt(osmAreaM2));
+    const nativeDiag = Math.hypot(maxY, halfExtentXZ * 2);
+    return targetDiag / nativeDiag;
+  }
+  // Height only
   if (osmHeightM > 0 && maxY > 0) {
     const nativeTileH = maxY / VU;
     const targetTileH = osmHeightM / mPerTile;
     return targetTileH / nativeTileH;
   }
+  // Area only
   if (osmAreaM2 > 0 && halfExtentXZ > 0) {
     const nativeTileR = halfExtentXZ / VU;
     const targetTileR = Math.sqrt(osmAreaM2) / mPerTile / 2;
@@ -710,6 +734,7 @@ export class OSMTerrainLoader extends BaseLoader {
       way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|pedestrian|footway|cycleway|path|track)$"]${around};
       way["building"]${around};
       way["bridge"="yes"]["name"]${around};
+      way["man_made"="bridge"]["name"]${around};
       node["amenity"]${around};
       node["shop"]${around};
       node["tourism"]${around};
@@ -754,148 +779,123 @@ export class OSMTerrainLoader extends BaseLoader {
         const maxGY = latToGlobalY(lat - rLat, this._mPerTile) + 2;
 
         const buildingWays = [];
-        const bridgeWays = [];
 
+        // ── Separate elements by type for ordered processing ──────────────────
+        const wayElements  = [];
+        const nodeElements = [];
         for (const el of data.elements) {
-
-          if (el.type === 'way' && el.geometry?.length) {
-            if (el.tags?.bridge === 'yes' || el.tags?.man_made === 'bridge') {
-              const match = resolveLandmarkKey(el.tags);
-              if (match) {
-                bridgeWays.push({ el, match });
-                // still rasterize road/path terrain under the bridge
-                const cls = classifyOSM(el.tags);
-                if (cls) {
-                  const pts = el.geometry.map(g => toTile(g.lat, g.lon));
-                  rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width ?? 2);
-                }
-                continue; // don't fall through to the normal way handler
-              }
-            }
-
-            const cls = classifyOSM(el.tags);
-            if (cls) {
-              const pts = el.geometry.map(g => toTile(g.lat, g.lon));
-              if (cls.type === 'polygon') rasterizePolygon(terrainUpdates, pts, cls.terrain);
-              else                        rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width);
-              if (el.tags?.building) buildingWays.push(el);
-
-              if (el.tags?.highway &&
-                  ['primary','secondary','tertiary','residential'].includes(el.tags.highway) &&
-                  Math.random() > 0.6) {
-                entityDefs.push({
-                  id: `car:${el.id}`,
-                  latitude:  el.geometry[0].lat,
-                  longitude: el.geometry[0].lon,
-                  solid: false, bboxRadius: 0.35,
-                  physicsEnabled: false, fixed: true, renderHeavy: true,
-                  _lodColor: '#607D8B',
-                  title: 'car', label: 'car', category: 'car',
-                  renderFn(wr, groundElevPx, extra, entity) {
-                    const blueprint = Blueprints['car'];
-                    if (!blueprint || wr.cam.tilt < 0.04) return;
-                    const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
-                    const elev  = groundElevPx + entity.elevOffset;
-                    const depth = frontDepth(entity.tx, entity.ty, wr.cam.rotation, 0.35);
-                    wr.submitWorldObject(depth, () => {
-                      wr.ctx.globalAlpha = isoA;
-                      wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
-                      wr.ctx.globalAlpha = 1;
-                    });
-                  },
-                });
-              }
-            }
-          }
-
-          if (el.type === 'node') {
-            const { x: gx, y: gy } = toTile(el.lat, el.lon);
-            if (gx < minGX || gx > maxGX || gy < minGY || gy > maxGY) continue;
-
-            if (el.tags?.natural === 'tree') {
-              const species = treeSpeciesFromTags(el.tags);
-              const bpKey   = TREE_BLUEPRINT_KEY[species] ?? 'tree_oak';
-              entityDefs.push(makeBlueprintDef(
-                `tree:${el.id}`, el.lat, el.lon, bpKey,
-                {
-                  solid: true, bboxRadius: 0.5, footprintRadius: 1.2,
-                  physicsEnabled: true, physicsRadius: 0.5,
-                  lodColor: '#2E7D32', facingAngle: 180,
-                }
-              ));
-              continue;
-            }
-
-            const poi = classifyPOI(el.tags);
-            if (!poi) continue;
-
-            // FIXED
-            const landmarkMatch = resolveLandmarkKey(el.tags);
-            if (landmarkMatch) {
-              const { key: nameKey, name } = landmarkMatch;
-              if (!renderedLandmarkNames.has(nameKey)) {
-                renderedLandmarkNames.add(nameKey);
-                const blueprint  = Blueprints[nameKey];
-                const osmHeightM = parseFloat(el.tags?.height ?? el.tags?.['building:height'] ?? 0) || 0;
-                const scale      = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile);
-                const { halfExtentXZ } = blueprintNativeBounds(blueprint);
-                const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
-                const facingAngle = extractFacingAngle(el.tags);
-
-                console.log(`[OSMTerrainLoader] Landmark node "${name}" — h=${osmHeightM}m → scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`);
-
-                entityDefs.push(makeBlueprintDef(
-                  `landmark:node:${el.id}`, el.lat, el.lon, nameKey,
-                  {
-                    scale, facingAngle,
-                    solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
-                    physicsEnabled: true, physicsRadius: scaledR,
-                    fixed: true, lodColor: '#A1887F',
-                  }
-                ));
-              }
-              continue;
-            }
-
-            entityDefs.push(makeFeatureDef({
-              id: `osm:node:${el.id}`,
-              latitude: el.lat, longitude: el.lon,
-              color: poi.color, label: poi.label,
-              category: poi.category, value: poi.value,
-              title: name,
-              description: el.tags?.name ? `${poi.label} — ${name}` : poi.label,
-              tags: el.tags ?? {},
-            }));
-          }
+          if (el.type === 'way')  wayElements.push(el);
+          if (el.type === 'node') nodeElements.push(el);
         }
 
-        // ── Bridge landmarks ──────────────────────────────────────────────────────
-        for (const { el, match } of bridgeWays) {
-          const { key: nameKey, name } = match;
+        // ── Pass 1: Bridge landmark ways (span-aware — MUST run before nodes) ─
+        // The Golden Gate Bridge (and similar) is split across many OSM way
+        // segments inside a relation. A single way only covers one segment so
+        // computeWaySpanM on it returns ~0. Fix: group all way segments that
+        // share the same resolved landmark key, merge their geometry, then
+        // compute the true tip-to-tip span across the full merged point set.
+
+        // Step A — collect all bridge way segments keyed by landmark name
+        const bridgeSegmentsByKey = new Map(); // nameKey → { match, segments: el[] }
+
+        for (const el of wayElements) {
+          if (!el.geometry?.length) continue;
+          if (!(el.tags?.bridge === 'yes' || el.tags?.man_made === 'bridge')) continue;
+          const match = resolveLandmarkKey(el.tags);
+          if (!match) continue;
+
+          // Always rasterize road/path terrain under the bridge
+          const cls = classifyOSM(el.tags);
+          if (cls) {
+            const pts = el.geometry.map(g => toTile(g.lat, g.lon));
+            rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width ?? 2);
+          }
+
+          const { key: nameKey } = match;
+          if (!bridgeSegmentsByKey.has(nameKey)) {
+            bridgeSegmentsByKey.set(nameKey, { match, els: [] });
+          }
+          bridgeSegmentsByKey.get(nameKey).els.push(el);
+        }
+
+        // Step B — for each landmark, merge all segments and compute true span
+        for (const [nameKey, { match, els }] of bridgeSegmentsByKey) {
           if (renderedLandmarkNames.has(nameKey)) continue;
           const blueprint = Blueprints[nameKey];
           if (!blueprint) continue;
 
-          // Centroid from geometry
-          let cLat = 0, cLon = 0;
-          const geom = el.geometry ?? [];
-          for (const g of geom) { cLat += g.lat; cLon += g.lon; }
-          if (geom.length) { cLat /= geom.length; cLon /= geom.length; }
+          const { name } = match;
 
-          // Span = straight-line distance tip to tip — used to scale linear landmarks
-          const osmSpanM = computeWaySpanM(geom);
-          const osmHeightM = parseFloat(el.tags?.height ?? el.tags?.['max_height'] ?? 0) || 0;
-          const scale = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile, osmSpanM);
+          // Merge all geometry points from all segments
+          const allGeom = els.flatMap(el => el.geometry ?? []);
+
+          // Centroid across all points
+          let cLat = 0, cLon = 0;
+          for (const g of allGeom) { cLat += g.lat; cLon += g.lon; }
+          if (allGeom.length) { cLat /= allGeom.length; cLon /= allGeom.length; }
+
+          // True tip-to-tip span: project all points onto the principal axis
+          // (bearing from first to last point of the first/longest segment),
+          // then take max - min projected distance.
+          const refEl  = els.reduce((a, b) =>
+            (b.geometry?.length ?? 0) > (a.geometry?.length ?? 0) ? b : a
+          );
+          const refGeom = refEl.geometry ?? [];
+          let osmSpanM = 0;
+
+          if (allGeom.length >= 2 && refGeom.length >= 2) {
+            const a0 = refGeom[0];
+            const a1 = refGeom[refGeom.length - 1];
+            const dLat = (a1.lat - a0.lat) * 111320;
+            const dLon = (a1.lon - a0.lon) * 111320 * Math.cos(a0.lat * Math.PI / 180);
+            const axisLen = Math.hypot(dLat, dLon);
+            if (axisLen > 0) {
+              const axLat = dLat / axisLen;
+              const axLon = dLon / axisLen;
+              let minP = Infinity, maxP = -Infinity;
+              for (const g of allGeom) {
+                const gLat = (g.lat - a0.lat) * 111320;
+                const gLon = (g.lon - a0.lon) * 111320 * Math.cos(a0.lat * Math.PI / 180);
+                const proj = gLat * axLat + gLon * axLon;
+                if (proj < minP) minP = proj;
+                if (proj > maxP) maxP = proj;
+              }
+              osmSpanM = maxP - minP;
+            }
+          }
+
+          // Fallback: bounding-box diagonal if axis projection gave nothing
+          if (osmSpanM <= 0 && allGeom.length >= 2) {
+            let minLat = Infinity, maxLat = -Infinity;
+            let minLon = Infinity, maxLon = -Infinity;
+            for (const g of allGeom) {
+              if (g.lat < minLat) minLat = g.lat;
+              if (g.lat > maxLat) maxLat = g.lat;
+              if (g.lon < minLon) minLon = g.lon;
+              if (g.lon > maxLon) maxLon = g.lon;
+            }
+            const spanLat = (maxLat - minLat) * 111320;
+            const spanLon = (maxLon - minLon) * 111320 * Math.cos(cLat * Math.PI / 180);
+            osmSpanM = Math.max(spanLat, spanLon);
+          }
+
+          const firstEl    = els[0];
+          const osmHeightM = parseFloat(firstEl.tags?.height ?? firstEl.tags?.['max_height'] ?? 0) || 0;
+          const scale      = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile, osmSpanM);
 
           const { halfExtentXZ } = blueprintNativeBounds(blueprint);
-          const scaledR = Math.max(2, (halfExtentXZ / VU) * scale);
-          const facingAngle = extractFacingAngle(el.tags, geom);
+          const scaledR     = Math.max(2, (halfExtentXZ / VU) * scale);
+          const facingAngle = extractFacingAngle(firstEl.tags, refGeom);
 
-          console.log(`[OSMTerrainLoader] Bridge landmark "${name}" — span=${osmSpanM.toFixed(0)}m h=${osmHeightM}m → scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`);
+          console.log(
+            `[OSMTerrainLoader] Bridge landmark "${name}" — ` +
+            `${els.length} segments, span=${osmSpanM.toFixed(0)}m h=${osmHeightM}m → ` +
+            `scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`
+          );
 
           renderedLandmarkNames.add(nameKey);
           entityDefs.push(makeBlueprintDef(
-            `landmark:bridge:${el.id}`, cLat, cLon, nameKey,
+            `landmark:bridge:${els[0].id}`, cLat, cLon, nameKey,
             {
               scale, facingAngle,
               solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
@@ -905,7 +905,7 @@ export class OSMTerrainLoader extends BaseLoader {
           ));
 
           const colliders = makeBlueprintColliders(
-            `landmark:bridge:${el.id}`, cLat, cLon, blueprint, scale, this._mPerTile
+            `landmark:bridge:${els[0].id}`, cLat, cLon, blueprint, scale, this._mPerTile
           );
           for (const col of colliders) {
             const { dLat, dLon } = tileOffsetToGeo(
@@ -917,7 +917,117 @@ export class OSMTerrainLoader extends BaseLoader {
           }
         }
 
-        // ── Buildings ─────────────────────────────────────────────────────────
+        // ── Pass 2: All other ways (terrain + buildings + cars) ───────────────
+        for (const el of wayElements) {
+          if (!el.geometry?.length) continue;
+
+          // Skip bridge landmark ways — fully handled in pass 1
+          if (el.tags?.bridge === 'yes' || el.tags?.man_made === 'bridge') {
+            if (resolveLandmarkKey(el.tags)) continue;
+          }
+
+          const cls = classifyOSM(el.tags);
+          if (!cls) continue;
+
+          const pts = el.geometry.map(g => toTile(g.lat, g.lon));
+          if (cls.type === 'polygon') rasterizePolygon(terrainUpdates, pts, cls.terrain);
+          else                        rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width);
+
+          if (el.tags?.building) buildingWays.push(el);
+
+          if (el.tags?.highway &&
+              ['primary','secondary','tertiary','residential'].includes(el.tags.highway) &&
+              Math.random() > 0.6) {
+            entityDefs.push({
+              id: `car:${el.id}`,
+              latitude:  el.geometry[0].lat,
+              longitude: el.geometry[0].lon,
+              solid: false, bboxRadius: 0.35,
+              physicsEnabled: false, fixed: true, renderHeavy: true,
+              _lodColor: '#607D8B',
+              title: 'car', label: 'car', category: 'car',
+              renderFn(wr, groundElevPx, extra, entity) {
+                const blueprint = Blueprints['car'];
+                if (!blueprint || wr.cam.tilt < 0.04) return;
+                const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
+                const elev  = groundElevPx + entity.elevOffset;
+                const depth = frontDepth(entity.tx, entity.ty, wr.cam.rotation, 0.35);
+                wr.submitWorldObject(depth, () => {
+                  wr.ctx.globalAlpha = isoA;
+                  wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
+                  wr.ctx.globalAlpha = 1;
+                });
+              },
+            });
+          }
+        }
+
+        // ── Pass 3: Nodes (trees, POIs, landmark nodes) ───────────────────────
+        for (const el of nodeElements) {
+          const { x: gx, y: gy } = toTile(el.lat, el.lon);
+          if (gx < minGX || gx > maxGX || gy < minGY || gy > maxGY) continue;
+
+          if (el.tags?.natural === 'tree') {
+            const species = treeSpeciesFromTags(el.tags);
+            const bpKey   = TREE_BLUEPRINT_KEY[species] ?? 'tree_oak';
+            entityDefs.push(makeBlueprintDef(
+              `tree:${el.id}`, el.lat, el.lon, bpKey,
+              {
+                solid: true, bboxRadius: 0.5, footprintRadius: 1.2,
+                physicsEnabled: true, physicsRadius: 0.5,
+                lodColor: '#2E7D32', facingAngle: 180,
+              }
+            ));
+            continue;
+          }
+
+          const poi = classifyPOI(el.tags);
+          if (!poi) continue;
+
+          const landmarkMatch = resolveLandmarkKey(el.tags);
+          if (landmarkMatch) {
+            const { key: nameKey, name } = landmarkMatch;
+            // If a bridge way already claimed this name (e.g. Golden Gate Bridge),
+            // skip — the span-scaled version is already in entityDefs.
+            if (!renderedLandmarkNames.has(nameKey)) {
+              renderedLandmarkNames.add(nameKey);
+              const blueprint  = Blueprints[nameKey];
+              const osmHeightM = parseFloat(el.tags?.height ?? el.tags?.['building:height'] ?? 0) || 0;
+              const scale      = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile);
+              const { halfExtentXZ } = blueprintNativeBounds(blueprint);
+              const scaledR     = Math.max(2, (halfExtentXZ / VU) * scale);
+              const facingAngle = extractFacingAngle(el.tags);
+
+              console.log(`[OSMTerrainLoader] Landmark node "${name}" — h=${osmHeightM}m → scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`);
+
+              entityDefs.push(makeBlueprintDef(
+                `landmark:node:${el.id}`, el.lat, el.lon, nameKey,
+                {
+                  scale, facingAngle,
+                  solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
+                  physicsEnabled: true, physicsRadius: scaledR,
+                  fixed: true, lodColor: '#A1887F',
+                }
+              ));
+            }
+            continue;
+          }
+
+          entityDefs.push(makeFeatureDef({
+            id:          `osm:node:${el.id}`,
+            latitude:    el.lat,
+            longitude:   el.lon,
+            color:       poi.color,
+            label:       poi.label,
+            category:    poi.category,
+            value:       poi.value,
+            title:       el.tags?.name ?? poi.label,
+            description: el.tags?.name ? `${poi.label} — ${el.tags.name}` : poi.label,
+            tags:        el.tags ?? {},
+          }));
+        }
+
+        // ── Pass 4: Buildings ─────────────────────────────────────────────────
         if (buildingWays.length && this._terrainRegistry) {
           const buildings = preprocessBuildings(buildingWays);
 
@@ -968,6 +1078,8 @@ export class OSMTerrainLoader extends BaseLoader {
                   entityDefs.push(col);
                 }
               } else {
+                // A node entry exists for this landmark — upgrade it to the
+                // building-derived def which has area data for better scaling.
                 const existingIdx = entityDefs.findIndex(
                   e => e._bpKey === nameKey && e.id.startsWith('landmark:node:')
                 );
@@ -1025,6 +1137,7 @@ export class OSMTerrainLoader extends BaseLoader {
     console.warn('[OSMTerrainLoader] All endpoints failed, backing off 8s');
     return {};
   }
+  
 
   destroy() {
     if (this._debounceTimer !== null) {
