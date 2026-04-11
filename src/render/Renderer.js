@@ -1,31 +1,17 @@
 /**
  * GOE Core — WorldRenderer
  *
- * The single gateway to the canvas. No subsystem should hold a CanvasRenderingContext2D
- * or draw directly; everything is submitted through this class.
- *
- * Wraps:
- *   VoxelRenderer   — voxel-space box drawing + projection
- *   ShadowSystem    — sun angle, AO, volumetric shadows
- *   RenderPipeline  — depth-sorted world objects + UI overlays
- *
- * Subsystems interact only via:
- *   beginTile / box / drawBlueprint   — voxel geometry
- *   drawLine / drawCircle / drawPolygon / fillRect / drawTransformedImage — primitives
- *   submitShadow / submitWorldObject / submitOverlay  — pipeline queues
+ * Changes:
+ *   • drawDebugOverlay() added — draws collision shapes + facing arrows for
+ *     all blueprint entities.  Called from Engine after flush() when
+ *     debugLayers.colliders is true.
  */
 import { VoxelRenderer }  from './VoxelRenderer.js';
 import { ShadowSystem }   from './ShadowSystem.js';
-import { RenderPipeline } from '../core/RendererPipeline.js';   // adjust path if needed
-import { shadeHex, worldToScreen } from '../math/projection.js';
+import { RenderPipeline } from '../core/RendererPipeline.js';
+import { shadeHex, worldToScreen, tileHalfWidth, getElevOffset } from '../math/projection.js';
 
 export class WorldRenderer {
-  /**
-   * @param {CanvasRenderingContext2D} ctx
-   * @param {object}                  cam
-   * @param {object}                  [opts]
-   * @param {object}                  [opts.shadow]  Forwarded to ShadowSystem
-   */
   constructor(ctx, cam, opts = {}) {
     this.ctx = ctx;
     this.cam = cam;
@@ -35,11 +21,7 @@ export class WorldRenderer {
     this._pipeline = new RenderPipeline(ctx, cam);
   }
 
-  // ── Accessors ─────────────────────────────────────────────────────────────
-
   get shadowSystem() { return this._shadows; }
-
-  // ── Frame lifecycle ───────────────────────────────────────────────────────
 
   beginFrame() {
     this._voxel.beginFrame();
@@ -47,77 +29,36 @@ export class WorldRenderer {
     this._pipeline.beginFrame();
   }
 
-  /**
-   * Execute the deferred rendering pipeline.
-   * Order: shadows → depth-sorted world objects → weather → UI overlays.
-   * @param {WeatherSystem} [weatherSystem]
-   */
   flush(weatherSystem) {
     this._pipeline.flush(this._shadows, weatherSystem);
   }
 
   // ── Voxel / Blueprint drawing ─────────────────────────────────────────────
 
-  /** Set the tile-space origin for subsequent box() calls. */
   beginTile(tx, ty, elevPx) {
     this._voxel.beginTile(tx, ty, elevPx);
   }
 
-  /**
-   * Draw a single voxel box relative to the current tile origin.
-   * Mirrors VoxelRenderer.box() directly.
-   */
   box(x, y, z, w, h, d, top, right, front) {
     this._voxel.box(x, y, z, w, h, d, top, right, front);
   }
 
-
   drawBlueprintRotated(blueprint, tx, ty, elevPx, angleDeg, colorOverride = null) {
     this._voxel.beginTile(tx, ty, elevPx);
-    const rad = (angleDeg ?? 0) * Math.PI / 180;
-    const cos = Math.cos(rad);
-    const sin = Math.sin(rad);
-
+    this._voxel.setRotation(angleDeg ?? 180);
     for (const p of blueprint) {
-      // Rotate box CENTER around Y axis, then recompute corner
-      const cx = p.x + p.w / 2;
-      const cz = p.z + p.d / 2;
-      const rx = cx * cos - cz * sin;
-      const rz = cx * sin + cz * cos;
-
-      // After rotation the box half-extents swap for 90° multiples,
-      // but for arbitrary angles we keep w/d and accept slight shape error
-      // (good enough for OSM compass angles which are usually near 0/90/180/270)
-      const snap = Math.round(angleDeg / 90) * 90;
-      let rw = p.w, rd = p.d;
-      if (Math.abs(snap % 180) === 90) { rw = p.d; rd = p.w; }
-
-      const top   = colorOverride ? colorOverride                  : p.top;
-      const right = colorOverride ? shadeHex(colorOverride, 0.7)   : p.right ?? p.top;
-      const front = colorOverride ? shadeHex(colorOverride, 0.4)   : p.front ?? p.top;
-
-      this._voxel.box(
-        rx - rw / 2, p.y, rz - rd / 2,
-        rw, p.h, rd,
-        top, right, front,
-      );
+      const top   = colorOverride ? colorOverride                : p.top;
+      const right = colorOverride ? shadeHex(colorOverride, 0.7) : p.right ?? p.top;
+      const front = colorOverride ? shadeHex(colorOverride, 0.4) : p.front ?? p.top;
+      this._voxel.box(p.x, p.y, p.z, p.w, p.h, p.d, top, right, front);
     }
+    this._voxel.clearRotation();
   }
 
-  /**
-   * Draw a full blueprint (array of {x,y,z,w,h,d,top,right,front} descriptors)
-   * at a world tile position.
-   *
-   * @param {Array}       blueprint
-   * @param {number}      tx
-   * @param {number}      ty
-   * @param {number}      elevPx
-   * @param {string|null} [colorOverride]  Tints every box when set
-   */
   drawBlueprint(blueprint, tx, ty, elevPx, colorOverride = null) {
     this._voxel.beginTile(tx, ty, elevPx);
     for (const p of blueprint) {
-      const top   = colorOverride ? colorOverride             : p.top;
+      const top   = colorOverride ? colorOverride                : p.top;
       const right = colorOverride ? shadeHex(colorOverride, 0.7) : p.right ?? p.top;
       const front = colorOverride ? shadeHex(colorOverride, 0.4) : p.front ?? p.top;
       this._voxel.box(p.x, p.y, p.z, p.w, p.h, p.d, top, right, front);
@@ -126,7 +67,6 @@ export class WorldRenderer {
 
   // ── Primitive drawing API ─────────────────────────────────────────────────
 
-  /** Stroke a line on the canvas. */
   drawLine(x1, y1, x2, y2, strokeStyle, lineWidth = 1.2, lineCap = 'round') {
     const { ctx } = this;
     ctx.beginPath();
@@ -138,7 +78,6 @@ export class WorldRenderer {
     ctx.stroke();
   }
 
-  /** Fill a circle on the canvas. */
   drawCircle(x, y, radius, fillStyle) {
     const { ctx } = this;
     ctx.beginPath();
@@ -147,7 +86,6 @@ export class WorldRenderer {
     ctx.fill();
   }
 
-  /** Stroke a circle on the canvas. */
   strokeCircle(x, y, radius, strokeStyle, lineWidth = 1.5) {
     const { ctx } = this;
     ctx.beginPath();
@@ -157,10 +95,6 @@ export class WorldRenderer {
     ctx.stroke();
   }
 
-  /**
-   * Draw a closed polygon.
-   * @param {Array<{x,y}>} points
-   */
   drawPolygon(points, fillStyle = null, strokeStyle = null, lineWidth = 0.5) {
     const { ctx } = this;
     ctx.beginPath();
@@ -170,21 +104,11 @@ export class WorldRenderer {
     if (strokeStyle) { ctx.strokeStyle = strokeStyle; ctx.lineWidth = lineWidth; ctx.stroke(); }
   }
 
-  /** Fill a rectangle on the canvas. */
   fillRect(x, y, w, h, fillStyle) {
     this.ctx.fillStyle = fillStyle;
     this.ctx.fillRect(x, y, w, h);
   }
 
-  /**
-   * Draw an image via an affine transform.
-   * Used for slippy-map tiles, baked terrain images, etc.
-   *
-   * @param {CanvasImageSource} img
-   * @param {{m11,m12,m21,m22,dx,dy}} transform
-   * @param {number} [srcW=256]
-   * @param {number} [srcH=256]
-   */
   drawTransformedImage(img, transform, srcW = 256, srcH = 256) {
     const { ctx }                    = this;
     const { m11, m12, m21, m22, dx, dy } = transform;
@@ -194,18 +118,10 @@ export class WorldRenderer {
     ctx.restore();
   }
 
-  /**
-   * Draw a canvas image at a screen position with optional size.
-   * Delegates to standard drawImage overloads.
-   */
   drawImage(img, ...args) {
     this.ctx.drawImage(img, ...args);
   }
 
-  /**
-   * Draw a text label with a dark pill background.
-   * Convenience used by FeatureRenderer, cluster badges, etc.
-   */
   drawLabel(lx, ly, text, bgColor = 'rgba(0,0,0,0.55)', textColor = '#ffffff', fontSize = 11) {
     const { ctx } = this;
     ctx.font           = `500 ${fontSize}px sans-serif`;
@@ -219,6 +135,105 @@ export class WorldRenderer {
     ctx.fill();
     ctx.fillStyle = textColor;
     ctx.fillText(text, lx, ly);
+  }
+
+  // ── Debug overlay ─────────────────────────────────────────────────────────
+
+  /**
+   * Draw debug collision shapes + facing arrows over all entities.
+   * Call AFTER flush() so the overlay sits on top of everything.
+   *
+   * @param {Entity[]} entities
+   * @param {object}   cam
+   * @param {number}   pGX         global origin X
+   * @param {number}   pGY         global origin Y
+   * @param {object}   terrainCache
+   * @param {object}   terrainRegistry
+   */
+  drawDebugOverlay(entities, cam, pGX, pGY, terrainCache, terrainRegistry) {
+    const ctx = this.ctx;
+    const hw  = tileHalfWidth(cam.zoom, cam.tileW);
+    if (hw < 3) return;
+
+    ctx.save();
+
+    for (const e of entities) {
+      const groundH = terrainRegistry.heights[
+        terrainCache.getLocal?.(e.tx, e.ty, pGX, pGY, 80, 80)
+      ] ?? 4;
+      const elevPx = getElevOffset(groundH, cam.tilt, cam.zoom);
+      const { x: sx, y: sy } = worldToScreen(e.tx + 0.5, e.ty + 0.5, elevPx, cam);
+
+      // ── Collision shape ───────────────────────────────────────────────────
+      if (e._isBuildingBox || e._isCollider) {
+        const hw2 = (e._halfW ?? e.bboxRadius) * hw * 2;
+        const hd2 = (e._halfD ?? e.bboxRadius) * hw * 2;
+        ctx.strokeStyle = e._isCollider ? 'rgba(255,80,80,0.7)' : 'rgba(255,200,0,0.5)';
+        ctx.lineWidth   = 1;
+        ctx.strokeRect(sx - hw2, sy - hd2, hw2 * 2, hd2 * 2);
+
+      } else if (e.bboxRadius) {
+        const r = e.bboxRadius * hw * 2;
+        ctx.beginPath();
+        ctx.arc(sx, sy, r, 0, Math.PI * 2);
+        ctx.strokeStyle = e.solid ? 'rgba(255,100,100,0.5)' : 'rgba(100,180,255,0.35)';
+        ctx.lineWidth   = 1;
+        ctx.stroke();
+      }
+
+      // ── Facing arrow (blueprints only) ────────────────────────────────────
+      if (e._facingAngle != null && e._bpKey) {
+        // compassBearing → screen direction
+        // North = -Y on screen (up), East = +X
+        const bearing  = e._facingAngle * Math.PI / 180;
+        const camRot   = cam.rotation;
+        const wx =  Math.sin(bearing);   // east component
+        const wz = -Math.cos(bearing);   // north component (neg because Z=south)
+        // Project into isometric screen space
+        const screenDX = (wx * Math.cos(camRot) - wz * Math.sin(camRot)) * hw;
+        const screenDY = (wx * Math.sin(camRot) + wz * Math.cos(camRot)) * hw * cam.tilt;
+
+        const len = Math.max(12, hw * 1.5);
+        const mag = Math.hypot(screenDX, screenDY) || 1;
+        const nx  = (screenDX / mag) * len;
+        const ny  = (screenDY / mag) * len;
+
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(sx + nx, sy - ny);
+        ctx.strokeStyle = 'rgba(0,255,150,0.9)';
+        ctx.lineWidth   = 2;
+        ctx.stroke();
+
+        // Arrowhead
+        const ax = nx / len, ay = -ny / len;
+        ctx.beginPath();
+        ctx.moveTo(sx + nx, sy - ny);
+        ctx.lineTo(sx + nx - ax * 6 + ay * 4, sy - ny - ay * 6 - ax * 4);
+        ctx.lineTo(sx + nx - ax * 6 - ay * 4, sy - ny - ay * 6 + ax * 4);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(0,255,150,0.9)';
+        ctx.fill();
+
+        // Label: compass degrees
+        if (hw > 8) {
+          ctx.fillStyle  = 'rgba(0,255,150,0.9)';
+          ctx.font       = '10px monospace';
+          ctx.textAlign  = 'center';
+          ctx.fillText(`${Math.round(e._facingAngle)}°`, sx + nx * 1.4, sy - ny * 1.4);
+        }
+      }
+
+      // ── Entity ID at high zoom ────────────────────────────────────────────
+      if (hw > 20 && e._bpKey) {
+        ctx.fillStyle  = 'rgba(255,255,255,0.6)';
+        ctx.font       = '9px monospace';
+        ctx.textAlign  = 'center';
+        ctx.fillText(e._bpKey, sx, sy + 4);
+      }
+    }
+
+    ctx.restore();
   }
 
   // ── Pipeline submission ───────────────────────────────────────────────────
@@ -241,8 +256,6 @@ export class WorldRenderer {
   toggleShadows(value) {
     this._shadows.enabled = value ?? !this._shadows.enabled;
   }
-
-  // ── Projection convenience ────────────────────────────────────────────────
 
   worldToScreen(tx, ty, elevPx) {
     return worldToScreen(tx, ty, elevPx, this.cam);

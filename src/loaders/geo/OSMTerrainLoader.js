@@ -12,6 +12,17 @@
  *   id, latitude, longitude, solid, bboxRadius, physicsEnabled, fixed,
  *   physicsRadius, renderHeavy, _isBuildingBox, _lodColor,
  *   renderFn, updateFn
+ *
+ * Changes from previous version:
+ *   1. Rotation moved into VoxelRenderer.proj() via setRotation/clearRotation
+ *      — renderFn no longer needs to rotate box centres manually.
+ *   2. Fixed tree node block — was referencing nameKey/scale/scaledR from
+ *      landmark scope; now uses its own bpKey and sensible defaults.
+ *   3. Fixed buildingWay reference — extractFacingAngle now receives b.geometry
+ *      directly (buildingWay was undefined in that scope).
+ *   4. Compass→engine angle is corrected: blueprints face Z+ (south) by
+ *      default so bearing 180 = no rotation.  The conversion lives in
+ *      VoxelRenderer.setRotation(), not here.
  */
 import { BaseLoader } from '../BaseLoader.js';
 import { TerrainType } from '../../terrain/types.js';
@@ -168,14 +179,13 @@ function makeBlueprintColliders(id, lat, lon, blueprint, scale, mPerTile) {
     const halfD  = (p.d * 0.5) * scale / VU;
     
     // Only collide with boxes that have meaningful ground-level footprint
-    // (ignore purely decorative high-up boxes like spire tips)
     const groundY = p.y * scale / VU;
-    if (halfW < 0.3 || halfD < 0.3) continue;  // too thin
+    if (halfW < 0.3 || halfD < 0.3) continue;
     if (groundY > 4 && halfW < 1 && halfD < 1) continue;
     
     colliders.push({
       id:             `${id}_col_${i}`,
-      latitude:       lat,   // will be offset after geo→tile conversion
+      latitude:       lat,
       longitude:      lon,
       _localOffsetX:  localX,
       _localOffsetZ:  localZ,
@@ -186,7 +196,7 @@ function makeBlueprintColliders(id, lat, lon, blueprint, scale, mPerTile) {
       physicsEnabled: false,
       fixed:          true,
       renderHeavy:    false,
-      renderFn:       null,   // invisible
+      renderFn:       null,
       _isBuildingBox: true,
       _isCollider:    true,
       _parentId:      id,
@@ -199,54 +209,32 @@ function makeBlueprintColliders(id, lat, lon, blueprint, scale, mPerTile) {
 function tileOffsetToGeo(dTileX, dTileZ, baseLat, mPerTile) {
   const mLat = 111320;
   const mLon = 111320 * Math.cos(baseLat * Math.PI / 180);
-  const dLat = -(dTileZ * mPerTile) / mLat;   // z axis = south
+  const dLat = -(dTileZ * mPerTile) / mLat;
   const dLon =  (dTileX * mPerTile) / mLon;
   return { dLat, dLon };
 }
 
 // ─── Blueprint scaling helpers ─────────────────────────────────────────────────
 
-/**
- * Compute the native axis-aligned bounding box of a blueprint in voxel units.
- *   maxY         — tallest point (voxel units above y=0)
- *   halfExtentXZ — largest half-width/depth from origin (voxel units)
- */
 function blueprintNativeBounds(blueprint) {
   let maxY = 0, halfXZ = 0;
   for (const p of blueprint) {
     maxY   = Math.max(maxY, p.y + p.h);
-    // Distance from origin to the CENTER of each box face
     halfXZ = Math.max(halfXZ, Math.abs(p.x + p.w * 0.5), Math.abs(p.z + p.d * 0.5));
   }
   return { maxY, halfExtentXZ: halfXZ };
 }
 
-/**
- * Derive a uniform scale factor so the blueprint matches real-world OSM dims.
- *
- * Strategy:
- *   - If OSM height tag is present use it as the primary driver (most reliable).
- *   - Otherwise fall back to footprint area.
- *   - If neither is known, return 1 (native voxel scale).
- *
- * @param {Array}  blueprint  — raw blueprint box array
- * @param {number} osmHeightM — height in metres from OSM tags (0 = unknown)
- * @param {number} osmAreaM2  — footprint area in m² from OSM  (0 = unknown)
- * @param {number} mPerTile   — metres per tile in the engine
- * @returns {number} uniform scale factor
- */
 function computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile) {
   const { maxY, halfExtentXZ } = blueprintNativeBounds(blueprint);
 
   if (osmHeightM > 0 && maxY > 0) {
-    // Native blueprint height in tiles → target height in tiles → ratio
     const nativeTileH = maxY / VU;
     const targetTileH = osmHeightM / mPerTile;
     return targetTileH / nativeTileH;
   }
 
   if (osmAreaM2 > 0 && halfExtentXZ > 0) {
-    // Treat footprint as square: half-extent = sqrt(area) / 2
     const nativeTileR = halfExtentXZ / VU;
     const targetTileR = Math.sqrt(osmAreaM2) / mPerTile / 2;
     return targetTileR / nativeTileR;
@@ -257,11 +245,6 @@ function computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile) {
 
 // ─── EntityDef factories ────────────────────────────────────────────────────────
 
-/**
- * Create a building EntityDef.
- * renderFn draws the voxel box + facade decoration; the Engine never needs to
- * know this is a building.
- */
 function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, decorateBuildingFacade) {
   const halfSideM     = Math.sqrt(Math.max(16, b.areaM2));
   const halfSideTiles = halfSideM / mPerTile / 2;
@@ -318,7 +301,7 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, decorateBuildin
  * Priority:
  *   1. building:direction / direction tag (explicit compass bearing)
  *   2. First wall edge of the way geometry (implicit from node order)
- *   3. 0 (north) as fallback
+ *   3. 180 (south, blueprint default) as fallback
  */
 function extractFacingAngle(tags = {}, geometry = null) {
   // 1. Explicit tag
@@ -326,7 +309,6 @@ function extractFacingAngle(tags = {}, geometry = null) {
   if (explicit != null) {
     const deg = parseFloat(explicit);
     if (!isNaN(deg)) return deg;
-    // Cardinal strings
     const cardinals = { N:0, NE:45, E:90, SE:135, S:180, SW:225, W:270, NW:315 };
     if (cardinals[explicit.toUpperCase()] != null) return cardinals[explicit.toUpperCase()];
   }
@@ -335,25 +317,25 @@ function extractFacingAngle(tags = {}, geometry = null) {
   if (geometry?.length >= 2) {
     const dLon = geometry[1].lon - geometry[0].lon;
     const dLat = geometry[1].lat - geometry[0].lat;
-    // atan2 gives angle from east; convert to compass bearing from north
     const bearing = (Math.atan2(dLon, dLat) * 180 / Math.PI + 360) % 360;
-    // Snap to nearest 45° to avoid jitter from imprecise OSM tracing
     return Math.round(bearing / 45) * 45;
   }
 
-  return 0;
+  // 3. Default: south = blueprint default facing, no visual rotation
+  return 180;
 }
 
 /**
- * Blueprint entity (trees, landmarks, fauna, aviation props, etc.)
+ * Blueprint entity factory.
  *
- * opts.scale — uniform scale applied to every box at draw time so the model
- *              matches real-world OSM dimensions. Default 1 (native voxel size).
- *              Stored as _scale on the entity so it survives cache round-trips.
+ * Rotation is now handled entirely by VoxelRenderer.setRotation() inside
+ * renderFn — no box-centre math needed here.
+ *
+ * opts.facingAngle is a compass bearing (0=N, 90=E, 180=S default, 270=W).
  */
 function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
   const scale       = opts.scale       ?? 1;
-  const facingAngle = opts.facingAngle ?? 0;  // ← compass degrees, 0 = north
+  const facingAngle = opts.facingAngle ?? 180; // 180 = south = default blueprint facing
 
   return {
     id,
@@ -376,11 +358,10 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
 
     renderFn(wr, groundElevPx, extra, entity) {
       const blueprint = Blueprints[bpKey] ?? Blueprints['tree'];
-      if (!blueprint) return;
-      if (wr.cam.tilt < 0.04) return;
+      if (!blueprint || wr.cam.tilt < 0.04) return;
 
-      const s     = entity._scale ?? 1;
-      const angle = entity._facingAngle ?? 0;
+      const s     = entity._scale       ?? 1;
+      const angle = entity._facingAngle ?? 180;
       const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
       const elev  = groundElevPx + entity.elevOffset;
       const depth = tileDepth(
@@ -390,40 +371,25 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
 
       wr.submitWorldObject(depth, () => {
         wr.ctx.globalAlpha = isoA;
+        wr._voxel.beginTile(entity.tx, entity.ty, elev);
+        wr._voxel.setRotation(angle);   // rotation now in proj(), affects all 8 corners
 
-        if (s !== 1 || angle !== 0) {
-          // Scale + rotate each box
-          const rad = angle * Math.PI / 180;
-          const cos = Math.cos(rad), sin = Math.sin(rad);
-          const snap = Math.round(angle / 90) * 90;
-
-          wr._voxel.beginTile(entity.tx, entity.ty, elev);
-          for (const p of blueprint) {
-            const cx = (p.x + p.w / 2) * s;
-            const cz = (p.z + p.d / 2) * s;
-            const rx = cx * cos - cz * sin;
-            const rz = cx * sin + cz * cos;
-
-            let rw = p.w * s, rd = p.d * s;
-            if (Math.abs(snap % 180) === 90) { rw = p.d * s; rd = p.w * s; }
-
-            wr._voxel.box(
-              rx - rw / 2, p.y * s, rz - rd / 2,
-              rw, p.h * s, rd,
-              p.top, p.right ?? p.top, p.front ?? p.top,
-            );
-          }
-        } else {
-          wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
+        for (const p of blueprint) {
+          wr._voxel.box(
+            p.x * s, p.y * s, p.z * s,
+            p.w * s, p.h * s, p.d * s,
+            p.top, p.right ?? p.top, p.front ?? p.top,
+          );
         }
 
+        wr._voxel.clearRotation();
         wr.ctx.globalAlpha = 1;
       });
     },
   };
 }
 
-/** Standard 2D icon POI feature — self-contained renderFn, no external resolver */
+/** Standard 2D icon POI feature */
 function makeFeatureDef(f) {
   let blueprint    = null;
   let blueprintKey = null;
@@ -695,12 +661,10 @@ export class OSMTerrainLoader extends BaseLoader {
             );
           }
           if (e.bpKey) {
-            // Restore _scale so the landmark draws at the correct real-world size
-            
             return makeBlueprintDef(e.id, e.latitude, e.longitude, e.bpKey, {
               ...e,
-              scale: e._scale ?? 1,
-              facingAngle: e._facingAngle ?? 0,
+              scale:        e._scale        ?? 1,
+              facingAngle:  e._facingAngle  ?? 180,
             });
           }
           return makeFeatureDef(e);
@@ -754,8 +718,6 @@ export class OSMTerrainLoader extends BaseLoader {
         const terrainUpdates = new Map();
         const entityDefs     = [];
 
-        // Tracks which landmark blueprint keys have already been placed this
-        // fetch so duplicate OSM nodes/ways for the same structure are skipped.
         const renderedLandmarkNames = new Set();
 
         const toTile = (eLat, eLon) => ({
@@ -785,7 +747,6 @@ export class OSMTerrainLoader extends BaseLoader {
 
               if (el.tags?.building) buildingWays.push(el);
 
-              // Road traffic props
               if (el.tags?.highway &&
                   ['primary','secondary','tertiary','residential'].includes(el.tags.highway) &&
                   Math.random() > 0.6) {
@@ -824,25 +785,23 @@ export class OSMTerrainLoader extends BaseLoader {
             const { x: gx, y: gy } = toTile(el.lat, el.lon);
             if (gx < minGX || gx > maxGX || gy < minGY || gy > maxGY) continue;
 
-            // Individual OSM trees
+            // ── FIX 1: Individual OSM trees — use local bpKey/defaults, not
+            //    variables from the landmark scope (nameKey, scale, scaledR).
             if (el.tags?.natural === 'tree') {
               const species = treeSpeciesFromTags(el.tags);
               const bpKey   = TREE_BLUEPRINT_KEY[species] ?? 'tree_oak';
-              const facingAngle = extractFacingAngle(el.tags);
               entityDefs.push(makeBlueprintDef(
-                `landmark:node:${el.id}`,
+                `tree:${el.id}`,
                 el.lat, el.lon,
-                nameKey,
+                bpKey,
                 {
-                  scale,
-                  facingAngle,          // ← new
                   solid:           true,
-                  bboxRadius:      scaledR,
-                  footprintRadius: scaledR,
+                  bboxRadius:      0.5,
+                  footprintRadius: 1.2,
                   physicsEnabled:  true,
-                  physicsRadius:   scaledR,
-                  fixed:           true,
-                  lodColor:        '#A1887F',
+                  physicsRadius:   0.5,
+                  lodColor:        '#2E7D32',
+                  facingAngle:     180, // trees are symmetric, direction irrelevant
                 }
               ));
               continue;
@@ -855,7 +814,6 @@ export class OSMTerrainLoader extends BaseLoader {
             const name    = el.tags?.name || poi.label;
             const nameKey = name.toLowerCase().replace(/\s+/g, '_');
 
-            // Named landmark node → place blueprint once, skip POI dot always
             if (Blueprints[nameKey]) {
               if (!renderedLandmarkNames.has(nameKey)) {
                 renderedLandmarkNames.add(nameKey);
@@ -865,6 +823,7 @@ export class OSMTerrainLoader extends BaseLoader {
                 const scale      = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile);
                 const { halfExtentXZ } = blueprintNativeBounds(blueprint);
                 const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
+                const facingAngle = extractFacingAngle(el.tags);
 
                 entityDefs.push(makeBlueprintDef(
                   `landmark:node:${el.id}`,
@@ -872,6 +831,7 @@ export class OSMTerrainLoader extends BaseLoader {
                   nameKey,
                   {
                     scale,
+                    facingAngle,
                     solid:           true,
                     bboxRadius:      scaledR,
                     footprintRadius: scaledR,
@@ -882,7 +842,7 @@ export class OSMTerrainLoader extends BaseLoader {
                   }
                 ));
               }
-              continue; // skip POI fallthrough even if already rendered by way
+              continue;
             }
 
             entityDefs.push(makeFeatureDef({
@@ -907,13 +867,10 @@ export class OSMTerrainLoader extends BaseLoader {
 
           for (const b of buildings) {
             const name    = b.tags?.name ?? '';
-            const nameKey = name.toLowerCase().replace(/\s+/g, '_'); // global replace
+            const nameKey = name.toLowerCase().replace(/\s+/g, '_');
             const blueprint = Blueprints[nameKey];
 
             if (blueprint) {
-              // Compute real-world scale from OSM height + footprint area.
-              // The building way carries the most complete data (e.g. height=330
-              // on the Eiffel Tower way), so this is the authoritative source.
               const osmHeightM = parseFloat(b.tags?.height ?? b.tags?.['building:height'] ?? 0) || 0;
               const osmAreaM2  = b.areaM2 ?? 0;
               const scale      = computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, this._mPerTile);
@@ -926,7 +883,8 @@ export class OSMTerrainLoader extends BaseLoader {
                 `scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`
               );
 
-              const facingAngle = extractFacingAngle(b.tags, b.geometry ?? buildingWay.geometry);
+              // ── FIX 2: b already has .geometry — buildingWay was undefined.
+              const facingAngle = extractFacingAngle(b.tags, b.geometry);
 
               const landmarkDef = makeBlueprintDef(
                 `landmark:${b.id}`,
@@ -935,8 +893,8 @@ export class OSMTerrainLoader extends BaseLoader {
                 nameKey,
                 {
                   scale,
+                  facingAngle,
                   solid:           true,
-                  facingAngle,    
                   bboxRadius:      scaledR,
                   footprintRadius: scaledR,
                   physicsEnabled:  true,
@@ -948,10 +906,8 @@ export class OSMTerrainLoader extends BaseLoader {
 
               if (!renderedLandmarkNames.has(nameKey)) {
                 renderedLandmarkNames.add(nameKey);
-                
                 entityDefs.push(landmarkDef);
 
-                // Generate per-box colliders
                 const colliders = makeBlueprintColliders(
                   `landmark:${b.id}`,
                   b.centroid.lat,
@@ -973,8 +929,6 @@ export class OSMTerrainLoader extends BaseLoader {
                   entityDefs.push(col);
                 }
               } else {
-                // Upgrade any earlier node-placed entry to the richer
-                // building-centroid position and computed scale.
                 const existingIdx = entityDefs.findIndex(
                   e => e._bpKey === nameKey && e.id.startsWith('landmark:node:')
                 );
@@ -998,22 +952,22 @@ export class OSMTerrainLoader extends BaseLoader {
           await this._cache.set(cacheKey, {
             terrainUpdates: Object.fromEntries(terrainUpdates),
             entities: entityDefs.map(e => ({
-              id:        e.id,
-              latitude:  e.latitude,
-              longitude: e.longitude,
-              solid:     e.solid,
-              bboxRadius: e.bboxRadius,
-              _type:     e._isBuildingBox ? 'building' : (e.renderHeavy && e._bpKey ? 'blueprint' : 'poi'),
-              areaM2:    e._areaM2   ?? null,
-              heightM:   e._heightM  ?? null,
-              bpKey:     e._bpKey    ?? null,
-              _scale:    e._scale    ?? null,  // ← persisted for cache reconstruction
-              _facingAngle: e._facingAngle ?? null,
-              label:     e.label,
-              color:     e.color,
-              category:  e.category,
-              value:     e.value,
-              title:     e.title,
+              id:           e.id,
+              latitude:     e.latitude,
+              longitude:    e.longitude,
+              solid:        e.solid,
+              bboxRadius:   e.bboxRadius,
+              _type:        e._isBuildingBox ? 'building' : (e.renderHeavy && e._bpKey ? 'blueprint' : 'poi'),
+              areaM2:       e._areaM2        ?? null,
+              heightM:      e._heightM       ?? null,
+              bpKey:        e._bpKey         ?? null,
+              _scale:       e._scale         ?? null,
+              _facingAngle: e._facingAngle   ?? null,
+              label:        e.label,
+              color:        e.color,
+              category:     e.category,
+              value:        e.value,
+              title:        e.title,
             })),
             timestamp: Date.now(),
           });
