@@ -1,28 +1,19 @@
 /**
  * GOE — OSMTerrainLoader
  *
- * Fetches terrain polygons/lines + POI nodes from the Overpass API and
- * rasterises them into TerrainCache updates.
+ * Fixes in this revision:
+ *   A. Blueprint renderFn now calls wr.submitShadow() so trees, landmarks
+ *      (Eiffel Tower etc.) cast shadows like buildings do.
+ *      Shadow hull dimensions are derived from the blueprint's native
+ *      bounding box scaled by entity._scale, computed once at definition
+ *      time and stored in closure.
  *
- * Entity construction (buildings, trees, road traffic) lives entirely here.
- * The loader returns plain EntityDef objects; the Engine wraps them in
- * GenericEntity without knowing what kind of object they are.
- *
- * EntityDef fields used here:
- *   id, latitude, longitude, solid, bboxRadius, physicsEnabled, fixed,
- *   physicsRadius, renderHeavy, _isBuildingBox, _lodColor,
- *   renderFn, updateFn
- *
- * Changes from previous version:
- *   1. Rotation moved into VoxelRenderer.proj() via setRotation/clearRotation
- *      — renderFn no longer needs to rotate box centres manually.
- *   2. Fixed tree node block — was referencing nameKey/scale/scaledR from
- *      landmark scope; now uses its own bpKey and sensible defaults.
- *   3. Fixed buildingWay reference — extractFacingAngle now receives b.geometry
- *      directly (buildingWay was undefined in that scope).
- *   4. Compass→engine angle is corrected: blueprints face Z+ (south) by
- *      default so bearing 180 = no rotation.  The conversion lives in
- *      VoxelRenderer.setRotation(), not here.
+ *   B. Depth sorting — tileDepth() projects the entity CENTRE onto the
+ *      camera axis. For large objects this causes pop-through at non-cardinal
+ *      rotations because the front corner of one object can be nearer to the
+ *      camera than the centre of a smaller object behind it.
+ *      Fix: frontDepth() uses the FRONT CORNER (the corner that maximises
+ *      depth along the camera axis) as the sort key for all entity types.
  */
 import { BaseLoader } from '../BaseLoader.js';
 import { TerrainType } from '../../terrain/types.js';
@@ -39,10 +30,27 @@ const DEFAULT_ENDPOINTS = [
   'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ];
 
-const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
-
-// VU — voxel units per tile (must match VoxelRenderer)
+const CACHE_TTL_MS = 30 * 60 * 1000;
 const VU = 8;
+
+// ─── Depth sort helper ────────────────────────────────────────────────────────
+/**
+ * Returns the depth of the FRONT CORNER of a square bounding box.
+ *
+ * The isometric depth axis is:  depth = tx·cos(rot) + ty·sin(rot)
+ *
+ * For a box centred at (tx,ty) with half-extent r tiles the front corner
+ * (the one geometrically closest to the camera = highest depth = drawn last)
+ * is at (tx + sign(cos)·r,  ty + sign(sin)·r).
+ *
+ * Using the front corner instead of the centre prevents large objects from
+ * being buried behind smaller ones at non-cardinal camera angles.
+ */
+function frontDepth(tx, ty, rot, r) {
+  const cr = Math.cos(rot);
+  const sr = Math.sin(rot);
+  return (tx + Math.sign(cr) * r) * cr + (ty + Math.sign(sr) * r) * sr;
+}
 
 // ─── Terrain classification ────────────────────────────────────────────────────
 
@@ -161,28 +169,17 @@ function rasterizeLine(cache, pts, terrain, width) {
   }
 }
 
-
-/**
- * Generate AABB collision sub-entities from a blueprint's boxes.
- * Each box becomes a tiny invisible solid entity the player bounces off.
- */
 function makeBlueprintColliders(id, lat, lon, blueprint, scale, mPerTile) {
   const colliders = [];
-  
   for (let i = 0; i < blueprint.length; i++) {
     const p = blueprint[i];
-    
-    // Box center in voxel units → tile units
     const localX = (p.x + p.w * 0.5) * scale / VU;
     const localZ = (p.z + p.d * 0.5) * scale / VU;
     const halfW  = (p.w * 0.5) * scale / VU;
     const halfD  = (p.d * 0.5) * scale / VU;
-    
-    // Only collide with boxes that have meaningful ground-level footprint
     const groundY = p.y * scale / VU;
     if (halfW < 0.3 || halfD < 0.3) continue;
     if (groundY > 4 && halfW < 1 && halfD < 1) continue;
-    
     colliders.push({
       id:             `${id}_col_${i}`,
       latitude:       lat,
@@ -202,7 +199,6 @@ function makeBlueprintColliders(id, lat, lon, blueprint, scale, mPerTile) {
       _parentId:      id,
     });
   }
-  
   return colliders;
 }
 
@@ -227,19 +223,16 @@ function blueprintNativeBounds(blueprint) {
 
 function computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile) {
   const { maxY, halfExtentXZ } = blueprintNativeBounds(blueprint);
-
   if (osmHeightM > 0 && maxY > 0) {
     const nativeTileH = maxY / VU;
     const targetTileH = osmHeightM / mPerTile;
     return targetTileH / nativeTileH;
   }
-
   if (osmAreaM2 > 0 && halfExtentXZ > 0) {
     const nativeTileR = halfExtentXZ / VU;
     const targetTileR = Math.sqrt(osmAreaM2) / mPerTile / 2;
     return targetTileR / nativeTileR;
   }
-
   return 1;
 }
 
@@ -270,7 +263,8 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, decorateBuildin
 
     renderFn(wr, groundElevPx, extra, entity) {
       const elev  = groundElevPx + entity.elevOffset;
-      const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation, rVox / VU);
+      // FIX B: sort by front corner of bounding box
+      const depth = frontDepth(entity.tx, entity.ty, wr.cam.rotation, rVox / VU);
 
       wr.submitShadow({ p: { x: entity.tx, y: entity.ty }, elev, r: rVox, engineH: hVox });
 
@@ -295,16 +289,7 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, decorateBuildin
   };
 }
 
-/**
- * Extract facing angle in degrees from OSM tags + way geometry.
- *
- * Priority:
- *   1. building:direction / direction tag (explicit compass bearing)
- *   2. First wall edge of the way geometry (implicit from node order)
- *   3. 180 (south, blueprint default) as fallback
- */
 function extractFacingAngle(tags = {}, geometry = null) {
-  // 1. Explicit tag
   const explicit = tags['building:direction'] ?? tags['direction'];
   if (explicit != null) {
     const deg = parseFloat(explicit);
@@ -312,30 +297,38 @@ function extractFacingAngle(tags = {}, geometry = null) {
     const cardinals = { N:0, NE:45, E:90, SE:135, S:180, SW:225, W:270, NW:315 };
     if (cardinals[explicit.toUpperCase()] != null) return cardinals[explicit.toUpperCase()];
   }
-
-  // 2. Way geometry — first edge defines the wall direction
   if (geometry?.length >= 2) {
     const dLon = geometry[1].lon - geometry[0].lon;
     const dLat = geometry[1].lat - geometry[0].lat;
     const bearing = (Math.atan2(dLon, dLat) * 180 / Math.PI + 360) % 360;
     return Math.round(bearing / 45) * 45;
   }
-
-  // 3. Default: south = blueprint default facing, no visual rotation
   return 180;
 }
 
 /**
  * Blueprint entity factory.
  *
- * Rotation is now handled entirely by VoxelRenderer.setRotation() inside
- * renderFn — no box-centre math needed here.
+ * FIX A: renderFn submits a shadow hull using blueprint bounding box dims.
+ *         _shadowR and _shadowH are computed once at definition time in
+ *         closure so renderFn pays zero cost per frame.
  *
- * opts.facingAngle is a compass bearing (0=N, 90=E, 180=S default, 270=W).
+ * FIX B: depth sort uses frontDepth() — the front corner of the bounding
+ *         box — instead of the centre, fixing pop-through at diagonal angles.
  */
 function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
   const scale       = opts.scale       ?? 1;
-  const facingAngle = opts.facingAngle ?? 180; // 180 = south = default blueprint facing
+  const facingAngle = opts.facingAngle ?? 180;
+
+  // Pre-compute shadow hull dimensions at definition time (closure)
+  const _bp0 = Blueprints[bpKey];
+  let _shadowR = 0;  // voxel units
+  let _shadowH = 0;  // voxel units
+  if (_bp0) {
+    const { maxY, halfExtentXZ } = blueprintNativeBounds(_bp0);
+    _shadowR = halfExtentXZ * scale;
+    _shadowH = maxY         * scale;
+  }
 
   return {
     id,
@@ -364,15 +357,29 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
       const angle = entity._facingAngle ?? 180;
       const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
       const elev  = groundElevPx + entity.elevOffset;
-      const depth = tileDepth(
-        entity.tx, entity.ty, wr.cam.rotation,
-        entity.footprintRadius ?? entity.bboxRadius ?? 0.35
-      );
+
+      // FIX B: front-corner depth for correct sort at diagonal rotations
+      const footR = entity.footprintRadius ?? entity.bboxRadius ?? 0.35;
+      const depth = frontDepth(entity.tx, entity.ty, wr.cam.rotation, footR);
+
+      // FIX A: shadow from blueprint bounding box
+      // If entity._scale differs from closure scale (cache restore), rescale.
+      const scaleRatio = (scale > 0) ? s / scale : 1;
+      const shadowR = _shadowR * scaleRatio;
+      const shadowH = _shadowH * scaleRatio;
+      if (shadowR > 0 && shadowH > 0) {
+        wr.submitShadow({
+          p:       { x: entity.tx, y: entity.ty },
+          elev,
+          r:       shadowR,   // voxel units (same convention as building rVox)
+          engineH: shadowH,
+        });
+      }
 
       wr.submitWorldObject(depth, () => {
         wr.ctx.globalAlpha = isoA;
         wr._voxel.beginTile(entity.tx, entity.ty, elev);
-        wr._voxel.setRotation(angle);   // rotation now in proj(), affects all 8 corners
+        wr._voxel.setRotation(angle);
 
         for (const p of blueprint) {
           wr._voxel.box(
@@ -431,6 +438,7 @@ function makeFeatureDef(f) {
       const { cam } = wr;
       if (cam.tilt < 0.02) return;
       const elev  = groundElevPx + (entity.elevOffset ?? 0);
+      // POIs are point-sized, centre depth is correct for them
       const depth = tileDepth(entity.tx, entity.ty, cam.rotation, 0.35);
       const hw    = tileHalfWidth(cam.zoom, cam.tileW);
       const r     = Math.max(3, hw * 0.7);
@@ -599,11 +607,9 @@ export class OSMTerrainLoader extends BaseLoader {
     this._backoffUntil = 0;
     this._abort        = null;
     this._cache        = new PersistentCache('GOE_Overpass', 'osm_terrain');
-
     this._fetchDebounceMs = options.fetchDebounceMs ?? 800;
     this._debounceTimer   = null;
     this._pendingResolve  = null;
-
     this._decorateBuildingFacade = options.decorateBuildingFacade ?? null;
     this._terrainRegistry        = options.terrainRegistry        ?? null;
   }
@@ -624,7 +630,6 @@ export class OSMTerrainLoader extends BaseLoader {
       clearTimeout(this._debounceTimer);
       this._pendingResolve?.({});
     }
-
     return new Promise(resolve => {
       this._pendingResolve = resolve;
       this._debounceTimer  = setTimeout(async () => {
@@ -645,7 +650,6 @@ export class OSMTerrainLoader extends BaseLoader {
       return {};
     }
 
-    // ── Persistent cache ─────────────────────────────────────────────────────
     const cacheKey = this._getCacheKey(geoCenter);
     try {
       const cached = await this._cache.get(cacheKey);
@@ -663,8 +667,8 @@ export class OSMTerrainLoader extends BaseLoader {
           if (e.bpKey) {
             return makeBlueprintDef(e.id, e.latitude, e.longitude, e.bpKey, {
               ...e,
-              scale:        e._scale        ?? 1,
-              facingAngle:  e._facingAngle  ?? 180,
+              scale:       e._scale       ?? 1,
+              facingAngle: e._facingAngle ?? 180,
             });
           }
           return makeFeatureDef(e);
@@ -676,7 +680,6 @@ export class OSMTerrainLoader extends BaseLoader {
       }
     } catch (err) { console.warn('[OSMTerrainLoader] Cache read error', err); }
 
-    // ── Overpass query ────────────────────────────────────────────────────────
     const { lat, lon } = geoCenter;
     const r = this._fetchRadiusM;
     const around = `(around:${r},${lat},${lon})`;
@@ -708,16 +711,14 @@ export class OSMTerrainLoader extends BaseLoader {
           { signal: ctrl.signal }
         );
         clearTimeout(timeout);
-
         if (res.status === 429) { this._nextEndpoint(); continue; }
         if (!res.ok)             { this._nextEndpoint(); continue; }
 
         const data = await res.json();
         console.log(`[OSMTerrainLoader] ${data.elements?.length ?? 0} elements from ${this._endpoint}`);
 
-        const terrainUpdates = new Map();
-        const entityDefs     = [];
-
+        const terrainUpdates        = new Map();
+        const entityDefs            = [];
         const renderedLandmarkNames = new Set();
 
         const toTile = (eLat, eLon) => ({
@@ -737,38 +738,31 @@ export class OSMTerrainLoader extends BaseLoader {
 
         for (const el of data.elements) {
 
-          // ── Ways (terrain + buildings) ─────────────────────────────────────
           if (el.type === 'way' && el.geometry?.length) {
             const cls = classifyOSM(el.tags);
             if (cls) {
               const pts = el.geometry.map(g => toTile(g.lat, g.lon));
               if (cls.type === 'polygon') rasterizePolygon(terrainUpdates, pts, cls.terrain);
               else                        rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width);
-
               if (el.tags?.building) buildingWays.push(el);
 
               if (el.tags?.highway &&
                   ['primary','secondary','tertiary','residential'].includes(el.tags.highway) &&
                   Math.random() > 0.6) {
                 entityDefs.push({
-                  id:        `car:${el.id}`,
+                  id: `car:${el.id}`,
                   latitude:  el.geometry[0].lat,
                   longitude: el.geometry[0].lon,
-                  solid:     false,
-                  bboxRadius: 0.35,
-                  physicsEnabled: false,
-                  fixed:     true,
-                  renderHeavy: true,
+                  solid: false, bboxRadius: 0.35,
+                  physicsEnabled: false, fixed: true, renderHeavy: true,
                   _lodColor: '#607D8B',
-                  title: 'car',
-                  label: 'car',
-                  category: 'car',
+                  title: 'car', label: 'car', category: 'car',
                   renderFn(wr, groundElevPx, extra, entity) {
                     const blueprint = Blueprints['car'];
                     if (!blueprint || wr.cam.tilt < 0.04) return;
                     const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
                     const elev  = groundElevPx + entity.elevOffset;
-                    const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation, 0.35);
+                    const depth = frontDepth(entity.tx, entity.ty, wr.cam.rotation, 0.35);
                     wr.submitWorldObject(depth, () => {
                       wr.ctx.globalAlpha = isoA;
                       wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
@@ -780,34 +774,24 @@ export class OSMTerrainLoader extends BaseLoader {
             }
           }
 
-          // ── Nodes (POIs + individual trees) ────────────────────────────────
           if (el.type === 'node') {
             const { x: gx, y: gy } = toTile(el.lat, el.lon);
             if (gx < minGX || gx > maxGX || gy < minGY || gy > maxGY) continue;
 
-            // ── FIX 1: Individual OSM trees — use local bpKey/defaults, not
-            //    variables from the landmark scope (nameKey, scale, scaledR).
             if (el.tags?.natural === 'tree') {
               const species = treeSpeciesFromTags(el.tags);
               const bpKey   = TREE_BLUEPRINT_KEY[species] ?? 'tree_oak';
               entityDefs.push(makeBlueprintDef(
-                `tree:${el.id}`,
-                el.lat, el.lon,
-                bpKey,
+                `tree:${el.id}`, el.lat, el.lon, bpKey,
                 {
-                  solid:           true,
-                  bboxRadius:      0.5,
-                  footprintRadius: 1.2,
-                  physicsEnabled:  true,
-                  physicsRadius:   0.5,
-                  lodColor:        '#2E7D32',
-                  facingAngle:     180, // trees are symmetric, direction irrelevant
+                  solid: true, bboxRadius: 0.5, footprintRadius: 1.2,
+                  physicsEnabled: true, physicsRadius: 0.5,
+                  lodColor: '#2E7D32', facingAngle: 180,
                 }
               ));
               continue;
             }
 
-            // Standard POI
             const poi = classifyPOI(el.tags);
             if (!poi) continue;
 
@@ -817,28 +801,19 @@ export class OSMTerrainLoader extends BaseLoader {
             if (Blueprints[nameKey]) {
               if (!renderedLandmarkNames.has(nameKey)) {
                 renderedLandmarkNames.add(nameKey);
-
-                const blueprint  = Blueprints[nameKey];
-                const osmHeightM = parseFloat(el.tags?.height ?? el.tags?.['building:height'] ?? 0) || 0;
-                const scale      = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile);
+                const blueprint   = Blueprints[nameKey];
+                const osmHeightM  = parseFloat(el.tags?.height ?? el.tags?.['building:height'] ?? 0) || 0;
+                const scale       = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile);
                 const { halfExtentXZ } = blueprintNativeBounds(blueprint);
-                const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
+                const scaledR     = Math.max(2, (halfExtentXZ / VU) * scale);
                 const facingAngle = extractFacingAngle(el.tags);
-
                 entityDefs.push(makeBlueprintDef(
-                  `landmark:node:${el.id}`,
-                  el.lat, el.lon,
-                  nameKey,
+                  `landmark:node:${el.id}`, el.lat, el.lon, nameKey,
                   {
-                    scale,
-                    facingAngle,
-                    solid:           true,
-                    bboxRadius:      scaledR,
-                    footprintRadius: scaledR,
-                    physicsEnabled:  true,
-                    physicsRadius:   scaledR,
-                    fixed:           true,
-                    lodColor:        '#A1887F',
+                    scale, facingAngle,
+                    solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
+                    physicsEnabled: true, physicsRadius: scaledR,
+                    fixed: true, lodColor: '#A1887F',
                   }
                 ));
               }
@@ -846,28 +821,24 @@ export class OSMTerrainLoader extends BaseLoader {
             }
 
             entityDefs.push(makeFeatureDef({
-              id:          `osm:node:${el.id}`,
-              latitude:    el.lat,
-              longitude:   el.lon,
-              color:       poi.color,
-              label:       poi.label,
-              category:    poi.category,
-              value:       poi.value,
-              title:       name,
+              id: `osm:node:${el.id}`,
+              latitude: el.lat, longitude: el.lon,
+              color: poi.color, label: poi.label,
+              category: poi.category, value: poi.value,
+              title: name,
               description: el.tags?.name ? `${poi.label} — ${name}` : poi.label,
-              tags:        el.tags ?? {},
+              tags: el.tags ?? {},
             }));
           }
         }
 
         // ── Buildings ─────────────────────────────────────────────────────────
-
         if (buildingWays.length && this._terrainRegistry) {
           const buildings = preprocessBuildings(buildingWays);
 
           for (const b of buildings) {
-            const name    = b.tags?.name ?? '';
-            const nameKey = name.toLowerCase().replace(/\s+/g, '_');
+            const name      = b.tags?.name ?? '';
+            const nameKey   = name.toLowerCase().replace(/\s+/g, '_');
             const blueprint = Blueprints[nameKey];
 
             if (blueprint) {
@@ -883,46 +854,28 @@ export class OSMTerrainLoader extends BaseLoader {
                 `scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`
               );
 
-              // ── FIX 2: b already has .geometry — buildingWay was undefined.
               const facingAngle = extractFacingAngle(b.tags, b.geometry);
-
               const landmarkDef = makeBlueprintDef(
-                `landmark:${b.id}`,
-                b.centroid.lat,
-                b.centroid.lon,
-                nameKey,
+                `landmark:${b.id}`, b.centroid.lat, b.centroid.lon, nameKey,
                 {
-                  scale,
-                  facingAngle,
-                  solid:           true,
-                  bboxRadius:      scaledR,
-                  footprintRadius: scaledR,
-                  physicsEnabled:  true,
-                  physicsRadius:   scaledR,
-                  fixed:           true,
-                  lodColor:        '#A1887F',
+                  scale, facingAngle,
+                  solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
+                  physicsEnabled: true, physicsRadius: scaledR,
+                  fixed: true, lodColor: '#A1887F',
                 }
               );
 
               if (!renderedLandmarkNames.has(nameKey)) {
                 renderedLandmarkNames.add(nameKey);
                 entityDefs.push(landmarkDef);
-
                 const colliders = makeBlueprintColliders(
-                  `landmark:${b.id}`,
-                  b.centroid.lat,
-                  b.centroid.lon,
-                  blueprint,
-                  scale,
-                  this._mPerTile
+                  `landmark:${b.id}`, b.centroid.lat, b.centroid.lon,
+                  blueprint, scale, this._mPerTile
                 );
-
                 for (const col of colliders) {
                   const { dLat, dLon } = tileOffsetToGeo(
-                    col._localOffsetX,
-                    col._localOffsetZ,
-                    b.centroid.lat,
-                    this._mPerTile
+                    col._localOffsetX, col._localOffsetZ,
+                    b.centroid.lat, this._mPerTile
                   );
                   col.latitude  = b.centroid.lat + dLat;
                   col.longitude = b.centroid.lon + dLon;
@@ -932,9 +885,7 @@ export class OSMTerrainLoader extends BaseLoader {
                 const existingIdx = entityDefs.findIndex(
                   e => e._bpKey === nameKey && e.id.startsWith('landmark:node:')
                 );
-                if (existingIdx !== -1) {
-                  entityDefs[existingIdx] = landmarkDef;
-                }
+                if (existingIdx !== -1) entityDefs[existingIdx] = landmarkDef;
               }
             } else {
               entityDefs.push(
@@ -947,7 +898,6 @@ export class OSMTerrainLoader extends BaseLoader {
 
         console.log(`[OSMTerrainLoader] → ${terrainUpdates.size} terrain tiles, ${entityDefs.length} entities`);
 
-        // ── Persist ──────────────────────────────────────────────────────────
         try {
           await this._cache.set(cacheKey, {
             terrainUpdates: Object.fromEntries(terrainUpdates),

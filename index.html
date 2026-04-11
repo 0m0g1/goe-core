@@ -25,7 +25,29 @@
         .test-panel button { background: #201e1c; border: 1px solid #706050; color: #e0d0b0; margin: 2px; padding: 4px 8px; cursor: pointer; font-family: monospace; font-size: 10px; }
         .test-panel button:hover { background: #403830; }
         .debug-panel { position: absolute; bottom: 120px; right: 14px; background: rgba(0,0,0,0.7); border: 1px solid #504030; border-radius: 4px; padding: 8px; pointer-events: auto; font-family: monospace; font-size: 9px; color: #c0b898; z-index: 200; }
-        .debug-panel button { background: #201e1c; border: 1px solid #706050; color: #e0d0b0; margin-top: 4px; padding: 2px 6px; cursor: pointer; font-family: monospace; font-size: 9px; }
+        .debug-panel button { background: #201e1c; border: 1px solid #706050; color: #e0d0b0; margin-top: 4px; padding: 2px 6px; cursor: pointer; font-family: monospace; font-size: 9px; display: block; width: 100%; text-align: left; }
+        .debug-panel button:hover { background: #403830; }
+
+        /* Debug overlay toggle button — active state lights up green */
+        .debug-panel button.active {
+            border-color: #00e87a;
+            color: #00e87a;
+            background: rgba(0,232,122,0.08);
+        }
+
+        /* Inline debug status badge shown inside the HUD when overlay is on */
+        #debug-overlay-badge {
+            display: none;
+            color: #00e87a;
+            font-size: 9px;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            border: 1px solid #00e87a44;
+            padding: 1px 6px;
+            margin-top: 2px;
+        }
+        #debug-overlay-badge.visible { display: inline-block; }
+
         .dialogue-overlay { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); width: 600px; max-width: 90vw; background: rgba(12, 16, 20, 0.95); border: 2px solid #3b82f6; border-radius: 8px; padding: 20px; color: #e2e8f0; font-family: monospace; z-index: 1000; display: none; box-shadow: 0 10px 30px rgba(0,0,0,0.8); pointer-events: auto; }
         .dialogue-name { color: #fbbf24; font-size: 14px; font-weight: bold; margin-bottom: 8px; letter-spacing: 0.1em; text-transform: uppercase; }
         .dialogue-text { font-size: 16px; line-height: 1.5; margin-bottom: 16px; }
@@ -36,7 +58,6 @@
         .minigame-modal iframe { width: 100%; height: 100%; border: none; }
         .close-game { position: absolute; top: -15px; right: -15px; background: #ef4444; color: white; border: 2px solid white; border-radius: 50%; width: 30px; height: 30px; cursor: pointer; font-weight: bold; z-index: 2001; }
 
-        /* New physics panel */
         .physics-panel {
             position: absolute;
             top: 160px;
@@ -62,15 +83,8 @@
             font-size: 11px;
             font-weight: bold;
         }
-        .physics-panel button:hover {
-            background: #4a6a2a;
-            color: white;
-        }
-        .physics-panel span {
-            color: #c0e0a0;
-            font-size: 9px;
-            text-align: center;
-        }
+        .physics-panel button:hover { background: #4a6a2a; color: white; }
+        .physics-panel span { color: #c0e0a0; font-size: 9px; text-align: center; }
     </style>
 </head>
 <body>
@@ -86,6 +100,7 @@
     <div id="hud-terrain">● loading map…</div>
     <div id="hud-elevation">▲ elevation loading…</div>
     <div id="hud-nearby"></div>
+    <div id="debug-overlay-badge">◉ DEBUG OVERLAY ON</div>
 </div>
 
 <div class="controls">
@@ -111,7 +126,6 @@
     <div class="tilt-indicator"><div class="tilt-fill" id="tilt-fill"></div></div>
 </div>
 
-<!-- NEW: Physics test panel -->
 <div class="physics-panel">
     <button id="spawn-ball-btn">🟢 SPAWN BALL</button>
     <button id="kick-ball-btn">⚡ KICK BALL</button>
@@ -129,8 +143,14 @@
 </div>
 
 <div class="debug-panel" id="debug-panel">
-    <div>🐞 DEBUG</div>
+    <div style="margin-bottom:4px;">🐞 DEBUG</div>
     <div id="debug-stats">Buildings: 0<br>POIs: 0<br>Cache: 0</div>
+    <!--
+        Debug overlay toggle — calls engine.toggleLayer('colliders').
+        Draws collision circles/AABBs + facing arrows for every blueprint entity.
+        Green when active, dim when off.
+    -->
+    <button id="toggle-debug-overlay-btn" title="Toggle collision shapes + facing arrows">🔵 Debug Overlay: OFF</button>
     <button id="clear-cache-btn">🗑️ Clear Cache &amp; Reload</button>
 </div>
 
@@ -210,25 +230,18 @@
 
 <script type="module">
     import { Engine, OSMTerrainLoader, BioLoader, ElevationLoader, ElevationFormat, WeatherLoader, AviationLoader, Entity, ENTITY_TYPES, worldToScreen } from './src/GOECore.js';
-    // We'll also need Vector2D for forces – import from local physics folder (if available)
-    // For simplicity, we can use engine.physicsWorld and its Vector2D class if exposed.
-    // Since we have local physics files, we import Vector2D directly.
-    import Vector2D       from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/vector2d.js';
+    import Vector2D from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/vector2d.js';
 
-    // --------------------------------------------------------------
-    // Custom Ball Entity (physics test)
-    // --------------------------------------------------------------
+    // ── Custom Ball Entity ───────────────────────────────────────────────────
     class BallEntity extends Entity {
         constructor(id, tx, ty) {
             super(id, ENTITY_TYPES.FEATURE, tx, ty);
             this.physicsEnabled = true;
-            this.physicsRadius = 0.4;
-            this.fixed = false;
-            this.solid = false;
-            this.color = '#ff3333';
-            this.data = { label: "ball" };
-            this.blocking = false;
-            this.solid = true;
+            this.physicsRadius  = 0.4;
+            this.fixed  = false;
+            this.solid  = true;
+            this.color  = '#ff3333';
+            this.data   = { label: 'ball' };
         }
 
         render(wr, groundElevPx, extra) {
@@ -238,7 +251,7 @@
                 groundElevPx + (this.elevOffset ?? 0),
                 cam
             );
-            const r = Math.max(3, cam.zoom * cam.tileW * 0.4) / 2;
+            const r     = Math.max(3, cam.zoom * cam.tileW * 0.4) / 2;
             const depth = this.tx * Math.cos(cam.rotation) + this.ty * Math.sin(cam.rotation);
             wr.submitWorldObject(depth, () => {
                 ctx.beginPath();
@@ -253,22 +266,15 @@
         }
     }
 
-    // --------------------------------------------------------------
-    // NPCs & Events (unchanged)
-    // --------------------------------------------------------------
+    // ── Events / NPCs ────────────────────────────────────────────────────────
     const npcMaki = {
-        id: 'npc_maki',
-        title: 'Maki Kaji',
-        category: 'npc',
-        latitude: 35.6587,
-        longitude: 139.7455,
-        color: '#fbbf24',
+        id: 'npc_maki', title: 'Maki Kaji', category: 'npc',
+        latitude: 35.6587, longitude: 139.7455, color: '#fbbf24',
         data: {
-            category: 'npc',
-            asset: 'npc_person',
+            category: 'npc', asset: 'npc_person',
             dialogue: {
                 start: {
-                    text: "Ah, a traveler! I am Maki Kaji, the godfather of Sudoku. The world is built on logic and numbers. Do you wish to test your mind?",
+                    text: "Ah, a traveler! I am Maki Kaji, the godfather of Sudoku. Do you wish to test your mind?",
                     choices: [
                         { text: "I'm ready. Let's play!", next: 'play_game' },
                         { text: "Not right now, thanks.", next: 'exit' }
@@ -277,30 +283,28 @@
                 play_game: {
                     text: "Excellent! Let the numbers guide your path.",
                     action: 'trigger_sudoku',
-                    choices: [
-                        { text: "Farewell.", next: 'exit' }
-                    ]
+                    choices: [{ text: "Farewell.", next: 'exit' }]
                 }
             }
         }
     };
 
     const sampleEvents = [
-        { id: 'evt1', title: 'Battle of Hastings', category: 'war', latitude: 50.886, longitude: 0.488, year: 1066, description: 'Norman conquest of England.' },
-        { id: 'evt2', title: 'Moon Landing', category: 'science', latitude: 0.674, longitude: 23.473, year: 1969, description: 'First humans on the Moon.' },
+        { id: 'evt1', title: 'Battle of Hastings', category: 'war',      latitude: 50.886, longitude:  0.488, year: 1066, description: 'Norman conquest of England.' },
+        { id: 'evt2', title: 'Moon Landing',        category: 'science',  latitude:  0.674, longitude: 23.473, year: 1969, description: 'First humans on the Moon.' },
         { id: 'evt3', title: 'Fall of Berlin Wall', category: 'politics', latitude: 52.516, longitude: 13.382, year: 1989, description: 'End of Cold War division.' },
-        npcMaki
+        npcMaki,
     ];
 
     const categoryColors = {
-        war: '#ef4444', battle: '#ef4444', conflict: '#ef4444',
-        politics: '#f59e0b', government: '#f59e0b',
-        science: '#06b6d4', technology: '#06b6d4',
-        art: '#a78bfa', culture: '#a78bfa', music: '#a78bfa',
-        religion: '#f97316', spiritual: '#f97316',
-        sport: '#22c55e', sports: '#22c55e',
-        disaster: '#dc2626', nature: '#10b981',
-        economics: '#eab308', trade: '#eab308'
+        war:'#ef4444', battle:'#ef4444', conflict:'#ef4444',
+        politics:'#f59e0b', government:'#f59e0b',
+        science:'#06b6d4', technology:'#06b6d4',
+        art:'#a78bfa', culture:'#a78bfa', music:'#a78bfa',
+        religion:'#f97316', spiritual:'#f97316',
+        sport:'#22c55e', sports:'#22c55e',
+        disaster:'#dc2626', nature:'#10b981',
+        economics:'#eab308', trade:'#eab308',
     };
 
     function eventColor(item) {
@@ -312,165 +316,106 @@
 
     function buildFeatures(events) {
         return events.map(ev => ({
-            id: ev.id,
-            latitude: ev.latitude,
-            longitude: ev.longitude,
-            color: eventColor(ev),
-            label: ev.title,
-            data: ev
+            id: ev.id, latitude: ev.latitude, longitude: ev.longitude,
+            color: eventColor(ev), label: ev.title, data: ev,
         }));
     }
 
-    // --------------------------------------------------------------
-    // Setup Engine
-    // --------------------------------------------------------------
-    const canvas = document.getElementById('game-canvas');
-    
-    // --- FIX: Do NOT start on Battle of Hastings ---
-    // Instead, start at Trafalgar Square, London (safe location with no overlapping event)
-    const initialGeo = { lat: 51.5074, lon: -0.1278 };  // London Trafalgar Square
+    // ── Engine setup ─────────────────────────────────────────────────────────
+    const canvas     = document.getElementById('game-canvas');
+    const initialGeo = { lat: 51.5074, lon: -0.1278 }; // London Trafalgar
 
     const engine = new Engine({
-        geoCenter: initialGeo,
+        geoCenter:  initialGeo,
         showPlayer: true,
-        tileURLFn: (z, x, y) => `https://a.tile.openstreetmap.org/${z}/${x}/${y}.png`,
-        mapW: 400,
-        mapH: 400,
-        cameraOpts: {
-            zoom: 0.35,
-            zoomFlat: 0.18,
-            zoomIso: 0.58,
-            zoomSpeed: 0.0014
-        }
+        tileURLFn:  (z, x, y) => `https://a.tile.openstreetmap.org/${z}/${x}/${y}.png`,
+        mapW: 400, mapH: 400,
+        cameraOpts: { zoom: 0.35, zoomFlat: 0.18, zoomIso: 0.58, zoomSpeed: 0.0014 },
     });
 
-    const terrainLoader = new OSMTerrainLoader({
-        mPerTile: 2,
-        mapW: 400,
-        mapH: 400,
-        fetchRadiusM: 1500
-    });
-    engine.use(terrainLoader);
-
-    const bioLoader = new BioLoader({
-        limit: 50,
-        fetchRadiusM: 800
-    });
-    engine.use(bioLoader);
-
-    const apiKey = "b69650bacdb53e8000e14a735bb53035";
-    const weatherLoader = new WeatherLoader(apiKey);
-    engine.use(weatherLoader);
-
-    const aviationLoader = new AviationLoader();
-    engine.use(aviationLoader);
+    engine.use(new OSMTerrainLoader({ mPerTile: 2, mapW: 400, mapH: 400, fetchRadiusM: 1500 }));
+    engine.use(new BioLoader({ limit: 50, fetchRadiusM: 800 }));
+    engine.use(new WeatherLoader('b69650bacdb53e8000e14a735bb53035'));
+    engine.use(new AviationLoader());
+    engine.use({ id:'events', init(){}, destroy(){}, async fetch(){ return { entities: buildFeatures(sampleEvents) }; } });
 
     const elevationLoader = new ElevationLoader(
         (z, x, y) => `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`,
-        ElevationFormat.TERRARIUM,
-        2
+        ElevationFormat.TERRARIUM, 2
     );
     engine.setElevationLoader(elevationLoader);
-    
-    engine.use({
-        id: 'events',
-        init() {},
-        destroy() {},
-        async fetch() {
-            return { entities: buildFeatures(sampleEvents) };
-        },
-    });
-
     engine.mount(canvas);
 
-    // --------------------------------------------------------------
-    // Physics test helpers
-    // --------------------------------------------------------------
+    // ── Debug overlay toggle ──────────────────────────────────────────────────
+    // engine.debugLayers.colliders controls whether WorldRenderer.drawDebugOverlay()
+    // is called each frame (see Engine._frameOptimized step 10a).
+    const debugOverlayBtn   = document.getElementById('toggle-debug-overlay-btn');
+    const debugOverlayBadge = document.getElementById('debug-overlay-badge');
+
+    debugOverlayBtn.addEventListener('click', () => {
+        engine.toggleLayer('colliders');
+        const on = engine.debugLayers.colliders;
+        debugOverlayBtn.textContent = on ? '🟢 Debug Overlay: ON' : '🔵 Debug Overlay: OFF';
+        debugOverlayBtn.classList.toggle('active', on);
+        debugOverlayBadge.classList.toggle('visible', on);
+    });
+
+    // ── Physics helpers ───────────────────────────────────────────────────────
     let ballIdCounter = 0;
-    const balls = new Set(); // keep track for UI
 
     function updateBallCountUI() {
-        const count = Array.from(engine.entities).filter(e => e instanceof BallEntity).length;
+        const count = engine.entities.filter(e => e instanceof BallEntity).length;
         document.getElementById('ball-count').innerText = `Balls: ${count}`;
     }
 
     function spawnBall() {
         if (!engine.playerEntity) return;
-        const tx = engine.playerEntity.tx + 1;
-        const ty = engine.playerEntity.ty + 1;
-        const id = `ball_${Date.now()}_${ballIdCounter++}`;
-        const ball = new BallEntity(id, tx, ty);
+        const id   = `ball_${Date.now()}_${ballIdCounter++}`;
+        const ball = new BallEntity(id, engine.playerEntity.tx + 1, engine.playerEntity.ty + 1);
         engine.addEntity(ball);
-        // After attachment, adjust damping
-        if (ball._particle) {
-            ball._particle.damping = 0.97; // lower damping = faster stop
-        }
+        if (ball._particle) ball._particle.damping = 0.97;
         updateBallCountUI();
-        setTimeout(() => {
-            if (engine.entities.includes(ball)) {
-                engine.removeEntity(ball.id);
-                updateBallCountUI();
-            }
-        }, 30000);
+        setTimeout(() => { engine.removeEntity(ball.id); updateBallCountUI(); }, 30000);
     }
 
     function kickNearestBall() {
         if (!engine.playerEntity) return;
-        const playerPos = { x: engine.playerEntity.tx, y: engine.playerEntity.ty };
-        let closest = null;
-        let minDist = Infinity;
+        let closest = null, minDist = Infinity;
         for (const e of engine.entities) {
-            if (e instanceof BallEntity && e._particle) {
-                const dx = e.tx - playerPos.x;
-                const dy = e.ty - playerPos.y;
-                const dist = Math.hypot(dx, dy);
-                if (dist < minDist) {
-                    minDist = dist;
-                    closest = e;
-                }
-            }
+            if (!(e instanceof BallEntity) || !e._particle) continue;
+            const d = Math.hypot(e.tx - engine.playerEntity.tx, e.ty - engine.playerEntity.ty);
+            if (d < minDist) { minDist = d; closest = e; }
         }
-        if (closest && closest._particle) {
-            const angle = Math.random() * Math.PI * 2;
-            const strength = (1.5 + Math.random() * 2.5) / 10; // much lower
-            const vx = Math.cos(angle) * strength;
-            const vy = Math.sin(angle) * strength;
-            const p = closest._particle;
-            p.prevPosition = new Vector2D(p.position.x - vx, p.position.y - vy);
+        if (closest?._particle) {
+            const angle    = Math.random() * Math.PI * 2;
+            const strength = (1.5 + Math.random() * 2.5) / 10;
+            const p        = closest._particle;
+            p.prevPosition = new Vector2D(
+                p.position.x - Math.cos(angle) * strength,
+                p.position.y - Math.sin(angle) * strength
+            );
         }
     }
-        
-    // Wait for engine to be ready and then attach UI buttons
+
     setTimeout(() => {
-        const spawnBtn = document.getElementById('spawn-ball-btn');
-        const kickBtn = document.getElementById('kick-ball-btn');
-        if (spawnBtn) spawnBtn.onclick = () => spawnBall();
-        if (kickBtn) kickBtn.onclick = () => kickNearestBall();
+        document.getElementById('spawn-ball-btn').onclick = spawnBall;
+        document.getElementById('kick-ball-btn').onclick  = kickNearestBall;
     }, 500);
+    setInterval(updateBallCountUI, 2000);
 
-    // Also update ball count periodically (in case of auto-removal)
-    setInterval(() => {
-        updateBallCountUI();
-    }, 2000);
-
-    // --------------------------------------------------------------
-    // Helper: Jump to location (unchanged)
-    // --------------------------------------------------------------
-    async function jumpTo(lat, lon) {
-        engine.camera.zoom = 0.5;
-        engine.panTo(lat, lon);
-    }
-
+    // ── Test spot buttons ─────────────────────────────────────────────────────
     document.querySelectorAll('.test-panel button').forEach(btn => {
         btn.addEventListener('click', () => {
-            const lat = parseFloat(btn.dataset.lat);
-            const lon = parseFloat(btn.dataset.lon);
-            jumpTo(lat, lon);
+            engine.camera.zoom = 0.5;
+            engine.panTo(parseFloat(btn.dataset.lat), parseFloat(btn.dataset.lon));
         });
     });
 
+    // ── Misc UI ───────────────────────────────────────────────────────────────
+    const terrainLoader = engine._loaders.find(l => l.id === 'osm-terrain');
+
     document.getElementById('clear-cache-btn').addEventListener('click', async () => {
-        await terrainLoader.clearCache();
+        await terrainLoader?.clearCache();
         alert('Cache cleared. Reloading page...');
         location.reload();
     });
@@ -480,45 +425,24 @@
         document.getElementById('minigame-frame').src = 'about:blank';
     });
 
-    // --------------------------------------------------------------
-    // Dialogue & UI Hooks (unchanged, but using entity:click)
-    // --------------------------------------------------------------
-    const modeBadge   = document.getElementById('mode-badge');
-    const hudCoords   = document.getElementById('hud-coords');
-    const hudZoom     = document.getElementById('hud-zoom');
-    const hudTerrain  = document.getElementById('hud-terrain');
-    const hudElevation= document.getElementById('hud-elevation');
-    const hudNearby   = document.getElementById('hud-nearby');
-    const tiltFill    = document.getElementById('tilt-fill');
-    const eventCard   = document.getElementById('event-card');
-    const loadingToast= document.getElementById('loading-toast');
-    const debugStats  = document.getElementById('debug-stats');
-
-    const dialogueBox    = document.getElementById('dialogue-box');
-    const dialogueName   = document.getElementById('dialogue-name');
-    const dialogueText   = document.getElementById('dialogue-text');
-    const dialogueChoices= document.getElementById('dialogue-choices');
-    const minigameModal  = document.getElementById('minigame-modal');
-    const minigameFrame  = document.getElementById('minigame-frame');
-
-    const sudokuSrcDoc = document.getElementById('sudoku-template').textContent;
+    // ── Dialogue system ───────────────────────────────────────────────────────
+    const dialogueBox     = document.getElementById('dialogue-box');
+    const dialogueName    = document.getElementById('dialogue-name');
+    const dialogueText    = document.getElementById('dialogue-text');
+    const dialogueChoices = document.getElementById('dialogue-choices');
+    const minigameModal   = document.getElementById('minigame-modal');
+    const minigameFrame   = document.getElementById('minigame-frame');
+    const sudokuSrcDoc    = document.getElementById('sudoku-template').textContent;
 
     let currentCardTimeout = null;
-    let currentNPC = null;
+    let currentNPC         = null;
 
     function renderDialogueNode(nodeId) {
-        if (nodeId === 'exit') {
-            dialogueBox.style.display = 'none';
-            currentNPC = null;
-            return;
-        }
+        if (nodeId === 'exit') { dialogueBox.style.display = 'none'; currentNPC = null; return; }
         const dialogue = currentNPC?.data?.dialogue || currentNPC?.dialogue;
-        const node = dialogue?.[nodeId];
-        if (!node) {
-            console.error('No dialogue node found for:', nodeId, currentNPC);
-            return;
-        }
-        dialogueText.innerText = node.text;
+        const node     = dialogue?.[nodeId];
+        if (!node) { console.error('No dialogue node:', nodeId); return; }
+        dialogueText.innerText    = node.text;
         dialogueChoices.innerHTML = '';
         if (node.action === 'trigger_sudoku') {
             minigameModal.style.display = 'block';
@@ -528,33 +452,30 @@
             const btn = document.createElement('button');
             btn.className = 'dialogue-choice';
             btn.innerText = '> ' + choice.text;
-            btn.onclick = () => renderDialogueNode(choice.next);
+            btn.onclick   = () => renderDialogueNode(choice.next);
             dialogueChoices.appendChild(btn);
         });
     }
 
     engine.on('entity:click', ({ entity }) => {
-        // Check if entity is an NPC
-        const isNPC = entity.type === ENTITY_TYPES.NPC || 
-                      (entity.data && entity.data.category === 'npc') ||
-                      (entity.data && entity.data.dialogue);
-        
+        const isNPC = entity.type === ENTITY_TYPES.NPC ||
+                      entity.data?.category === 'npc'  ||
+                      entity.data?.dialogue;
         if (isNPC) {
-            eventCard.style.display = 'none';
+            document.getElementById('event-card').style.display = 'none';
             if (currentCardTimeout) clearTimeout(currentCardTimeout);
             currentNPC = entity.data || entity;
-            dialogueName.innerText = currentNPC.title || entity.label || 'NPC';
-            dialogueBox.style.display = 'block';
+            dialogueName.innerText      = currentNPC.title || entity.label || 'NPC';
+            dialogueBox.style.display   = 'block';
             renderDialogueNode('start');
             return;
         }
-
-        // Regular POI / event
         dialogueBox.style.display = 'none';
-        const ev = entity.data || entity;
+        const ev    = entity.data || entity;
         const color = eventColor(ev);
-        eventCard.style.display = 'block';
-        eventCard.innerHTML = `
+        const card  = document.getElementById('event-card');
+        card.style.display = 'block';
+        card.innerHTML = `
             <div style="font-size:9px;letter-spacing:.2em;text-transform:uppercase;margin-bottom:4px;color:${color}">
                 ${String(ev.category || ev.type || 'event').toUpperCase()}
             </div>
@@ -562,106 +483,72 @@
                 ${ev.title || ev.name || 'Untitled'}
             </div>
             ${ev.year ? `<div style="color:#8a9973">${ev.year}</div>` : ''}
-            ${ev.description ? `<div style="color:#756f5d;margin-top:4px;font-size:10px">${ev.description.slice(0, 120)}${ev.description.length > 120 ? '…' : ''}</div>` : ''}
+            ${ev.description ? `<div style="color:#756f5d;margin-top:4px;font-size:10px">${ev.description.slice(0,120)}${ev.description.length>120?'…':''}</div>` : ''}
             <div style="color:#455034;font-size:9px;margin-top:6px">
                 ${Number(ev.latitude).toFixed(4)}°, ${Number(ev.longitude).toFixed(4)}°
-            </div>
-        `;
+            </div>`;
         if (currentCardTimeout) clearTimeout(currentCardTimeout);
-        currentCardTimeout = setTimeout(() => {
-            eventCard.style.display = 'none';
-        }, 5000);
+        currentCardTimeout = setTimeout(() => { card.style.display = 'none'; }, 5000);
     });
 
     engine.on('map:click', () => {
-        eventCard.style.display = 'none';
+        document.getElementById('event-card').style.display = 'none';
         dialogueBox.style.display = 'none';
         if (currentCardTimeout) clearTimeout(currentCardTimeout);
     });
 
     engine.on('map:rightclick', ({ lat, lon }) => {
-        console.log('Right-click at ' + lat + ', ' + lon);
         alert('Add event at ' + lat.toFixed(5) + ', ' + lon.toFixed(5));
     });
 
     engine.on('fetch:start', () => {
-        loadingToast.style.display = 'block';
-        hudTerrain.innerText = '⟳ loading map…';
+        document.getElementById('loading-toast').style.display = 'block';
+        document.getElementById('hud-terrain').innerText = '⟳ loading map…';
     });
+
     engine.on('fetch:done', () => {
-        loadingToast.style.display = 'none';
+        document.getElementById('loading-toast').style.display = 'none';
         updateDebugStats();
     });
 
-    engine.on('weather:changed', (w) => {
+    engine.on('weather:changed', w => {
         document.getElementById('hud-terrain').innerHTML +=
-            ' <span style="color:#60a5fa">(' + w.condition + ', ' + w.temp + '°C)</span>';
+            ` <span style="color:#60a5fa">(${w.condition}, ${w.temp}°C)</span>`;
     });
 
     function updateDebugStats() {
-        const buildings = engine.entities.filter(e => e.type === ENTITY_TYPES.BUILDING).length;
-        const pois = engine.entities.filter(e => e.type === ENTITY_TYPES.FEATURE).length;
-        const cacheSize = engine.terrainCache ? engine.terrainCache.size() : 0;
-        debugStats.innerHTML = `Buildings: ${buildings}<br>POIs: ${pois}<br>Cache: ${cacheSize}`;
-    }
-
-    function updateNearbyCount() {
-        if (!engine.player) return;
-        const px = engine.player.tx;
-        const py = engine.player.ty;
-        let count = 0;
-        for (const e of engine.entities) {
-            if (e === engine.player) continue;
-            const dx = Math.abs(e.tx - px);
-            const dy = Math.abs(e.ty - py);
-            if (dx < 10 && dy < 10) count++;
-        }
-        hudNearby.innerText = count ? `◈ ${count} entity${count !== 1 ? 's' : ''} nearby` : '';
+        const buildings = engine.entities.filter(e => e._isBuildingBox && !e._isCollider).length;
+        const pois      = engine.entities.filter(e => !e.renderHeavy && !e._isBuildingBox).length;
+        const cache     = engine.terrainCache?.size?.() ?? 0;
+        document.getElementById('debug-stats').innerHTML =
+            `Buildings: ${buildings}<br>Blueprints: ${engine.entities.filter(e=>e._bpKey).length}<br>POIs: ${pois}<br>Cache: ${cache}`;
     }
 
     engine.on('hud', ({ lat, lon, zoom, tilt, terrain }) => {
-        hudCoords.innerText  = `${lat.toFixed(5)}° N \u00a0 ${lon.toFixed(5)}° E`;
-        hudZoom.innerText    = `zoom: ${zoom}× \u00a0 tilt: ${(tilt * 100).toFixed(0)}%`;
-        hudTerrain.innerText = terrain;
-        if (tilt < 0.05)       modeBadge.style.color = '#3a70a8';
-        else if (tilt > 0.95)  modeBadge.style.color = '#e8db9b';
-        else                   modeBadge.style.color = '#a07830';
-        tiltFill.style.height = (tilt * 100) + '%';
-        updateNearbyCount();
+        document.getElementById('hud-coords').innerText  = `${lat.toFixed(5)}° N \u00a0 ${lon.toFixed(5)}° E`;
+        document.getElementById('hud-zoom').innerText    = `zoom: ${zoom}× \u00a0 tilt: ${(tilt*100).toFixed(0)}%`;
+        document.getElementById('hud-terrain').innerText = terrain;
+        const badge = document.getElementById('mode-badge');
+        if      (tilt < 0.05) badge.style.color = '#3a70a8';
+        else if (tilt > 0.95) badge.style.color = '#e8db9b';
+        else                  badge.style.color = '#a07830';
+        document.getElementById('tilt-fill').style.height = (tilt * 100) + '%';
         updateDebugStats();
     });
 
     setInterval(() => {
-        if (elevationLoader.status === 'ready') {
-            hudElevation.innerText = '▲ elevation ready';
-            hudElevation.style.color = '#5bc23a';
-        } else if (elevationLoader.status === 'loading') {
-            hudElevation.innerText = '⟳ loading elevation…';
-            hudElevation.style.color = '#a07830';
-        } else {
-            hudElevation.innerText = '⚠ elevation unavailable';
-            hudElevation.style.color = '#ef4444';
-        }
+        const el = document.getElementById('hud-elevation');
+        if      (elevationLoader.status === 'ready')   { el.innerText = '▲ elevation ready';       el.style.color = '#5bc23a'; }
+        else if (elevationLoader.status === 'loading') { el.innerText = '⟳ loading elevation…';    el.style.color = '#a07830'; }
+        else                                           { el.innerText = '⚠ elevation unavailable'; el.style.color = '#ef4444'; }
     }, 500);
 
-    engine.on('player:move', () => updateNearbyCount());
+    document.getElementById('zoom-in').addEventListener('click',  () => engine.camera.zoomIn(canvas.width/2,  canvas.height/2));
+    document.getElementById('zoom-out').addEventListener('click', () => engine.camera.zoomOut(canvas.width/2, canvas.height/2));
+    document.getElementById('rot-left').addEventListener('click',  () => engine.camera.rotateLeft());
+    document.getElementById('rot-right').addEventListener('click', () => engine.camera.rotateRight());
 
-    document.getElementById('zoom-in').addEventListener('click', () => {
-        engine.camera.zoomIn(canvas.width / 2, canvas.height / 2);
-    });
-    document.getElementById('zoom-out').addEventListener('click', () => {
-        engine.camera.zoomOut(canvas.width / 2, canvas.height / 2);
-    });
-    document.getElementById('rot-left').addEventListener('click', () => {
-        engine.camera.rotateLeft();
-    });
-    document.getElementById('rot-right').addEventListener('click', () => {
-        engine.camera.rotateRight();
-    });
-
-    setTimeout(() => {
-        engine._centreCameraOnPlayer();
-    }, 100);
+    setTimeout(() => engine._centreCameraOnPlayer(), 100);
 </script>
 </body>
 </html>

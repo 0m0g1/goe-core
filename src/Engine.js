@@ -319,6 +319,7 @@ export class Engine extends EventEmitter {
       overpass:  true,
       entities:  true,
       player:    true,
+      colliders: false,
     };
 
     this._tileCache      = [];
@@ -996,6 +997,13 @@ export class Engine extends EventEmitter {
 
     // 10. Flush pipeline
     this._renderer.flush(this.weather);
+
+    if (this.debugLayers.colliders) {
+      this._renderer.drawDebugOverlay(
+        this.entities, cam, pGX, pGY,
+        this.terrainCache, this.terrainRegistry
+      );
+    }
 
     // 11. HUD
     if (this.playerEntity) {
