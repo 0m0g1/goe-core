@@ -4,6 +4,12 @@
  * Rotation is now baked into proj() via setRotation() / clearRotation().
  * Every corner of every box goes through the same XZ rotation before the
  * camera transform, so arbitrary compass angles render correctly.
+ *
+ * Fix: box() snap for face-visibility now accounts for the current entity
+ * rotation. Previously snap was computed from cam.rotation alone, so rotated
+ * entities (e.g. Golden Gate Bridge at ~315°) would have the wrong two side
+ * faces selected — back/hidden faces were drawn and front faces were skipped,
+ * producing an X-ray / see-through appearance.
  */
 import { tileHalfWidth, tileHalfHeight, shadeHex } from '../math/projection.js';
 
@@ -21,6 +27,7 @@ export class VoxelRenderer {
     // Identity rotation by default
     this._rotCos  = 1;
     this._rotSin  = 0;
+    this._rotRad  = 0;   // stored so box() can offset the snap correctly
   }
 
   /**
@@ -30,13 +37,15 @@ export class VoxelRenderer {
    */
   setRotation(compassDeg) {
     const rad     = (compassDeg - 180) * Math.PI / 180;
+    this._rotRad  = rad;
     this._rotCos  = Math.cos(rad);
     this._rotSin  = Math.sin(rad);
   }
 
   clearRotation() {
-    this._rotCos = 1;
-    this._rotSin = 0;
+    this._rotRad  = 0;
+    this._rotCos  = 1;
+    this._rotSin  = 0;
   }
 
   beginTile(tx, ty, baseElevPx) {
@@ -104,8 +113,11 @@ export class VoxelRenderer {
 
   /**
    * Draw a single voxel box with top, right-facing, and front-facing faces.
-   * Visible faces are determined by the current camera rotation snap (0–3).
-   * Rotation is handled automatically by proj() — box() needs no changes.
+   *
+   * Face visibility is determined by snapping the EFFECTIVE camera angle —
+   * cam.rotation offset by the entity's local rotation — to the nearest 90°.
+   * This ensures that for a rotated entity (e.g. a bridge aligned NW-SE) the
+   * correct two side faces are selected regardless of compass heading.
    *
    * @param {number} x      - voxel-space left edge
    * @param {number} y      - voxel-space bottom edge
@@ -114,8 +126,8 @@ export class VoxelRenderer {
    * @param {number} h      - height (y axis)
    * @param {number} d      - depth  (z axis)
    * @param {string} top    - top face color
-   * @param {string} right  - right-facing side color  (+X in snap=0)
-   * @param {string} front  - front-facing side color  (+Z in snap=0)
+   * @param {string} right  - right-facing side color  (+X in entity space)
+   * @param {string} front  - front-facing side color  (+Z in entity space)
    */
   box(x, y, z, w, h, d, top, right, front) {
     const vp      = (px, py, pz) => this.proj(px, py, pz);
@@ -131,10 +143,17 @@ export class VoxelRenderer {
       cFront = shadeHex(front, shadows.getLightFactor(Math.PI / 2));
     }
 
-    // ── Rotation snap — which two side faces are visible ──────────────────
-    const snap = ((Math.round(cam.rotation / (Math.PI / 2)) % 4) + 4) % 4;
+    // ── Rotation-aware snap ───────────────────────────────────────────────
+    // The entity's voxel geometry has been rotated by _rotRad in proj().
+    // To select the correct visible face pair we snap the camera angle
+    // relative to the entity's local axes, not the world axes.
+    // effectiveAngle = cam.rotation + entity_rotation
+    // (entity rotates the geometry, which is equivalent to rotating the
+    //  camera in the opposite direction relative to the entity)
+    const effectiveAngle = cam.rotation + this._rotRad;
+    const snap = ((Math.round(effectiveAngle / (Math.PI / 2)) % 4) + 4) % 4;
 
-    // Precompute all 8 corners — each goes through proj() which handles rotation
+    // Precompute all 8 corners — proj() applies entity rotation + camera transform
     const c = [
       vp(x,     y,     z    ),  // 0 BL bottom
       vp(x + w, y,     z    ),  // 1 BR bottom
@@ -149,23 +168,23 @@ export class VoxelRenderer {
     // Top face — always visible
     this._poly([c[4], c[5], c[6], c[7]], cTop, edge);
 
-    // Side faces — depends on snap
+    // Side faces — two visible faces based on effective snap
     switch (snap) {
       case 0:
-        this._poly([c[5], c[1], c[2], c[6]], cRight,  edge); // +X face
-        this._poly([c[6], c[2], c[3], c[7]], cFront,  edge); // +Z face
+        this._poly([c[5], c[1], c[2], c[6]], cRight, edge); // +X face
+        this._poly([c[6], c[2], c[3], c[7]], cFront, edge); // +Z face
         break;
       case 1:
-        this._poly([c[6], c[2], c[3], c[7]], cRight,  edge); // +Z face
-        this._poly([c[7], c[3], c[0], c[4]], cFront,  edge); // -X face
+        this._poly([c[6], c[2], c[3], c[7]], cRight, edge); // +Z face
+        this._poly([c[7], c[3], c[0], c[4]], cFront, edge); // -X face
         break;
       case 2:
-        this._poly([c[7], c[3], c[0], c[4]], cRight,  edge); // -X face
-        this._poly([c[4], c[0], c[1], c[5]], cFront,  edge); // -Z face
+        this._poly([c[7], c[3], c[0], c[4]], cRight, edge); // -X face
+        this._poly([c[4], c[0], c[1], c[5]], cFront, edge); // -Z face
         break;
       case 3:
-        this._poly([c[4], c[0], c[1], c[5]], cRight,  edge); // -Z face
-        this._poly([c[5], c[1], c[2], c[6]], cFront,  edge); // +X face
+        this._poly([c[4], c[0], c[1], c[5]], cRight, edge); // -Z face
+        this._poly([c[5], c[1], c[2], c[6]], cFront, edge); // +X face
         break;
     }
   }

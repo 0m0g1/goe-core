@@ -393,7 +393,8 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
 
     renderFn(wr, groundElevPx, extra, entity) {
       const blueprint = Blueprints[bpKey] ?? Blueprints['tree'];
-      if (!blueprint || wr.cam.tilt < 0.04) return;
+      const minTilt = (entity._scale ?? 1) > 10 ? 0.01 : 0.04;
+      if (!blueprint || wr.cam.tilt < minTilt) return;
 
       const s     = entity._scale       ?? 1;
       const angle = entity._facingAngle ?? 180;
@@ -955,7 +956,8 @@ export class OSMTerrainLoader extends BaseLoader {
               title: 'car', label: 'car', category: 'car',
               renderFn(wr, groundElevPx, extra, entity) {
                 const blueprint = Blueprints['car'];
-                if (!blueprint || wr.cam.tilt < 0.04) return;
+                const minTilt = (entity._scale ?? 1) > 10 ? 0.01 : 0.04;
+if (!blueprint || wr.cam.tilt < minTilt) return;
                 const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
                 const elev  = groundElevPx + entity.elevOffset;
                 const depth = frontDepth(entity.tx, entity.ty, wr.cam.rotation, 0.35);
