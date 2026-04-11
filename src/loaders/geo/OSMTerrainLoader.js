@@ -788,7 +788,7 @@ export class OSMTerrainLoader extends BaseLoader {
           if (el.type === 'node') nodeElements.push(el);
         }
 
-        // ── Pass 1: Bridge landmark ways (span-aware — MUST run before nodes) ─
+// ── Pass 1: Bridge landmark ways (span-aware — MUST run before nodes) ─
         // The Golden Gate Bridge (and similar) is split across many OSM way
         // segments inside a relation. A single way only covers one segment so
         // computeWaySpanM on it returns ~0. Fix: group all way segments that
@@ -796,7 +796,7 @@ export class OSMTerrainLoader extends BaseLoader {
         // compute the true tip-to-tip span across the full merged point set.
 
         // Step A — collect all bridge way segments keyed by landmark name
-        const bridgeSegmentsByKey = new Map(); // nameKey → { match, segments: el[] }
+        const bridgeSegmentsByKey = new Map(); // nameKey → { match, els: [] }
 
         for (const el of wayElements) {
           if (!el.geometry?.length) continue;
@@ -835,19 +835,18 @@ export class OSMTerrainLoader extends BaseLoader {
           if (allGeom.length) { cLat /= allGeom.length; cLon /= allGeom.length; }
 
           // True tip-to-tip span: project all points onto the principal axis
-          // (bearing from first to last point of the first/longest segment),
-          // then take max - min projected distance.
-          const refEl  = els.reduce((a, b) =>
+          // (bearing of the longest segment), then take max - min projection.
+          const refEl   = els.reduce((a, b) =>
             (b.geometry?.length ?? 0) > (a.geometry?.length ?? 0) ? b : a
           );
           const refGeom = refEl.geometry ?? [];
-          let osmSpanM = 0;
+          let osmSpanM  = 0;
 
           if (allGeom.length >= 2 && refGeom.length >= 2) {
-            const a0 = refGeom[0];
-            const a1 = refGeom[refGeom.length - 1];
-            const dLat = (a1.lat - a0.lat) * 111320;
-            const dLon = (a1.lon - a0.lon) * 111320 * Math.cos(a0.lat * Math.PI / 180);
+            const a0    = refGeom[0];
+            const a1    = refGeom[refGeom.length - 1];
+            const dLat  = (a1.lat - a0.lat) * 111320;
+            const dLon  = (a1.lon - a0.lon) * 111320 * Math.cos(a0.lat * Math.PI / 180);
             const axisLen = Math.hypot(dLat, dLon);
             if (axisLen > 0) {
               const axLat = dLat / axisLen;
@@ -864,7 +863,7 @@ export class OSMTerrainLoader extends BaseLoader {
             }
           }
 
-          // Fallback: bounding-box diagonal if axis projection gave nothing
+          // Fallback: bounding-box longest axis
           if (osmSpanM <= 0 && allGeom.length >= 2) {
             let minLat = Infinity, maxLat = -Infinity;
             let minLon = Infinity, maxLon = -Infinity;
@@ -884,37 +883,45 @@ export class OSMTerrainLoader extends BaseLoader {
           const scale      = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile, osmSpanM);
 
           const { halfExtentXZ } = blueprintNativeBounds(blueprint);
-          const scaledR     = Math.max(2, (halfExtentXZ / VU) * scale);
-          const facingAngle = extractFacingAngle(firstEl.tags, refGeom);
+
+          // ── Radius decoupling ─────────────────────────────────────────────
+          // scaledR = true visual half-extent in tiles (can be hundreds for GGB).
+          // bboxRadius / physicsRadius must stay small — they drive culling,
+          // collision queries, and frontDepth(). Feeding 677 tiles into
+          // frontDepth pushes the depth sort value far outside the scene range
+          // (~0-80 tiles) so the bridge renders behind everything or not at all.
+          // footprintRadius is capped at 40 tiles — large enough that the bridge
+          // sorts in front of nearby terrain but won't blow up the depth key.
+          const scaledR        = (halfExtentXZ / VU) * scale;
+          const cullingR       = Math.min(Math.max(scaledR, 2), 8);
+          const footprintR     = Math.min(scaledR, 40);
+
+          const facingAngle    = extractFacingAngle(firstEl.tags, refGeom);
 
           console.log(
             `[OSMTerrainLoader] Bridge landmark "${name}" — ` +
             `${els.length} segments, span=${osmSpanM.toFixed(0)}m h=${osmHeightM}m → ` +
-            `scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`
+            `scale=${scale.toFixed(2)}x (visualR=${scaledR.toFixed(1)} cullingR=${cullingR.toFixed(1)} tiles)`
           );
 
           renderedLandmarkNames.add(nameKey);
           entityDefs.push(makeBlueprintDef(
             `landmark:bridge:${els[0].id}`, cLat, cLon, nameKey,
             {
-              scale, facingAngle,
-              solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
-              physicsEnabled: true, physicsRadius: scaledR,
-              fixed: true, lodColor: '#A1887F',
+              scale,
+              facingAngle,
+              solid:           false,   // bridges: don't block player movement
+              bboxRadius:      cullingR,
+              footprintRadius: footprintR,
+              physicsEnabled:  false,
+              physicsRadius:   cullingR,
+              fixed:           true,
+              lodColor:        '#A1887F',
             }
           ));
 
-          const colliders = makeBlueprintColliders(
-            `landmark:bridge:${els[0].id}`, cLat, cLon, blueprint, scale, this._mPerTile
-          );
-          for (const col of colliders) {
-            const { dLat, dLon } = tileOffsetToGeo(
-              col._localOffsetX, col._localOffsetZ, cLat, this._mPerTile
-            );
-            col.latitude  = cLat + dLat;
-            col.longitude = cLon + dLon;
-            entityDefs.push(col);
-          }
+          // Colliders omitted for bridges — individual segment colliders would
+          // need their own span-aware placement and are rarely useful at this scale.
         }
 
         // ── Pass 2: All other ways (terrain + buildings + cars) ───────────────
