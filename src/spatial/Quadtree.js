@@ -44,20 +44,37 @@ export class Quadtree {
                 node.objects.push(object);
                 return;
             }
-            // At capacity — subdivide and redistribute ALL existing items
+
+            // Subdivide and redistribute existing objects
             node.subdivide();
             const existing = node.objects;
-            node.objects = [];                          // ← clear parent list
+            node.objects = [];                 // clear parent
+
             for (const obj of existing) {
                 for (const child of node.children) {
-                    this._insert(obj, child);
+                    if (this._contains(child.bounds, obj)) {
+                        this._insert(obj, child);
+                        break;               // ✅ insert into FIRST containing child only
+                    }
                 }
             }
+
+            // Insert the NEW object into the first containing child
+            for (const child of node.children) {
+                if (this._contains(child.bounds, object)) {
+                    this._insert(object, child);
+                    break;                   // ✅ once inserted, stop
+                }
+            }
+            return;                          // ✅ do NOT fall through to non‑leaf code
         }
 
-        // Non-leaf: insert into whichever children contain the object
+        // Non‑leaf: insert into the first containing child
         for (const child of node.children) {
-            this._insert(object, child);
+            if (this._contains(child.bounds, object)) {
+                this._insert(object, child);
+                break;                       // ✅ only one child
+            }
         }
     }
 

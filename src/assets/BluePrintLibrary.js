@@ -198,40 +198,42 @@ const ATM = [
 
 // Car ~4.5 m × 1.8 m × 1.5 m → 18 × 7.2 × 6 VU
 const CAR = [
-  // Body lower
-  { x: -9,   y:  0,  z: -3,   w: 18,  h:  4,  d:  6,  ...C('#1E88E5','#1565C0','#1976D2') },
-  // Wheel arches cut-in (represented as darker panels)
-  { x: -9.4, y:  0,  z: -3.4, w:  3.6,h:  2.4,d:  2.4,...C('#111827','#0A1020','#0D1525') },
-  { x:  5.8, y:  0,  z: -3.4, w:  3.6,h:  2.4,d:  2.4,...C('#111827','#0A1020','#0D1525') },
-  { x: -9.4, y:  0,  z:  1,   w:  3.6,h:  2.4,d:  2.4,...C('#111827','#0A1020','#0D1525') },
-  { x:  5.8, y:  0,  z:  1,   w:  3.6,h:  2.4,d:  2.4,...C('#111827','#0A1020','#0D1525') },
-  // Cabin / greenhouse
-  { x: -6.4, y:  4,  z: -2.8, w: 13.2,h:  4.4,d:  5.6,...C('#42A5F5','#1E88E5','#2196F3') },
-  // Windscreens
-  { x: -6,   y:  4.2,z: -2.9, w: 12,  h:  3.8,d:  0.3,...C('#B3E5FC','#81D4FA','#B3E5FC') }, // front
-  { x: -6,   y:  4.2,z:  2.6, w: 12,  h:  3.8,d:  0.3,...C('#B3E5FC','#81D4FA','#B3E5FC') }, // rear
-  // Side windows
-  { x: -6.3, y:  4.2,z: -2.6, w:  0.3,h:  3.6,d:  5.4,...C('#B3E5FC','#81D4FA','#B3E5FC') },
-  { x:  6,   y:  4.2,z: -2.6, w:  0.3,h:  3.6,d:  5.4,...C('#B3E5FC','#81D4FA','#B3E5FC') },
-  // Wheels (4 × rubber + hub)
-  { x:-10.4, y: -1.2,z: -2.8, w:  2,  h:  3.2,d:  2,  ...C('#212121','#111111','#1A1A1A') },
-  { x:  8.4, y: -1.2,z: -2.8, w:  2,  h:  3.2,d:  2,  ...C('#212121','#111111','#1A1A1A') },
-  { x:-10.4, y: -1.2,z:  0.8, w:  2,  h:  3.2,d:  2,  ...C('#212121','#111111','#1A1A1A') },
-  { x:  8.4, y: -1.2,z:  0.8, w:  2,  h:  3.2,d:  2,  ...C('#212121','#111111','#1A1A1A') },
-  // Hubcaps
-  { x: -9.8, y: -0.4,z: -2.4, w:  0.8,h:  2.4,d:  1.4,...C('#90A4AE','#78909C','#B0BEC5') },
-  { x:  9,   y: -0.4,z: -2.4, w:  0.8,h:  2.4,d:  1.4,...C('#90A4AE','#78909C','#B0BEC5') },
-  { x: -9.8, y: -0.4,z:  1.2, w:  0.8,h:  2.4,d:  1.4,...C('#90A4AE','#78909C','#B0BEC5') },
-  { x:  9,   y: -0.4,z:  1.2, w:  0.8,h:  2.4,d:  1.4,...C('#90A4AE','#78909C','#B0BEC5') },
+  // ── LOWER CHASSIS & BUMPERS ──────────────────────────────────────────────
+  { x:-11, y: 1, z:-5, w:22, h: 3, d:10, top:'#1976D2', right:'#1565C0', front:'#0D47A1' }, // Main Floor
+  { x: 11, y: 1, z:-4, w: 1, h: 2, d: 8, top:'#263238', right:'#263238', front:'#263238' }, // Front Bumper
+  { x:-12, y: 1, z:-4, w: 1, h: 2, d: 8, top:'#263238', right:'#263238', front:'#263238' }, // Rear Bumper
+
+  // ── BODY LAYERS (Tapering the Hood) ──────────────────────────────────────
+  { x: -10, y: 4, z:-5, w:14, h: 1, d:10, top:'#1E88E5', right:'#1565C0', front:'#1976D2' }, // Rear Deck/Trunk
+  { x:   4, y: 4, z:-5, w: 7, h: 1, d:10, top:'#1E88E5', right:'#1565C0', front:'#1976D2' }, // Hood (Lower than roof)
+
+  // ── GREENHOUSE (The Cabin & Glass) ───────────────────────────────────────
+  { x: -7, y: 5, z:-4.5, w:11, h: 4, d: 9, top:'#1E88E5', right:'#1565C0', front:'#1976D2' }, // Roof/Core
+  // Windshield (Stepped for slope effect)
+  { x:  4, y: 5, z:-4, w: 1, h: 2, d: 8, top:'#B3E5FC', right:'#81D4FA', front:'#E1F5FE' }, 
+  { x:  3, y: 6, z:-4, w: 1, h: 2, d: 8, top:'#B3E5FC', right:'#81D4FA', front:'#E1F5FE' },
+  // Side Windows (Recessed by 0.2 for depth)
+  { x: -6, y: 5.5, z:-4.7, w: 9, h: 2.5, d: 0.2, top:'#263238', right:'#263238', front:'#263238' }, // Left Glass
+  { x: -6, y: 5.5, z: 4.5,  w: 9, h: 2.5, d: 0.2, top:'#263238', right:'#263238', front:'#263238' }, // Right Glass
+
+  // ── WHEELS (Tucked into arches) ──────────────────────────────────────────
+  { x:-8, y: 0, z:-5.5, w: 4, h: 4, d: 2, top:'#212121', right:'#000000', front:'#111111' }, // Rear Left
+  { x: 5, y: 0, z:-5.5, w: 4, h: 4, d: 2, top:'#212121', right:'#000000', front:'#111111' }, // Front Left
+  { x:-8, y: 0, z: 3.5,  w: 4, h: 4, d: 2, top:'#212121', right:'#000000', front:'#111111' }, // Rear Right
+  { x: 5, y: 0, z: 3.5,  w: 4, h: 4, d: 2, top:'#212121', right:'#000000', front:'#111111' }, // Front Right
+
+  // ── DETAILS (The "Realism" Boosters) ─────────────────────────────────────
+  // Side Mirrors
+  { x: 3, y: 5.5, z:-5.5, w: 1, h: 1, d: 1, top:'#1E88E5', right:'#1565C0', front:'#1976D2' }, 
+  { x: 3, y: 5.5, z: 4.5,  w: 1, h: 1, d: 1, top:'#1E88E5', right:'#1565C0', front:'#1976D2' },
   // Headlights
-  { x: -7.6, y:  1.2,z: -3,   w:  2.8,h:  2,  d:  0.4,...C('#FFF9C4','#FFF176','#FFFDE7') },
-  { x:  4.8, y:  1.2,z: -3,   w:  2.8,h:  2,  d:  0.4,...C('#FFF9C4','#FFF176','#FFFDE7') },
-  // Tail lights
-  { x: -7.6, y:  1.2,z:  2.8, w:  2.4,h:  1.6,d:  0.4,...C('#EF5350','#E53935','#E57373') },
-  { x:  5.2, y:  1.2,z:  2.8, w:  2.4,h:  1.6,d:  0.4,...C('#EF5350','#E53935','#E57373') },
-  // Bumpers
-  { x: -8.4, y:  0.4,z: -3.2, w: 16.8,h:  1.6,d:  0.4,...C('#90A4AE','#78909C','#B0BEC5') },
-  { x: -8.4, y:  0.4,z:  3.2, w: 16.8,h:  1.6,d:  0.4,...C('#90A4AE','#78909C','#B0BEC5') },
+  { x: 10.5, y: 2.5, z:-4, w: 0.5, h: 1.5, d: 2, top:'#FFF9C4', right:'#FFF176', front:'#FFFFFF' },
+  { x: 10.5, y: 2.5, z: 2,  w: 0.5, h: 1.5, d: 2, top:'#FFF9C4', right:'#FFF176', front:'#FFFFFF' },
+  // Front Grille
+  { x: 11.1, y: 1.5, z:-2, w: 0.2, h: 2, d: 4, top:'#111111', right:'#111111', front:'#111111' },
+  // Tail Lights
+  { x: -11.5, y: 2.5, z:-4, w: 0.5, h: 1.2, d: 2, top:'#EF5350', right:'#B71C1C', front:'#FF5252' },
+  { x: -11.5, y: 2.5, z: 2,  w: 0.5, h: 1.2, d: 2, top:'#EF5350', right:'#B71C1C', front:'#FF5252' },
 ];
 
 // Taxi — same shell, yellow livery + roof sign
@@ -1206,6 +1208,134 @@ const EIFFEL_TOWER = [
   { x:-0.3,y:202, z:-0.3,w:0.6,h:10, d:0.6,top:'#FFD700', right:'#DAA520', front:'#FFC125' },
 ];
 
+const BIG_BEN = [
+  // ── MAIN TOWER SHAFT ─────────────────────────────────────────────────────
+  { x:-10, y: 0,  z:-10, w:20, h:60, d:20, top:'#D2B48C', right:'#C19A6B', front:'#A88C52' },
+  { x:-11, y: 60, z:-11, w:22, h:2,  d:22, top:'#C19A6B', right:'#A88C52', front:'#8B7355' }, // Decorative ledge
+
+  // ── CLOCK FACE SECTION ───────────────────────────────────────────────────
+  { x:-10, y: 62, z:-10, w:20, h:15, d:20, top:'#D2B48C', right:'#C19A6B', front:'#A88C52' },
+  // Clock Faces (White inserts)
+  { x:-8,  y: 65, z:-10.5, w:16, h:10, d:1,  top:'#FFFFFF', right:'#EEEEEE', front:'#FFFFFF' }, // Front
+  { x: 9.5, y: 65, z:-8,    w:1,  h:10, d:16, top:'#FFFFFF', right:'#FFFFFF', front:'#EEEEEE' }, // Right
+  { x:-8,  y: 65, z: 9.5,  w:16, h:10, d:1,  top:'#FFFFFF', right:'#EEEEEE', front:'#FFFFFF' }, // Back
+  { x:-10.5,y: 65, z:-8,    w:1,  h:10, d:16, top:'#FFFFFF', right:'#FFFFFF', front:'#EEEEEE' }, // Left
+
+  // ── ROOF / SPIRE ─────────────────────────────────────────────────────────
+  { x:-11, y: 77, z:-11, w:22, h:4,  d:22, top:'#455A64', right:'#37474F', front:'#263238' }, // Roof Base
+  { x:-8,  y: 81, z:-8,  w:16, h:8,  d:16, top:'#455A64', right:'#37474F', front:'#263238' }, // Sloped mid
+  { x:-5,  y: 89, z:-5,  w:10, h:10, d:10, top:'#D4AF37', right:'#C59B27', front:'#B8860B' }, // Gold detailing
+  { x:-2,  y: 99, z:-2,  w:4,  h:15, d:4,  top:'#37474F', right:'#263238', front:'#212121' }, // Final needle
+  { x:-0.5,y:114, z:-0.5,w:1,  h:5,  d:1,  top:'#D4AF37', right:'#D4AF37', front:'#D4AF37' }  // Tip
+];
+
+const GREAT_PYRAMID = [
+  { x:-40, y: 0,  z:-40, w:80, h:8, d:80, top:'#EDC9AF', right:'#D2B48C', front:'#C19A6B' },
+  { x:-35, y: 8,  z:-35, w:70, h:8, d:70, top:'#EDC9AF', right:'#D2B48C', front:'#C19A6B' },
+  { x:-30, y: 16, z:-30, w:60, h:8, d:60, top:'#F4A460', right:'#E29650', front:'#D2B48C' },
+  { x:-25, y: 24, z:-25, w:50, h:8, d:50, top:'#F4A460', right:'#E29650', front:'#D2B48C' },
+  { x:-20, y: 32, z:-20, w:40, h:8, d:40, top:'#EDC9AF', right:'#D2B48C', front:'#C19A6B' },
+  { x:-15, y: 40, z:-15, w:30, h:8, d:30, top:'#EDC9AF', right:'#D2B48C', front:'#C19A6B' },
+  { x:-10, y: 48, z:-10, w:20, h:8, d:20, top:'#F4A460', right:'#E29650', front:'#D2B48C' },
+  { x:-5,  y: 56, z:-5,  w:10, h:8, d:10, top:'#F4A460', right:'#E29650', front:'#D2B48C' },
+  // The Capstone (Pyramidion)
+  { x:-2,  y: 64, z:-2,  w:4,  h:4, d:4,  top:'#FFD700', right:'#DAA520', front:'#B8860B' }
+];
+
+const ARC_DE_TRIOMPHE = [
+  // Left Pillar
+  { x:-20, y: 0, z:-10, w:12, h:30, d:20, top:'#E0E0E0', right:'#BDBDBD', front:'#9E9E9E' },
+  // Right Pillar
+  { x: 8,  y: 0, z:-10, w:12, h:30, d:20, top:'#E0E0E0', right:'#BDBDBD', front:'#9E9E9E' },
+  
+  // Arch Connector (The ceiling of the arch)
+  { x:-8,  y: 25, z:-10, w:16, h:5,  d:20, top:'#D5D5D5', right:'#BDBDBD', front:'#9E9E9E' },
+  
+  // Top Attic Section (The heavy block on top)
+  { x:-22, y: 30, z:-11, w:44, h:12, d:22, top:'#F5F5F5', right:'#E0E0E0', front:'#BDBDBD' },
+  
+  // Decorative Cornice
+  { x:-23, y: 42, z:-12, w:46, h:3,  d:24, top:'#EEEEEE', right:'#D5D5D5', front:'#BDBDBD' }
+];
+
+const GOLDEN_GATE_BRIDGE = [
+
+  // ── MARIN ANCHORAGE (north end) ──────────────────────────────────────────
+  { x:-20, y:  0, z:-240, w:40, h:16, d:48, top:'#8B3A2A', right:'#7A2E1E', front:'#6B2218' },
+  { x:-16, y: 16, z:-240, w:32, h: 6, d:48, top:'#A04030', right:'#8B3A2A', front:'#7A2E1E' },
+
+  // ── SF ANCHORAGE (south end) ──────────────────────────────────────────────
+  { x:-20, y:  0, z: 192, w:40, h:16, d:48, top:'#8B3A2A', right:'#7A2E1E', front:'#6B2218' },
+  { x:-16, y: 16, z: 192, w:32, h: 6, d:48, top:'#A04030', right:'#8B3A2A', front:'#7A2E1E' },
+
+  // ── ROADWAY DECK ──────────────────────────────────────────────────────────
+  { x: -8, y: 20, z:-240, w:16, h: 4, d:480, top:'#C1440E', right:'#A83000', front:'#8B2500' },
+  { x: -9, y: 18, z:-240, w: 2, h: 3, d:480, top:'#8B3A2A', right:'#7A2E1E', front:'#6B2218' },
+  { x:  7, y: 18, z:-240, w: 2, h: 3, d:480, top:'#8B3A2A', right:'#7A2E1E', front:'#6B2218' },
+
+  // ── NORTH TOWER ───────────────────────────────────────────────────────────
+  // Left leg
+  { x:-12, y:  0, z:-136, w:12, h:128, d:16, top:'#C0400C', right:'#A83000', front:'#8B2500' },
+  // Right leg
+  { x:  0, y:  0, z:-136, w:12, h:128, d:16, top:'#C0400C', right:'#A83000', front:'#8B2500' },
+  // Portal struts
+  { x:-12, y: 48, z:-136, w:24, h: 8, d:16, top:'#A83000', right:'#8B2500', front:'#742000' },
+  { x:-12, y: 80, z:-136, w:24, h: 8, d:16, top:'#A83000', right:'#8B2500', front:'#742000' },
+  { x:-12, y:108, z:-136, w:24, h: 8, d:16, top:'#A83000', right:'#8B2500', front:'#742000' },
+  // Caps
+  { x:-14, y:124, z:-140, w:16, h: 6, d:24, top:'#C84810', right:'#B03808', front:'#8B2500' },
+  { x:-12, y:128, z:-138, w:12, h: 8, d:20, top:'#D05010', right:'#B83808', front:'#9B3000' },
+  { x:  0, y:124, z:-140, w:16, h: 6, d:24, top:'#C84810', right:'#B03808', front:'#8B2500' },
+  { x:  2, y:128, z:-138, w:12, h: 8, d:20, top:'#D05010', right:'#B83808', front:'#9B3000' },
+
+  // ── SOUTH TOWER ───────────────────────────────────────────────────────────
+  { x:-12, y:  0, z: 96, w:12, h:128, d:16, top:'#C0400C', right:'#A83000', front:'#8B2500' },
+  { x:  0, y:  0, z: 96, w:12, h:128, d:16, top:'#C0400C', right:'#A83000', front:'#8B2500' },
+  { x:-12, y: 48, z: 96, w:24, h: 8, d:16, top:'#A83000', right:'#8B2500', front:'#742000' },
+  { x:-12, y: 80, z: 96, w:24, h: 8, d:16, top:'#A83000', right:'#8B2500', front:'#742000' },
+  { x:-12, y:108, z: 96, w:24, h: 8, d:16, top:'#A83000', right:'#8B2500', front:'#742000' },
+  { x:-14, y:124, z: 92, w:16, h: 6, d:24, top:'#C84810', right:'#B03808', front:'#8B2500' },
+  { x:-12, y:128, z: 94, w:12, h: 8, d:20, top:'#D05010', right:'#B83808', front:'#9B3000' },
+  { x:  0, y:124, z: 92, w:16, h: 6, d:24, top:'#C84810', right:'#B03808', front:'#8B2500' },
+  { x:  2, y:128, z: 94, w:12, h: 8, d:20, top:'#D05010', right:'#B83808', front:'#9B3000' },
+
+  // ── MAIN CABLES (catenary stepped along Z, left channel) ─────────────────
+  { x:-10, y: 52, z:-240, w:4, h:4, d:36, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+  { x:-10, y: 40, z:-204, w:4, h:4, d:36, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+  { x:-10, y: 28, z:-168, w:4, h:4, d:32, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+  { x:-10, y: 20, z:-136, w:4, h:4, d:272,top:'#8B3A2A', right:'#6A2818', front:'#5A1808' },
+  { x:-10, y: 28, z: 136, w:4, h:4, d:32, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+  { x:-10, y: 40, z: 168, w:4, h:4, d:36, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+  { x:-10, y: 52, z: 192, w:4, h:4, d:36, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+  // Right channel cable
+  { x:  6, y: 52, z:-240, w:4, h:4, d:36, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+  { x:  6, y: 40, z:-204, w:4, h:4, d:36, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+  { x:  6, y: 28, z:-168, w:4, h:4, d:32, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+  { x:  6, y: 20, z:-136, w:4, h:4, d:272,top:'#8B3A2A', right:'#6A2818', front:'#5A1808' },
+  { x:  6, y: 28, z: 136, w:4, h:4, d:32, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+  { x:  6, y: 40, z: 168, w:4, h:4, d:36, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+  { x:  6, y: 52, z: 192, w:4, h:4, d:36, top:'#7A3020', right:'#5A2010', front:'#4A1808' },
+
+  // ── HANGER CABLES (left channel) ──────────────────────────────────────────
+  { x:-10, y: 20, z:-200, w:4, h:24, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:-10, y: 20, z:-160, w:4, h:20, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:-10, y: 20, z:-120, w:4, h: 8, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:-10, y: 20, z: -80, w:4, h: 4, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:-10, y: 20, z:  40, w:4, h: 4, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:-10, y: 20, z:  80, w:4, h: 8, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:-10, y: 20, z: 120, w:4, h:20, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:-10, y: 20, z: 160, w:4, h:24, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  // Right channel hangers
+  { x:  6, y: 20, z:-200, w:4, h:24, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:  6, y: 20, z:-160, w:4, h:20, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:  6, y: 20, z:-120, w:4, h: 8, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:  6, y: 20, z: -80, w:4, h: 4, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:  6, y: 20, z:  40, w:4, h: 4, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:  6, y: 20, z:  80, w:4, h: 8, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:  6, y: 20, z: 120, w:4, h:20, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+  { x:  6, y: 20, z: 160, w:4, h:24, d:4, top:'#6B2218', right:'#5A1A10', front:'#4A1208' },
+];
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Export
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1337,4 +1467,14 @@ export const Blueprints = {
 
   eiffel_tower:     EIFFEL_TOWER,
   tour_eiffel:  EIFFEL_TOWER, 
+  // New Monument mappings
+  big_ben:        BIG_BEN,
+  elizabeth_tower: BIG_BEN,
+  great_pyramid:  GREAT_PYRAMID,
+  pyramid_of_cheops: GREAT_PYRAMID,
+  great_pyramid_of_giza:      GREAT_PYRAMID,
+  pyramid_of_khufu:       GREAT_PYRAMID,
+  golden_gate_bridge:       GOLDEN_GATE_BRIDGE,
+  golden_gate:              GOLDEN_GATE_BRIDGE,
+  arc_de_triomphe: ARC_DE_TRIOMPHE
 };

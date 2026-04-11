@@ -306,6 +306,24 @@ function extractFacingAngle(tags = {}, geometry = null) {
   return 180;
 }
 
+// ─── Landmark name resolver — restore from doc 1 ──────────────────────────────
+function resolveLandmarkKey(tags) {
+  if (!tags) return null;
+  const candidates = [
+    tags['name:en'],
+    tags['int_name'],
+    tags['alt_name:en'],
+    tags['old_name'],
+    tags['name'],
+  ];
+  for (const c of candidates) {
+    if (!c || typeof c !== 'string') continue;
+    const key = c.toLowerCase().replace(/[\s\-']+/g, '_').replace(/[^a-z0-9_]/g, '');
+    if (Blueprints[key]) return { key, name: c };
+  }
+  return null;
+}
+
 /**
  * Blueprint entity factory.
  *
@@ -691,6 +709,7 @@ export class OSMTerrainLoader extends BaseLoader {
       way["waterway"~"^(river|stream|canal|drain|ditch|riverbank)$"]${around};
       way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|pedestrian|footway|cycleway|path|track)$"]${around};
       way["building"]${around};
+      way["bridge"="yes"]["name"]${around};
       node["amenity"]${around};
       node["shop"]${around};
       node["tourism"]${around};
@@ -735,10 +754,25 @@ export class OSMTerrainLoader extends BaseLoader {
         const maxGY = latToGlobalY(lat - rLat, this._mPerTile) + 2;
 
         const buildingWays = [];
+        const bridgeWays = [];
 
         for (const el of data.elements) {
 
           if (el.type === 'way' && el.geometry?.length) {
+            if (el.tags?.bridge === 'yes' || el.tags?.man_made === 'bridge') {
+              const match = resolveLandmarkKey(el.tags);
+              if (match) {
+                bridgeWays.push({ el, match });
+                // still rasterize road/path terrain under the bridge
+                const cls = classifyOSM(el.tags);
+                if (cls) {
+                  const pts = el.geometry.map(g => toTile(g.lat, g.lon));
+                  rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width ?? 2);
+                }
+                continue; // don't fall through to the normal way handler
+              }
+            }
+
             const cls = classifyOSM(el.tags);
             if (cls) {
               const pts = el.geometry.map(g => toTile(g.lat, g.lon));
@@ -795,18 +829,21 @@ export class OSMTerrainLoader extends BaseLoader {
             const poi = classifyPOI(el.tags);
             if (!poi) continue;
 
-            const name    = el.tags?.name || poi.label;
-            const nameKey = name.toLowerCase().replace(/\s+/g, '_');
-
-            if (Blueprints[nameKey]) {
+            // FIXED
+            const landmarkMatch = resolveLandmarkKey(el.tags);
+            if (landmarkMatch) {
+              const { key: nameKey, name } = landmarkMatch;
               if (!renderedLandmarkNames.has(nameKey)) {
                 renderedLandmarkNames.add(nameKey);
-                const blueprint   = Blueprints[nameKey];
-                const osmHeightM  = parseFloat(el.tags?.height ?? el.tags?.['building:height'] ?? 0) || 0;
-                const scale       = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile);
+                const blueprint  = Blueprints[nameKey];
+                const osmHeightM = parseFloat(el.tags?.height ?? el.tags?.['building:height'] ?? 0) || 0;
+                const scale      = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile);
                 const { halfExtentXZ } = blueprintNativeBounds(blueprint);
-                const scaledR     = Math.max(2, (halfExtentXZ / VU) * scale);
+                const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
                 const facingAngle = extractFacingAngle(el.tags);
+
+                console.log(`[OSMTerrainLoader] Landmark node "${name}" — h=${osmHeightM}m → scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`);
+
                 entityDefs.push(makeBlueprintDef(
                   `landmark:node:${el.id}`, el.lat, el.lon, nameKey,
                   {
@@ -832,14 +869,63 @@ export class OSMTerrainLoader extends BaseLoader {
           }
         }
 
+        // ── Bridge landmarks ──────────────────────────────────────────────────────
+        for (const { el, match } of bridgeWays) {
+          const { key: nameKey, name } = match;
+          if (renderedLandmarkNames.has(nameKey)) continue;
+          const blueprint = Blueprints[nameKey];
+          if (!blueprint) continue;
+
+          // Centroid from geometry
+          let cLat = 0, cLon = 0;
+          const geom = el.geometry ?? [];
+          for (const g of geom) { cLat += g.lat; cLon += g.lon; }
+          if (geom.length) { cLat /= geom.length; cLon /= geom.length; }
+
+          // Span = straight-line distance tip to tip — used to scale linear landmarks
+          const osmSpanM = computeWaySpanM(geom);
+          const osmHeightM = parseFloat(el.tags?.height ?? el.tags?.['max_height'] ?? 0) || 0;
+          const scale = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile, osmSpanM);
+
+          const { halfExtentXZ } = blueprintNativeBounds(blueprint);
+          const scaledR = Math.max(2, (halfExtentXZ / VU) * scale);
+          const facingAngle = extractFacingAngle(el.tags, geom);
+
+          console.log(`[OSMTerrainLoader] Bridge landmark "${name}" — span=${osmSpanM.toFixed(0)}m h=${osmHeightM}m → scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`);
+
+          renderedLandmarkNames.add(nameKey);
+          entityDefs.push(makeBlueprintDef(
+            `landmark:bridge:${el.id}`, cLat, cLon, nameKey,
+            {
+              scale, facingAngle,
+              solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
+              physicsEnabled: true, physicsRadius: scaledR,
+              fixed: true, lodColor: '#A1887F',
+            }
+          ));
+
+          const colliders = makeBlueprintColliders(
+            `landmark:bridge:${el.id}`, cLat, cLon, blueprint, scale, this._mPerTile
+          );
+          for (const col of colliders) {
+            const { dLat, dLon } = tileOffsetToGeo(
+              col._localOffsetX, col._localOffsetZ, cLat, this._mPerTile
+            );
+            col.latitude  = cLat + dLat;
+            col.longitude = cLon + dLon;
+            entityDefs.push(col);
+          }
+        }
+
         // ── Buildings ─────────────────────────────────────────────────────────
         if (buildingWays.length && this._terrainRegistry) {
           const buildings = preprocessBuildings(buildingWays);
 
           for (const b of buildings) {
-            const name      = b.tags?.name ?? '';
-            const nameKey   = name.toLowerCase().replace(/\s+/g, '_');
-            const blueprint = Blueprints[nameKey];
+            const match     = resolveLandmarkKey(b.tags);
+            const nameKey   = match?.key  ?? '';
+            const name      = match?.name ?? '';
+            const blueprint = match ? Blueprints[nameKey] : null;
 
             if (blueprint) {
               const osmHeightM = parseFloat(b.tags?.height ?? b.tags?.['building:height'] ?? 0) || 0;
@@ -849,7 +935,7 @@ export class OSMTerrainLoader extends BaseLoader {
               const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
 
               console.log(
-                `[OSMTerrainLoader] Landmark "${name}" — ` +
+                `[OSMTerrainLoader] Landmark bldg "${name}" — ` +
                 `h=${osmHeightM}m area=${osmAreaM2.toFixed(0)}m² → ` +
                 `scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`
               );
