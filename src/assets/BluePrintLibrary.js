@@ -1118,58 +1118,92 @@ const AMENITY = [
 ];
 
 const EIFFEL_TOWER = [
-  // ── LEGS (four curved arches) ─────────────────────────────────────────────
-  // Front‑left leg (from viewer perspective)
-  { x: -24, y: 0,  z: -24, w: 8, h: 48, d: 8, top: '#6D4C41', right: '#5D4037', front: '#4E342E' },
-  { x: -28, y: 48, z: -28, w: 16, h: 12, d: 16, top: '#795548', right: '#6D4C41', front: '#5D4037' },
-  // Front‑right leg
-  { x: 16,  y: 0,  z: -24, w: 8, h: 48, d: 8, top: '#6D4C41', right: '#5D4037', front: '#4E342E' },
-  { x: 12,  y: 48, z: -28, w: 16, h: 12, d: 16, top: '#795548', right: '#6D4C41', front: '#5D4037' },
-  // Back‑left leg
-  { x: -24, y: 0,  z: 16,  w: 8, h: 48, d: 8, top: '#6D4C41', right: '#5D4037', front: '#4E342E' },
-  { x: -28, y: 48, z: 12,  w: 16, h: 12, d: 16, top: '#795548', right: '#6D4C41', front: '#5D4037' },
-  // Back‑right leg
-  { x: 16,  y: 0,  z: 16,  w: 8, h: 48, d: 8, top: '#6D4C41', right: '#5D4037', front: '#4E342E' },
-  { x: 12,  y: 48, z: 12,  w: 16, h: 12, d: 16, top: '#795548', right: '#6D4C41', front: '#5D4037' },
 
-  // ── FIRST PLATFORM (lower observation deck) ───────────────────────────────
-  { x: -36, y: 60, z: -36, w: 72, h: 4, d: 72, top: '#A1887F', right: '#8D6E63', front: '#795548' },
+  // ── LEG FL (front-left) — 6 sections curving inward ──────────────────────
+  { x:-32, y:  0, z:-32, w:10, h: 8, d:10, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+  { x:-30, y:  8, z:-30, w: 8, h: 8, d: 8, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+  { x:-27, y: 16, z:-27, w: 6, h: 8, d: 6, top:'#6D4C41', right:'#5D4037', front:'#4E342E' },
+  { x:-24, y: 24, z:-24, w: 5, h: 8, d: 5, top:'#6D4C41', right:'#5D4037', front:'#4E342E' },
+  { x:-21, y: 32, z:-21, w: 4, h: 8, d: 4, top:'#795548', right:'#6D4C41', front:'#5D4037' },
+  { x:-18, y: 40, z:-18, w: 4, h:10, d: 4, top:'#795548', right:'#6D4C41', front:'#5D4037' },
+
+  // ── LEG FR (front-right) ──────────────────────────────────────────────────
+  { x: 22, y:  0, z:-32, w:10, h: 8, d:10, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+  { x: 22, y:  8, z:-30, w: 8, h: 8, d: 8, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+  { x: 21, y: 16, z:-27, w: 6, h: 8, d: 6, top:'#6D4C41', right:'#5D4037', front:'#4E342E' },
+  { x: 19, y: 24, z:-24, w: 5, h: 8, d: 5, top:'#6D4C41', right:'#5D4037', front:'#4E342E' },
+  { x: 17, y: 32, z:-21, w: 4, h: 8, d: 4, top:'#795548', right:'#6D4C41', front:'#5D4037' },
+  { x: 14, y: 40, z:-18, w: 4, h:10, d: 4, top:'#795548', right:'#6D4C41', front:'#5D4037' },
+
+  // ── LEG BL (back-left) ────────────────────────────────────────────────────
+  { x:-32, y:  0, z: 22, w:10, h: 8, d:10, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+  { x:-30, y:  8, z: 22, w: 8, h: 8, d: 8, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+  { x:-27, y: 16, z: 21, w: 6, h: 8, d: 6, top:'#6D4C41', right:'#5D4037', front:'#4E342E' },
+  { x:-24, y: 24, z: 19, w: 5, h: 8, d: 5, top:'#6D4C41', right:'#5D4037', front:'#4E342E' },
+  { x:-21, y: 32, z: 17, w: 4, h: 8, d: 4, top:'#795548', right:'#6D4C41', front:'#5D4037' },
+  { x:-18, y: 40, z: 14, w: 4, h:10, d: 4, top:'#795548', right:'#6D4C41', front:'#5D4037' },
+
+  // ── LEG BR (back-right) ───────────────────────────────────────────────────
+  { x: 22, y:  0, z: 22, w:10, h: 8, d:10, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+  { x: 22, y:  8, z: 22, w: 8, h: 8, d: 8, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+  { x: 21, y: 16, z: 21, w: 6, h: 8, d: 6, top:'#6D4C41', right:'#5D4037', front:'#4E342E' },
+  { x: 19, y: 24, z: 19, w: 5, h: 8, d: 5, top:'#6D4C41', right:'#5D4037', front:'#4E342E' },
+  { x: 17, y: 32, z: 17, w: 4, h: 8, d: 4, top:'#795548', right:'#6D4C41', front:'#5D4037' },
+  { x: 14, y: 40, z: 14, w: 4, h:10, d: 4, top:'#795548', right:'#6D4C41', front:'#5D4037' },
+
+  // ── LOWER ARCH BRACING (level ~y=20, suggests the curved lattice) ─────────
+  { x:-30, y: 18, z:-30, w:60, h: 3, d: 3, top:'#4E342E', right:'#3E2723', front:'#3E2723' },
+  { x:-30, y: 18, z: 27, w:60, h: 3, d: 3, top:'#4E342E', right:'#3E2723', front:'#3E2723' },
+  { x:-30, y: 18, z:-27, w: 3, h: 3, d:54, top:'#4E342E', right:'#3E2723', front:'#3E2723' },
+  { x: 27, y: 18, z:-27, w: 3, h: 3, d:54, top:'#4E342E', right:'#3E2723', front:'#3E2723' },
+
+  // ── MID ARCH BRACING (level ~y=38, just below first platform) ────────────
+  { x:-20, y: 38, z:-20, w:40, h: 3, d: 3, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+  { x:-20, y: 38, z: 17, w:40, h: 3, d: 3, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+  { x:-20, y: 38, z:-17, w: 3, h: 3, d:34, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+  { x: 17, y: 38, z:-17, w: 3, h: 3, d:34, top:'#5D4037', right:'#4E342E', front:'#3E2723' },
+
+  // ── FIRST PLATFORM ────────────────────────────────────────────────────────
+  { x:-22, y: 50, z:-22, w:44, h: 3, d:44, top:'#A1887F', right:'#8D6E63', front:'#795548' },
+  // Platform lip
+  { x:-24, y: 53, z:-24, w:48, h: 2, d:48, top:'#8D6E63', right:'#795548', front:'#6D4C41' },
+  // Railing — thin posts suggestion
+  { x:-24, y: 55, z:-24, w:48, h: 3, d: 2, top:'#BCAAA4', right:'#A1887F', front:'#8D6E63' },
+  { x:-24, y: 55, z: 22, w:48, h: 3, d: 2, top:'#BCAAA4', right:'#A1887F', front:'#8D6E63' },
+  { x:-24, y: 55, z:-22, w: 2, h: 3, d:44, top:'#BCAAA4', right:'#A1887F', front:'#8D6E63' },
+  { x: 22, y: 55, z:-22, w: 2, h: 3, d:44, top:'#BCAAA4', right:'#A1887F', front:'#8D6E63' },
+
+  // ── SECOND STAGE — narrows quickly (the elegant shaft) ───────────────────
+  { x:-14, y: 55, z:-14, w:28, h:12, d:28, top:'#795548', right:'#6D4C41', front:'#5D4037' },
+  { x:-12, y: 67, z:-12, w:24, h:12, d:24, top:'#795548', right:'#6D4C41', front:'#5D4037' },
+  { x:-10, y: 79, z:-10, w:20, h:12, d:20, top:'#8D6E63', right:'#795548', front:'#6D4C41' },
+  { x: -8, y: 91, z: -8, w:16, h:10, d:16, top:'#8D6E63', right:'#795548', front:'#6D4C41' },
+
+  // ── SECOND PLATFORM ───────────────────────────────────────────────────────
+  { x:-14, y:101, z:-14, w:28, h: 3, d:28, top:'#BCAAA4', right:'#A1887F', front:'#8D6E63' },
+  { x:-15, y:104, z:-15, w:30, h: 2, d:30, top:'#A1887F', right:'#8D6E63', front:'#795548' },
   // Railing
-  { x: -36, y: 64, z: -36, w: 72, h: 4, d: 4, top: '#BCAAA4', right: '#A1887F', front: '#8D6E63' },
-  { x: -36, y: 64, z: 32,  w: 72, h: 4, d: 4, top: '#BCAAA4', right: '#A1887F', front: '#8D6E63' },
-  { x: -36, y: 64, z: -32, w: 4,  h: 4, d: 64, top: '#BCAAA4', right: '#A1887F', front: '#8D6E63' },
-  { x: 32,  y: 64, z: -32, w: 4,  h: 4, d: 64, top: '#BCAAA4', right: '#A1887F', front: '#8D6E63' },
+  { x:-15, y:106, z:-15, w:30, h: 2, d: 2, top:'#D7CCC8', right:'#BCAAA4', front:'#A1887F' },
+  { x:-15, y:106, z: 13, w:30, h: 2, d: 2, top:'#D7CCC8', right:'#BCAAA4', front:'#A1887F' },
+  { x:-15, y:106, z:-13, w: 2, h: 2, d:26, top:'#D7CCC8', right:'#BCAAA4', front:'#A1887F' },
+  { x: 13, y:106, z:-13, w: 2, h: 2, d:26, top:'#D7CCC8', right:'#BCAAA4', front:'#A1887F' },
 
-  // ── UPPER TOWER (tapering) ────────────────────────────────────────────────
-  // Lower section
-  { x: -20, y: 64, z: -20, w: 40, h: 40, d: 40, top: '#795548', right: '#6D4C41', front: '#5D4037' },
-  // Taper 1
-  { x: -16, y: 104, z: -16, w: 32, h: 32, d: 32, top: '#8D6E63', right: '#795548', front: '#6D4C41' },
-  // Taper 2
-  { x: -12, y: 136, z: -12, w: 24, h: 24, d: 24, top: '#A1887F', right: '#8D6E63', front: '#795548' },
+  // ── UPPER SHAFT — very slender ────────────────────────────────────────────
+  { x: -6, y:106, z: -6, w:12, h:16, d:12, top:'#8D6E63', right:'#795548', front:'#6D4C41' },
+  { x: -5, y:122, z: -5, w:10, h:14, d:10, top:'#8D6E63', right:'#795548', front:'#6D4C41' },
+  { x: -4, y:136, z: -4, w: 8, h:12, d: 8, top:'#A1887F', right:'#8D6E63', front:'#795548' },
+  { x: -3, y:148, z: -3, w: 6, h:10, d: 6, top:'#A1887F', right:'#8D6E63', front:'#795548' },
 
-  // ── SECOND PLATFORM (upper observation deck) ──────────────────────────────
-  { x: -20, y: 160, z: -20, w: 40, h: 4, d: 40, top: '#BCAAA4', right: '#A1887F', front: '#8D6E63' },
-  // Railing
-  { x: -20, y: 164, z: -20, w: 40, h: 3, d: 3, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' },
-  { x: -20, y: 164, z: 17,  w: 40, h: 3, d: 3, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' },
-  { x: -20, y: 164, z: -17, w: 3,  h: 3, d: 34, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' },
-  { x: 17,  y: 164, z: -17, w: 3,  h: 3, d: 34, top: '#D7CCC8', right: '#BCAAA4', front: '#A1887F' },
+  // ── LANTERN / SPIRE BASE ──────────────────────────────────────────────────
+  { x: -4, y:158, z: -4, w: 8, h: 8, d: 8, top:'#BCAAA4', right:'#A1887F', front:'#8D6E63' },
+  { x: -3, y:166, z: -3, w: 6, h: 8, d: 6, top:'#D4AF37', right:'#C59B27', front:'#B8860B' },
 
-  // ── TOP LANTERN (spire base) ──────────────────────────────────────────────
-  { x: -6,  y: 164, z: -6,  w: 12, h: 24, d: 12, top: '#A1887F', right: '#8D6E63', front: '#795548' },
-  // Spire
-  { x: -3,  y: 188, z: -3,  w: 6,  h: 20, d: 6,  top: '#D4AF37', right: '#C59B27', front: '#B8860B' },
-  // Antenna tip
-  { x: -1,  y: 208, z: -1,  w: 2,  h: 12, d: 2,  top: '#FFD700', right: '#DAA520', front: '#FFC125' },
-  // Ball at top
-  { x: -2,  y: 220, z: -2,  w: 4,  h: 4,  d: 4,  top: '#FFD700', right: '#DAA520', front: '#FFC125' },
-
-  // ── ARCHES BETWEEN LEGS (decorative) ───────────────────────────────────────
-  { x: -28, y: 40, z: -28, w: 56, h: 4, d: 4, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
-  { x: -28, y: 40, z: 24,  w: 56, h: 4, d: 4, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
-  { x: -28, y: 40, z: -24, w: 4,  h: 4, d: 48, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
-  { x: 24,  y: 40, z: -24, w: 4,  h: 4, d: 48, top: '#5D4037', right: '#4E342E', front: '#3E2723' },
+  // ── SPIRE (tapers in 3 steps) ─────────────────────────────────────────────
+  { x: -2, y:174, z: -2, w: 4, h:10, d: 4, top:'#D4AF37', right:'#C59B27', front:'#B8860B' },
+  { x: -1, y:184, z: -1, w: 2, h:10, d: 2, top:'#E8C84A', right:'#D4AF37', front:'#C59B27' },
+  { x:-0.5,y:194, z:-0.5,w: 1, h: 8, d: 1, top:'#FFD700', right:'#DAA520', front:'#FFC125' },
+  // Antenna
+  { x:-0.3,y:202, z:-0.3,w:0.6,h:10, d:0.6,top:'#FFD700', right:'#DAA520', front:'#FFC125' },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

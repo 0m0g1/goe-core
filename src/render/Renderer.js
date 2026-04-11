@@ -71,6 +71,39 @@ export class WorldRenderer {
     this._voxel.box(x, y, z, w, h, d, top, right, front);
   }
 
+
+  drawBlueprintRotated(blueprint, tx, ty, elevPx, angleDeg, colorOverride = null) {
+    this._voxel.beginTile(tx, ty, elevPx);
+    const rad = (angleDeg ?? 0) * Math.PI / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+
+    for (const p of blueprint) {
+      // Rotate box CENTER around Y axis, then recompute corner
+      const cx = p.x + p.w / 2;
+      const cz = p.z + p.d / 2;
+      const rx = cx * cos - cz * sin;
+      const rz = cx * sin + cz * cos;
+
+      // After rotation the box half-extents swap for 90° multiples,
+      // but for arbitrary angles we keep w/d and accept slight shape error
+      // (good enough for OSM compass angles which are usually near 0/90/180/270)
+      const snap = Math.round(angleDeg / 90) * 90;
+      let rw = p.w, rd = p.d;
+      if (Math.abs(snap % 180) === 90) { rw = p.d; rd = p.w; }
+
+      const top   = colorOverride ? colorOverride                  : p.top;
+      const right = colorOverride ? shadeHex(colorOverride, 0.7)   : p.right ?? p.top;
+      const front = colorOverride ? shadeHex(colorOverride, 0.4)   : p.front ?? p.top;
+
+      this._voxel.box(
+        rx - rw / 2, p.y, rz - rd / 2,
+        rw, p.h, rd,
+        top, right, front,
+      );
+    }
+  }
+
   /**
    * Draw a full blueprint (array of {x,y,z,w,h,d,top,right,front} descriptors)
    * at a world tile position.

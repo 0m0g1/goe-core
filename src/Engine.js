@@ -153,9 +153,10 @@ class PlayerEntity extends Entity {
 
   _overlaps(px, py, other) {
     if (other._isBuildingBox) {
-      const r  = other.bboxRadius;
-      const cx = Math.max(other.tx - r, Math.min(other.tx + r, px));
-      const cy = Math.max(other.ty - r, Math.min(other.ty + r, py));
+      const hw = other._halfW ?? other.bboxRadius;
+      const hd = other._halfD ?? other.bboxRadius;
+      const cx = Math.max(other.tx - hw, Math.min(other.tx + hw, px));
+      const cy = Math.max(other.ty - hd, Math.min(other.ty + hd, py));
       return Math.hypot(px - cx, py - cy) < this.bboxRadius;
     }
     const dx = px - other.tx, dy = py - other.ty;
@@ -168,11 +169,12 @@ class PlayerEntity extends Entity {
       if (e === this || !e.solid) continue;
       if (!this._overlaps(this.tx, this.ty, e)) continue;
       if (e._isBuildingBox) {
-        const r = e.bboxRadius;
-        const overlapL = (this.tx + this.bboxRadius) - (e.tx - r);
-        const overlapR = (e.tx + r) - (this.tx - this.bboxRadius);
-        const overlapT = (this.ty + this.bboxRadius) - (e.ty - r);
-        const overlapB = (e.ty + r) - (this.ty - this.bboxRadius);
+        const hw = e._halfW ?? e.bboxRadius;
+        const hd = e._halfD ?? e.bboxRadius;
+        const overlapL = (this.tx + this.bboxRadius) - (e.tx - hw);
+        const overlapR = (e.tx + hw) - (this.tx - this.bboxRadius);
+        const overlapT = (this.ty + this.bboxRadius) - (e.ty - hd);
+        const overlapB = (e.ty + hd) - (this.ty - this.bboxRadius);
         const min = Math.min(overlapL, overlapR, overlapT, overlapB);
         if (min === overlapL) this.tx -= overlapL;
         else if (min === overlapR) this.tx += overlapR;
@@ -223,6 +225,7 @@ class GenericEntity extends Entity {
     // Flag used by PlayerEntity collision to choose AABB vs circle
     this._isBuildingBox = def._isBuildingBox ?? false;
     this._scale  = def._scale  ?? 1;
+    this._facingAngle = def._facingAngle ?? 0;
     this._bpKey  = def._bpKey  ?? null;
 
     this._lodColor   = def._lodColor   ?? null;

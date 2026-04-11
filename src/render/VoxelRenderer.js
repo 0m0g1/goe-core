@@ -1,5 +1,9 @@
 /**
  * GOE Core — VoxelRenderer
+ *
+ * Rotation is now baked into proj() via setRotation() / clearRotation().
+ * Every corner of every box goes through the same XZ rotation before the
+ * camera transform, so arbitrary compass angles render correctly.
  */
 import { tileHalfWidth, tileHalfHeight, shadeHex } from '../math/projection.js';
 
@@ -13,6 +17,26 @@ export class VoxelRenderer {
     this._tx      = 0;
     this._ty      = 0;
     this._base    = 0;
+
+    // Identity rotation by default
+    this._rotCos  = 1;
+    this._rotSin  = 0;
+  }
+
+  /**
+   * Set per-entity XZ rotation from an OSM compass bearing.
+   * Blueprints face Z+ (south) by default → bearing 180 = no rotation.
+   * @param {number} compassDeg  0=N, 90=E, 180=S, 270=W
+   */
+  setRotation(compassDeg) {
+    const rad     = (compassDeg - 180) * Math.PI / 180;
+    this._rotCos  = Math.cos(rad);
+    this._rotSin  = Math.sin(rad);
+  }
+
+  clearRotation() {
+    this._rotCos = 1;
+    this._rotSin = 0;
   }
 
   beginTile(tx, ty, baseElevPx) {
@@ -33,10 +57,19 @@ export class VoxelRenderer {
     this._mh2 = cam.mapH / 2;
   }
 
+  /**
+   * Project a voxel-space point to screen space.
+   * Applies entity-local XZ rotation BEFORE the camera rotation so every
+   * corner of every box is correctly transformed for any compass angle.
+   */
   proj(vx, vy, vz) {
+    // 1. Entity-local XZ rotation (cos/sin set via setRotation())
+    const lx = vx * this._rotCos - vz * this._rotSin;
+    const lz = vx * this._rotSin + vz * this._rotCos;
+
     const cam = this.cam;
-    const tx  = this._tx + 0.5 + vx / VOXEL_UNITS;
-    const tz  = this._ty + 0.5 + vz / VOXEL_UNITS;
+    const tx  = this._tx + 0.5 + lx / VOXEL_UNITS;
+    const tz  = this._ty + 0.5 + lz / VOXEL_UNITS;
     const xw  = tx - this._mw2;
     const zw  = tz - this._mh2;
     const xr  =  xw * this._cr + zw * this._sr;
@@ -72,6 +105,7 @@ export class VoxelRenderer {
   /**
    * Draw a single voxel box with top, right-facing, and front-facing faces.
    * Visible faces are determined by the current camera rotation snap (0–3).
+   * Rotation is handled automatically by proj() — box() needs no changes.
    *
    * @param {number} x      - voxel-space left edge
    * @param {number} y      - voxel-space bottom edge
@@ -98,13 +132,9 @@ export class VoxelRenderer {
     }
 
     // ── Rotation snap — which two side faces are visible ──────────────────
-    // snap 0: camera faces +X/+Z corner  (default isometric south-east)
-    // snap 1: camera faces +X/-Z corner  (rotated 90° CW)
-    // snap 2: camera faces -X/-Z corner  (rotated 180°)
-    // snap 3: camera faces -X/+Z corner  (rotated 270° CW)
     const snap = ((Math.round(cam.rotation / (Math.PI / 2)) % 4) + 4) % 4;
 
-    // Precompute all 8 corners only once
+    // Precompute all 8 corners — each goes through proj() which handles rotation
     const c = [
       vp(x,     y,     z    ),  // 0 BL bottom
       vp(x + w, y,     z    ),  // 1 BR bottom
