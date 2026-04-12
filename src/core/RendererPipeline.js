@@ -29,8 +29,8 @@ export class RenderPipeline {
   /**
    * Submit a 3D object or sprite. Will be depth-sorted.
    */
-  submitWorldObject(depth, renderFn) {
-    this.worldObjects.push({ depth, renderFn });
+  submitWorldObject(depth, renderFn, priority = 0) {
+    this.worldObjects.push({ depth, renderFn, priority });
   }
 
   /**
@@ -52,10 +52,13 @@ export class RenderPipeline {
     }
 
     // 2. Y-Sorted World Geometry (Voxels, Trees, Players, Flat Features)
-    this.worldObjects.sort((a, b) => a.depth - b.depth);
+    this.worldObjects.sort((a, b) => a.depth - b.depth || a.priority - b.priority);
     for (const obj of this.worldObjects) {
       obj.renderFn(ctx);
     }
+
+
+    // Then sort by depth first, priority second:
 
     // 3. Weather Overlay (Rain, snow, fog)
     if (weatherSystem) {

@@ -86,6 +86,7 @@ function makeBlueprintEntityDef(id, lat, lon, assetKey, opts = {}) {
       const elev  = groundElevPx + entity.elevOffset;
       const depth = tileDepth(entity.tx, entity.ty, wr.cam.rotation, entity.footprintRadius ?? entity.bboxRadius ?? 0.3);
       wr.submitWorldObject(depth, () => {
+  wr.ctx.globalAlpha = 1;
         wr.ctx.globalAlpha = isoA;
         wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
         wr.ctx.globalAlpha = 1;
@@ -148,9 +149,11 @@ export class BioLoader extends BaseLoader {
    * Convert GBIF records → EntityDef array, then pad with procedural fauna.
    */
   _buildEntityDefs(records, geoCenter) {
+    // FIX: filter out nulls from records that have no visual asset
     const defs = records
       .filter(obs => obs.decimalLatitude != null && obs.decimalLongitude != null)
-      .map(obs => this._recordToEntityDef(obs));
+      .map(obs => this._recordToEntityDef(obs))
+      .filter(Boolean);  // ← drops records that returned null (no asset)
 
     const faunaCount = defs.filter(d => d.subType === 'animal').length;
     const TARGET     = 40;

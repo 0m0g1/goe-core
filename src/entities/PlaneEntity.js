@@ -42,6 +42,7 @@ export class PlaneEntity extends Entity {
     const depth = tileDepth(this.tx, this.ty, cam.rotation) - 99999; // always on top
 
     wr.submitWorldObject(depth, () => {
+  wr.ctx.globalAlpha = 1;
       if (cam.tilt < 0.03) return;
 
       const blueprint = Blueprints['airplane_jet'] ?? Blueprints['tree']; // fallback

@@ -88,6 +88,27 @@ export function tileDepth(tx, ty, rotation, footprintRadius = 0) {
   return xr + zr;
 }
 
+
+// ─── Depth sort helper ────────────────────────────────────────────────────────
+/**
+ * Returns the depth of the FRONT CORNER of a square bounding box.
+ *
+ * The isometric depth axis is:  depth = tx·cos(rot) + ty·sin(rot)
+ *
+ * For a box centred at (tx,ty) with half-extent r tiles the front corner
+ * (the one geometrically closest to the camera = highest depth = drawn last)
+ * is at (tx + sign(cos)·r,  ty + sign(sin)·r).
+ *
+ * Using the front corner instead of the centre prevents large objects from
+ * being buried behind smaller ones at non-cardinal camera angles.
+ */
+export function frontDepth(tx, ty, rot, r) {
+  const cr = Math.cos(rot);
+  const sr = Math.sin(rot);
+  return (tx + Math.sign(cr) * r) * cr + (ty + Math.sign(sr) * r) * sr;
+}
+
+
 // ─── SCREEN → WORLD ──────────────────────────────────────────────────────────
 
 /**

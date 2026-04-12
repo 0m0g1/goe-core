@@ -1,24 +1,35 @@
 /**
  * GOE Core — OSMLayerRenderer
- *
- * Accepts a WorldRenderer instead of raw ctx/cam.
- * All tile image drawing routes through worldRenderer.drawTransformedImage().
+ * * Optimized for sharpness and memory efficiency.
  */
 import {
   worldToScreen, tileHalfWidth, tileHalfHeight, screenToWorld,
 } from '../math/projection.js';
-import { geoToTile, tileToGeo, slippyTileToLatLon, latLonToSlippy } from '../math/geo.js';
+import { geoToTile, tileToGeo } from '../math/geo.js';
 
-// ─── Global tile image cache ──────────────────────────────────────────────────
+// ─── Bounded LRU tile image cache ────────────────────────────────────────────
 
+const TILE_CACHE_MAX = 256;
 const TILE_CACHE = new Map();
 
 function getSlippyTile(z, x, y, urlFn) {
-  const n  = Math.pow(2, z);
+  const n = Math.pow(2, z);
   const ix = Math.floor(((x % n) + n) % n);
   const iy = Math.floor(Math.max(0, Math.min(n - 1, y)));
   const key = `${z}/${ix}/${iy}`;
-  if (TILE_CACHE.has(key)) return TILE_CACHE.get(key);
+
+  if (TILE_CACHE.has(key)) {
+    const obj = TILE_CACHE.get(key);
+    TILE_CACHE.delete(key);
+    TILE_CACHE.set(key, obj);
+    return obj;
+  }
+
+  if (TILE_CACHE.size >= TILE_CACHE_MAX) {
+    const oldestKey = TILE_CACHE.keys().next().value;
+    TILE_CACHE.delete(oldestKey);
+  }
+
   const img = new Image();
   img.crossOrigin = 'anonymous';
   img.src = urlFn(z, ix, iy);
@@ -39,14 +50,15 @@ export function evictTileCache(z) {
 
 export class OSMLayerRenderer {
   /**
-   * @param {WorldRenderer}                         worldRenderer
-   * @param {(z:number,x:number,y:number)=>string}  urlFn
-   * @param {number}                                [maxTiles=120]
+   * @param {WorldRenderer} worldRenderer
+   * @param {(z:number,x:number,y:number)=>string} urlFn
+   * @param {number} [maxTiles=256] - Increased default to support high-res screens
    */
-  constructor(worldRenderer, urlFn, maxTiles = 120) {
-    this._wr      = worldRenderer;
-    this.urlFn    = urlFn;
+  constructor(worldRenderer, urlFn, maxTiles = 256) {
+    this._wr = worldRenderer;
+    this.urlFn = urlFn;
     this.maxTiles = maxTiles;
+    this._currentOsmZoom = undefined;
   }
 
   get ctx() { return this._wr.ctx; }
@@ -54,22 +66,23 @@ export class OSMLayerRenderer {
 
   setURLFn(urlFn) { this.urlFn = urlFn; }
 
-  /**
-   * Draw the OSM tile layer for the current frame.
-   * @param {HTMLCanvasElement}  canvas
-   * @param {{lat:number,lon:number}} geoCenter
-   */
   draw(canvas, geoCenter) {
     const { cam, urlFn, _wr: wr } = this;
+    const dpr = window.devicePixelRatio || 1;
 
-    // 1. OSM zoom level
-    let osmZ = Math.round(
-      Math.log2(250468 * cam.zoom * Math.cos(geoCenter.lat * Math.PI / 180))
+    // 1. Calculate OSM zoom level
+    // We use Math.ceil and a small bias (+0.1) to ensure we jump to the higher-res 
+    // tile earlier. We also factor in DPR so Retina screens don't look blurry.
+    const zoomBias = dpr > 1 ? 0.5 : 0.1;
+    let osmZ = Math.ceil(
+      Math.log2(250468 * cam.zoom * Math.cos(geoCenter.lat * Math.PI / 180)) + zoomBias
     );
     osmZ = Math.max(0, Math.min(19, osmZ));
+
+    this._currentOsmZoom = osmZ;
     const numTiles = Math.pow(2, osmZ);
 
-    // 2. Geo corners of canvas
+    // 2. Get viewport boundaries in Geo coordinates
     const corners = [
       [0, 0], [canvas.width, 0], [0, canvas.height], [canvas.width, canvas.height],
     ].map(([sx, sy]) => {
@@ -81,50 +94,61 @@ export class OSMLayerRenderer {
     const lons = corners.map(c => c.lon);
     const minLat = Math.max(-85.05, Math.min(...lats));
     const maxLat = Math.min( 85.05, Math.max(...lats));
-    const minLon = Math.min(...lons), maxLon = Math.max(...lons);
+    const minLon = Math.min(...lons);
+    const maxLon = Math.max(...lons);
 
-    const lon2x = lon => (lon + 180) / 360 * numTiles;
-    const lat2y = lat => {
+    const lon2x = (lon, z) => (lon + 180) / 360 * Math.pow(2, z);
+    const lat2y = (lat, z) => {
       const l = lat * Math.PI / 180;
-      return (1 - Math.log(Math.tan(l) + 1 / Math.cos(l)) / Math.PI) / 2 * numTiles;
+      return (1 - Math.log(Math.tan(l) + 1 / Math.cos(l)) / Math.PI) / 2 * Math.pow(2, z);
     };
 
-    let minX = Math.floor(lon2x(minLon)), maxX = Math.floor(lon2x(maxLon));
-    let minY = Math.floor(lat2y(maxLat)), maxY = Math.floor(lat2y(minLat));
-
-    // 3. Safety cap
     let z = osmZ;
+    let minX = Math.floor(lon2x(minLon, z));
+    let maxX = Math.floor(lon2x(maxLon, z));
+    let minY = Math.floor(lat2y(maxLat, z));
+    let maxY = Math.floor(lat2y(minLat, z));
+
+    // 3. Safety cap: Drop zoom only if we exceed maxTiles
     while ((maxX - minX + 1) * (maxY - minY + 1) > this.maxTiles && z > 0) {
       z--;
-      const nn = Math.pow(2, z);
-      minX = Math.floor((minLon + 180) / 360 * nn);
-      maxX = Math.floor((maxLon + 180) / 360 * nn);
-      minY = Math.floor(lat2y(maxLat) / (numTiles / nn));
-      maxY = Math.floor(lat2y(minLat) / (numTiles / nn));
+      minX = Math.floor(lon2x(minLon, z));
+      maxX = Math.floor(lon2x(maxLon, z));
+      minY = Math.floor(lat2y(maxLat, z));
+      maxY = Math.floor(lat2y(minLat, z));
     }
 
-    const tile2lon = x => x / Math.pow(2, z) * 360 - 180;
-    const tile2lat = y => {
-      const n = Math.PI - 2 * Math.PI * y / Math.pow(2, z);
+    const tile2lon = (x, zoom) => x / Math.pow(2, zoom) * 360 - 180;
+    const tile2lat = (y, zoom) => {
+      const n = Math.PI - 2 * Math.PI * y / Math.pow(2, zoom);
       return 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
     };
 
-    // 4. Render tiles via WorldRenderer
+    // 4. Render tiles
+    // We disable image smoothing if we want that "pixel-perfect" crispness 
+    // when slightly upscaling, but keeping it on is usually better for maps.
+    this.ctx.imageSmoothingEnabled = true;
+    this.ctx.imageSmoothingQuality = 'high';
+
     for (let x = minX; x <= maxX; x++) {
       for (let y = minY; y <= maxY; y++) {
-        if (y < 0 || y >= Math.pow(2, z)) continue;
-        const wx   = ((x % numTiles) + numTiles) % numTiles;
-        const tile = getSlippyTile(z, wx, y, urlFn);
+        const nAtZ = Math.pow(2, z);
+        if (y < 0 || y >= nAtZ) continue;
+
+        // Wrapped X for continuous panning
+        const worldX = ((x % nAtZ) + nAtZ) % nAtZ;
+        const tile = getSlippyTile(z, worldX, y, urlFn);
         if (!tile.loaded) continue;
 
-        const tNw = geoToTile(tile2lat(y),   tile2lon(x),   geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
-        const tNe = geoToTile(tile2lat(y),   tile2lon(x + 1), geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
-        const tSw = geoToTile(tile2lat(y + 1), tile2lon(x), geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
+        const tNw = geoToTile(tile2lat(y, z),     tile2lon(x, z),     geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
+        const tNe = geoToTile(tile2lat(y, z),     tile2lon(x + 1, z), geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
+        const tSw = geoToTile(tile2lat(y + 1, z), tile2lon(x, z),     geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
 
         const p1 = worldToScreen(tNw.x, tNw.y, 0, cam);
         const p2 = worldToScreen(tNe.x, tNe.y, 0, cam);
         const p4 = worldToScreen(tSw.x, tSw.y, 0, cam);
 
+        // Render with a 0.5px overlap to prevent sub-pixel gaps (seams)
         wr.drawTransformedImage(
           tile.img,
           {
@@ -147,7 +171,6 @@ export class OSMLayerRenderer {
   }
 
   resetTileCache() {
-    const currentZoom = this._currentOsmZoom; // store it during draw()
-    evictTileCache(currentZoom);
+    evictTileCache(this._currentOsmZoom);
   }
 }

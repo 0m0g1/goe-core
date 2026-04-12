@@ -513,7 +513,7 @@
     // --- COMBINED LOCATIONS (from both files + unique) ---
     const unifiedLocations = [
         { name: "🗼 Paris - Eiffel Tower", lat: 48.8584, lon: 2.2945 },
-        { name: "🏫 Alliance High School (Kenya)", lat: -1.2489, lon: 36.6642 },
+        { name: "🏫 Alliance High School (Kenya)", lat: -1.259944,  lon: 36.667270 },
         { name: "🗽 New York - Times Square", lat: 40.7580, lon: -73.9855 },
         { name: "🇬🇧 London - Trafalgar Square", lat: 51.5074, lon: -0.1278 },
         { name: "🇯🇵 Tokyo - Shibuya", lat: 35.6587, lon: 139.7456 },
@@ -541,6 +541,7 @@
             const r = Math.max(3, cam.zoom * cam.tileW * 0.4) / 2;
             const depth = this.tx * Math.cos(cam.rotation) + this.ty * Math.sin(cam.rotation);
             wr.submitWorldObject(depth, () => {
+                wr.ctx.globalAlpha = 1;
                 ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
                 ctx.fillStyle = '#ff5e5e'; ctx.fill();
                 ctx.beginPath(); ctx.arc(x - r*0.2, y - r*0.2, r*0.25, 0, Math.PI*2);
@@ -575,6 +576,7 @@
         mapW: 400, mapH: 400,
         cameraOpts: { zoom: 0.42, zoomFlat: 0.18, zoomIso: 0.58, zoomSpeed: 0.0014 }
     });
+    window.engine = engine;
     engine.use(new OSMTerrainLoader({ mPerTile: 2, mapW: 400, mapH: 400, fetchRadiusM: 1500 }));
     engine.use(new BioLoader({ limit: 50, fetchRadiusM: 800 }));
     engine.use(new WeatherLoader('b69650bacdb53e8000e14a735bb53035'));
@@ -612,12 +614,6 @@
     // Quick spots row
     const quickDiv = document.getElementById('quick-spots');
     const quickSpots = unifiedLocations.slice(0, 5);
-    quickSpots.forEach(spot => {
-        const qbtn = document.createElement('button'); qbtn.className = "quick-btn";
-        qbtn.innerText = spot.name.slice(0, 18);
-        qbtn.onclick = () => { engine.camera.zoom = 0.55; engine.panTo(spot.lat, spot.lon); };
-        quickDiv.appendChild(qbtn);
-    });
 
     // --- Physics balls ---
     let ballIdCounter = 0;

@@ -3,16 +3,24 @@
  * Fetches RGB-encoded terrain elevation tiles (Terrarium or Mapbox format),
  * caches the decoded ImageData, and provides a synchronous per-pixel lookup.
  *
+ * Memory fixes vs previous version
+ * ─────────────────────────────────
+ * 1. `_resolved` Map is now bounded (RESOLVED_CACHE_MAX = 64 entries, LRU).
+ *    Previously it grew without limit. Each ImageData is 256×256×4 = 262 KB;
+ *    64 tiles ≈ 16 MB cap (well within reason for elevation data).
+ *
+ * 2. Persistent (IndexedDB) storage no longer calls Array.from(imageData.data).
+ *    A Uint8ClampedArray of 262,144 bytes converts to a plain JS Array of
+ *    262,144 Numbers at ~8 bytes each → a ~2 MB transient spike per tile.
+ *    With MAX_CONCURRENT_FETCHES=4 that was up to 8 MB of garbage every batch.
+ *    Fix: store the Uint8ClampedArray directly (it is structured-cloneable,
+ *    so IndexedDB accepts it natively) and reconstruct ImageData from it on
+ *    retrieval — same API, zero conversion cost.
+ *
  * Compatible providers:
  *   • Nextzen Terrarium:  (R×256 + G + B/256) − 32768
  *   • Mapbox Terrain-RGB: −10000 + (R×65536 + G×256 + B) × 0.1
  *   • AWS Terrarium (S3 elevation-tiles-prod) — same formula as Nextzen
- *
- * Persistent cache stores raw pixel data in IndexedDB to avoid re-downloading.
- *
- * Concurrency: tile fetches are limited to MAX_CONCURRENT_FETCHES in-flight at
- * once. Without this, a large PRE_RADIUS triggers a burst that can hit provider
- * rate limits and slow down the initial load.
  */
 import { latLonToSlippy } from '../../math/geo.js';
 import { PersistentCache } from '../../core/PersistentCache.js';
@@ -25,6 +33,12 @@ export const ElevationFormat = Object.freeze({
 const TILE_ZOOM            = 13;   // ~10 m/px resolution
 const PRE_RADIUS           = 1;    // pre-warm N tiles in each direction
 const MAX_CONCURRENT_FETCHES = 4;  // max in-flight tile requests at once
+
+/**
+ * Maximum number of decoded ImageData objects to keep in the in-memory LRU.
+ * 64 × 262 KB ≈ 16 MB — covers a 7×7 neighbourhood at zoom 13 with slack.
+ */
+const RESOLVED_CACHE_MAX = 64;
 
 // In-memory promise cache (for concurrent requests within a single session)
 const _inFlight = new Map();
@@ -46,7 +60,7 @@ export class ElevationLoader {
     this._urlFn    = urlFn;
     this._format   = format;
     this._mPerTile = mPerTile;
-    this._resolved = new Map(); // key → ImageData (in-memory)
+    this._resolved = new Map(); // key → ImageData (bounded LRU, see _putResolved)
     this._status   = 'idle';
     this._lastCenter = null;
     this._persistCache = new PersistentCache('GOE_Elevation', 'tiles');
@@ -60,28 +74,61 @@ export class ElevationLoader {
   }
 
   /**
+   * Insert an ImageData into the in-memory LRU cache.
+   * Evicts the oldest (first-inserted) entry when the cap is reached.
+   * Using the Map-insertion-order property for O(1) LRU.
+   */
+  _putResolved(key, imageData) {
+    if (this._resolved.has(key)) {
+      // LRU: move to newest position
+      this._resolved.delete(key);
+    } else if (this._resolved.size >= RESOLVED_CACHE_MAX) {
+      // Evict oldest
+      this._resolved.delete(this._resolved.keys().next().value);
+    }
+    this._resolved.set(key, imageData);
+  }
+
+  /**
+   * LRU-aware get: touching an entry promotes it to most-recently-used.
+   */
+  _getResolved(key) {
+    if (!this._resolved.has(key)) return undefined;
+    const imageData = this._resolved.get(key);
+    // Promote to newest position
+    this._resolved.delete(key);
+    this._resolved.set(key, imageData);
+    return imageData;
+  }
+
+  /**
    * Load a single tile from in-memory cache → IndexedDB → network.
    * @param {string} url
    * @param {string} key  e.g. "13/123/456"
    * @returns {Promise<ImageData>}
    */
   async _loadTile(url, key) {
-    // 1. In-memory cache (fast path)
-    if (this._resolved.has(key)) return this._resolved.get(key);
+    // 1. In-memory LRU cache (fast path)
+    const cached = this._getResolved(key);
+    if (cached) return cached;
+
     // 2. Prevent duplicate concurrent requests for the same tile
     if (_inFlight.has(key)) return _inFlight.get(key);
 
     const promise = (async () => {
       // 3. Persistent cache (IndexedDB)
       try {
-        const cached = await this._persistCache.get(key);
-        if (cached && cached.data && cached.width && cached.height) {
-          const imageData = new ImageData(
-            new Uint8ClampedArray(cached.data),
-            cached.width,
-            cached.height
-          );
-          this._resolved.set(key, imageData);
+        const stored = await this._persistCache.get(key);
+        if (stored && stored.data && stored.width && stored.height) {
+          // Fix 2: stored.data is now a Uint8ClampedArray (structured-cloneable),
+          // so we can construct ImageData directly without Array → TypedArray copy.
+          // If the DB has old data (plain Array from a previous version), the
+          // Uint8ClampedArray constructor handles that too — both paths work.
+          const pixelData = stored.data instanceof Uint8ClampedArray
+            ? stored.data
+            : new Uint8ClampedArray(stored.data); // backwards-compat with old stores
+          const imageData = new ImageData(pixelData, stored.width, stored.height);
+          this._putResolved(key, imageData);
           return imageData;
         }
       } catch (err) {
@@ -98,15 +145,22 @@ export class ElevationLoader {
           const ctx = c.getContext('2d');
           ctx.drawImage(img, 0, 0, 256, 256);
           const imageData = ctx.getImageData(0, 0, 256, 256);
+
+          // Fix 2: store the Uint8ClampedArray directly in IndexedDB.
+          // Previously Array.from(imageData.data) created a plain JS Array where
+          // each of the 262,144 elements costs ~8 bytes → ~2 MB transient per tile.
+          // Uint8ClampedArray is structured-cloneable (IDB-storable) and stays at
+          // 1 byte/element in the serialisation buffer.
           const toStore = {
-            data:   Array.from(imageData.data),
+            data:   imageData.data, // Uint8ClampedArray — NOT Array.from()
             width:  imageData.width,
             height: imageData.height,
           };
           this._persistCache.set(key, toStore).catch(err => {
             console.warn(`[ElevationLoader] Failed to cache ${key}:`, err);
           });
-          this._resolved.set(key, imageData);
+
+          this._putResolved(key, imageData);
           resolve(imageData);
         };
         img.onerror = reject;
@@ -124,10 +178,6 @@ export class ElevationLoader {
 
   /**
    * Run an array of async task factories with at most `limit` in-flight.
-   * Each element of `tasks` is a zero-argument function returning a Promise.
-   * @param {Array<()=>Promise<any>>} tasks
-   * @param {number} limit
-   * @returns {Promise<void>}
    */
   async _pooled(tasks, limit = MAX_CONCURRENT_FETCHES) {
     let idx = 0;
@@ -137,7 +187,6 @@ export class ElevationLoader {
         await tasks[i]().catch(() => {}); // missing tile → silent
       }
     };
-    // Spin up `limit` workers that each pull from the shared idx counter
     await Promise.all(
       Array.from({ length: Math.min(limit, tasks.length) }, worker)
     );
@@ -145,13 +194,8 @@ export class ElevationLoader {
 
   /**
    * Pre-fetch tiles around a geo centre.
-   * Uses a concurrency pool so at most MAX_CONCURRENT_FETCHES tiles are
-   * in-flight at once instead of launching them all simultaneously.
-   * @param {{ lat:number, lon:number }} geoCenter
-   * @returns {Promise<void>}
    */
   async prefetch(geoCenter) {
-    // Skip if centre hasn't moved meaningfully
     const prev = this._lastCenter;
     if (prev && Math.abs(prev.lat - geoCenter.lat) < 0.001 && Math.abs(prev.lon - geoCenter.lon) < 0.001)
       return;
@@ -160,14 +204,13 @@ export class ElevationLoader {
 
     const { tileX, tileY } = latLonToSlippy(geoCenter.lat, geoCenter.lon, TILE_ZOOM);
 
-    // Collect tasks (factories, not promises — so we can control concurrency)
     const tasks = [];
     for (let dx = -PRE_RADIUS; dx <= PRE_RADIUS; dx++) {
       for (let dy = -PRE_RADIUS; dy <= PRE_RADIUS; dy++) {
         const x   = tileX + dx;
         const y   = tileY + dy;
         const key = `${TILE_ZOOM}/${x}/${y}`;
-        if (this._resolved.has(key)) continue; // already loaded
+        if (this._getResolved(key)) continue; // already loaded (also promotes in LRU)
         const url = this._urlFn(TILE_ZOOM, x, y);
         tasks.push(() => this._loadTile(url, key));
       }
@@ -180,14 +223,13 @@ export class ElevationLoader {
   /**
    * Synchronous elevation lookup — safe to call in the render loop.
    * Returns 0 if the tile hasn't loaded yet.
-   * @param {number} lat
-   * @param {number} lon
-   * @returns {number} Elevation in metres
    */
   sampleElevation(lat, lon) {
     const { x, y, tileX, tileY } = latLonToSlippy(lat, lon, TILE_ZOOM);
     const key = `${TILE_ZOOM}/${tileX}/${tileY}`;
-    const id  = this._resolved.get(key);
+    // Use _getResolved so frequent lookups promote hot tiles and keep them
+    // from being evicted by background prefetch traffic.
+    const id  = this._getResolved(key);
     if (!id) return 0;
 
     const px    = Math.min(255, Math.floor((x - tileX) * 256));
@@ -199,8 +241,6 @@ export class ElevationLoader {
 
   /**
    * Convert a real-world elevation (metres) to engine tile-height units.
-   * @param {number} elevM
-   * @returns {number}
    */
   toTileHeight(elevM) {
     return Math.min(80, Math.max(0, elevM / this._mPerTile));

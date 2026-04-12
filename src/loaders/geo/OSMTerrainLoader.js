@@ -1,29 +1,53 @@
 /**
- * GOE — OSMTerrainLoader
+ * GOE — OSMTerrainLoader (full rewrite)
  *
- * Fixes in this revision:
- *   A. Blueprint renderFn now calls wr.submitShadow() so trees, landmarks
- *      (Eiffel Tower etc.) cast shadows like buildings do.
- *      Shadow hull dimensions are derived from the blueprint's native
- *      bounding box scaled by entity._scale, computed once at definition
- *      time and stored in closure.
+ * Core fixes vs previous version:
  *
- *   B. Depth sorting — tileDepth() projects the entity CENTRE onto the
- *      camera axis. For large objects this causes pop-through at non-cardinal
- *      rotations because the front corner of one object can be nearer to the
- *      camera than the centre of a smaller object behind it.
- *      Fix: frontDepth() uses the FRONT CORNER (the corner that maximises
- *      depth along the camera axis) as the sort key for all entity types.
+ *   A. Real polygon rendering — every way's raw geometry nodes are stored on
+ *      the entity def (_ring / _nodes). renderFn projects them to screen space
+ *      at draw time using lonToGlobalX / latToGlobalY, then draws the actual
+ *      polygon or polyline. No more OBB-derived rectangles for everything.
+ *
+ *   B. Tile key encoding — replaced (x << 16) | (y & 0xFFFF) with a string
+ *      key `${x},${y}`. The bitshift silently collides for global tile coords
+ *      above 32767 (most real-world positions), causing roads to overwrite each
+ *      other and disappear. String keys have no range limit.
+ *
+ *   C. Roads are visible entities — Pass 2 now produces a GenericEntity-style
+ *      def for every highway way. renderFn projects the polyline and strokes it
+ *      with a width scaled to road class and camera zoom.
+ *
+ *   D. Polygon features (parks, water, landuse, leisure) produce visible polygon
+ *      entities in addition to terrain tile painting. Each gets a fill colour
+ *      and optional stroke matching the feature type.
+ *
+ *   E. Buildings use their actual OSM footprint polygon, not an OBB-derived box.
+ *      The 3-D effect is achieved by extruding each polygon edge downward to
+ *      simulate walls, then filling the roof face on top.
+ *
+ *   F. Elevation sampling — mirrors the map.js open-elevation approach:
+ *      fetchElevationGrid() calls api.open-elevation.com with a grid of points
+ *      around the fetch centre and stores results in _elevGrid. sampleElev()
+ *      bilinearly interpolates the grid, returning 0 on cache miss (safe for
+ *      render loop). ElevationLoader integration (if provided) is still used
+ *      as a higher-resolution fallback.
+ *
+ *   G. Blueprint landmark shadow and depth fixes from previous version retained.
+ *
+ *   H. Live entity cache retained (FIX C from previous version).
  */
-import { BaseLoader } from '../BaseLoader.js';
-import { TerrainType } from '../../terrain/types.js';
+import { BaseLoader }         from '../BaseLoader.js';
+import { TerrainType }        from '../../terrain/types.js';
 import { lonToGlobalX, latToGlobalY } from '../../math/geo.js';
-import { PersistentCache } from '../../core/PersistentCache.js';
-import { Blueprints } from '../../assets/BluePrintLibrary.js';
-import { tileDepth, getElevOffset, tileHalfWidth, shadeHex, worldToScreen } from '../../math/projection.js';
+import { PersistentCache }    from '../../core/PersistentCache.js';
+import { Blueprints }         from '../../assets/BluePrintLibrary.js';
+import {
+  tileHalfWidth, worldToScreen, frontDepth, shadeHex,
+} from '../../math/projection.js';
 import { preprocessBuildings } from './BuildingPreprocessor.js';
-import { resolveFeatureType } from '../../terrain/FeatureTypes.js';
+import { ProceduralBlueprintGenerator } from './ProceduralBlueprintGenerator.js';
 
+// ─── Overpass endpoints ────────────────────────────────────────────────────────
 const DEFAULT_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.private.coffee/api/interpreter',
@@ -31,64 +55,176 @@ const DEFAULT_ENDPOINTS = [
 ];
 
 const CACHE_TTL_MS = 30 * 60 * 1000;
-const VU = 8;
+const VU           = 8;   // voxel units per tile
 
-// ─── Depth sort helper ────────────────────────────────────────────────────────
+// ─── Elevation grid ────────────────────────────────────────────────────────────
+// Mirrors map.js: fetch a 5×5 grid from open-elevation, interpolate on lookup.
+const ELEV_STEP    = 0.002; // degrees between grid samples
+const ELEV_HALF    = 2;     // grid goes ±2 steps in each direction → 5×5 = 25pts
+
 /**
- * Returns the depth of the FRONT CORNER of a square bounding box.
- *
- * The isometric depth axis is:  depth = tx·cos(rot) + ty·sin(rot)
- *
- * For a box centred at (tx,ty) with half-extent r tiles the front corner
- * (the one geometrically closest to the camera = highest depth = drawn last)
- * is at (tx + sign(cos)·r,  ty + sign(sin)·r).
- *
- * Using the front corner instead of the centre prevents large objects from
- * being buried behind smaller ones at non-cardinal camera angles.
+ * Build a lat/lon grid around a centre and fetch elevations from
+ * api.open-elevation.com.  Returns a flat array of {latitude,longitude,elevation}
+ * objects, identical to what map.js fetchTopology() stores in terrainGrid.
  */
-function frontDepth(tx, ty, rot, r) {
-  const cr = Math.cos(rot);
-  const sr = Math.sin(rot);
-  return (tx + Math.sign(cr) * r) * cr + (ty + Math.sign(sr) * r) * sr;
+async function fetchElevationGrid(lat, lon) {
+  const locations = [];
+  for (let i = -ELEV_HALF; i <= ELEV_HALF; i++) {
+    for (let j = -ELEV_HALF; j <= ELEV_HALF; j++) {
+      locations.push({
+        latitude:  lat + i * ELEV_STEP,
+        longitude: lon + j * ELEV_STEP,
+      });
+    }
+  }
+  try {
+    const res  = await fetch('https://api.open-elevation.com/api/v1/lookup', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ locations }),
+    });
+    const data = await res.json();
+    return data.results ?? [];
+  } catch (e) {
+    console.warn('[OSMTerrainLoader] Elevation fetch failed:', e.message);
+    return [];
+  }
+}
+
+/**
+ * Bilinear interpolation over the elevation grid.
+ * Returns metres, or 0 if the grid hasn't loaded or the point is out of range.
+ */
+function sampleElev(grid, lat, lon) {
+  if (!grid.length) return 0;
+
+  // Find bounding grid points
+  const lats = [...new Set(grid.map(p => p.latitude))].sort((a, b) => a - b);
+  const lons = [...new Set(grid.map(p => p.longitude))].sort((a, b) => a - b);
+  if (lats.length < 2 || lons.length < 2) return grid[0]?.elevation ?? 0;
+
+  const lat0 = lats.findIndex(l => l >= lat) - 1;
+  const lon0 = lons.findIndex(l => l >= lon) - 1;
+  const li   = Math.max(0, Math.min(lats.length - 2, lat0));
+  const lj   = Math.max(0, Math.min(lons.length - 2, lon0));
+
+  const tLat = (lat - lats[li]) / (lats[li + 1] - lats[li]);
+  const tLon = (lon - lons[lj]) / (lons[lj + 1] - lons[lj]);
+
+  const get = (la, lo) => {
+    const pt = grid.find(p => p.latitude === la && p.longitude === lo);
+    return pt?.elevation ?? 0;
+  };
+
+  const e00 = get(lats[li],     lons[lj]);
+  const e10 = get(lats[li + 1], lons[lj]);
+  const e01 = get(lats[li],     lons[lj + 1]);
+  const e11 = get(lats[li + 1], lons[lj + 1]);
+
+  return e00 * (1 - tLat) * (1 - tLon)
+       + e10 * tLat        * (1 - tLon)
+       + e01 * (1 - tLat)  * tLon
+       + e11 * tLat        * tLon;
 }
 
 // ─── Terrain classification ────────────────────────────────────────────────────
-
 function classifyOSM(tags) {
   if (!tags) return null;
-  const { highway:h, surface:s, waterway:w, natural:n, landuse:l, leisure:le, building:b } = tags;
-  if (n==='water'||n==='wetland'||l==='reservoir'||l==='basin'||w==='riverbank')
-    return { terrain: TerrainType.DEEP_WATER, type:'polygon' };
-  if (w==='river')    return { terrain: TerrainType.WATER, type:'line', width:3 };
-  if (w==='stream'||w==='canal') return { terrain: TerrainType.WATER, type:'line', width:2 };
-  if (w)              return { terrain: TerrainType.WATER, type:'line', width:1 };
-  if (n==='beach')    return { terrain: TerrainType.SAND,  type:'polygon' };
-  if (n==='wood'||l==='forest') return { terrain: TerrainType.FOREST, type:'polygon' };
-  if (le==='park'||le==='garden'||l==='park') return { terrain: TerrainType.PARK, type:'polygon' };
+  const { highway: h, surface: s, waterway: w, natural: n, landuse: l, leisure: le, building: b } = tags;
+
+  if (n === 'water' || n === 'wetland' || l === 'reservoir' || l === 'basin' || w === 'riverbank')
+    return { terrain: TerrainType.DEEP_WATER, type: 'polygon' };
+  if (w === 'river')               return { terrain: TerrainType.WATER, type: 'line', width: 3 };
+  if (w === 'stream' || w === 'canal') return { terrain: TerrainType.WATER, type: 'line', width: 2 };
+  if (w)                           return { terrain: TerrainType.WATER, type: 'line', width: 1 };
+  if (n === 'beach')               return { terrain: TerrainType.SAND,  type: 'polygon' };
+  if (n === 'wood' || l === 'forest') return { terrain: TerrainType.FOREST, type: 'polygon' };
+  if (le === 'park' || le === 'garden' || l === 'park')
+    return { terrain: TerrainType.PARK, type: 'polygon' };
   if (['grass','meadow','village_green','allotments'].includes(l) ||
       ['grassland','heath','scrub'].includes(n) ||
       ['pitch','playground'].includes(le))
-    return { terrain: TerrainType.GRASS, type:'polygon' };
+    return { terrain: TerrainType.GRASS, type: 'polygon' };
+
   if (h) {
     const unpaved = ['dirt','earth','ground','unpaved','mud','gravel','sand'];
     const paved   = ['asphalt','paved','concrete','chipseal','paving_stones'];
     let roadTerrain = TerrainType.ROAD_TARMAC;
     if (unpaved.includes(s) || ['track','path','bridleway'].includes(h)) roadTerrain = TerrainType.ROAD_DIRT;
     else if (paved.includes(s)) roadTerrain = TerrainType.ROAD_TARMAC;
-    if (h==='motorway'||h==='trunk'||h==='primary')   return { terrain: roadTerrain, type:'line', width:3 };
-    if (h==='secondary'||h==='tertiary')               return { terrain: roadTerrain, type:'line', width:2 };
-    if (h==='footway'||h==='path'||h==='cycleway'||h==='pedestrian')
-      return { terrain: TerrainType.PATH, type:'line', width:1 };
-    return { terrain: roadTerrain, type:'line', width:1 };
+
+    if (h === 'motorway' || h === 'trunk' || h === 'primary')   return { terrain: roadTerrain, type: 'line', width: 3 };
+    if (h === 'secondary' || h === 'tertiary')                   return { terrain: roadTerrain, type: 'line', width: 2 };
+    if (['footway','path','cycleway','pedestrian'].includes(h))  return { terrain: TerrainType.PATH, type: 'line', width: 1 };
+    return { terrain: roadTerrain, type: 'line', width: 1 };
   }
-  if (b) return { terrain: TerrainType.BUILDING, type:'polygon' };
+  if (b) return { terrain: TerrainType.BUILDING, type: 'polygon' };
   if (['residential','commercial','retail','industrial'].includes(l))
-    return { terrain: TerrainType.RESIDENTIAL, type:'polygon' };
+    return { terrain: TerrainType.RESIDENTIAL, type: 'polygon' };
   return null;
 }
 
-// ─── POI classification ────────────────────────────────────────────────────────
+// ─── Polygon feature fill/stroke styles ───────────────────────────────────────
+const POLYGON_STYLES = {
+  // natural
+  water:    { fill: 'rgba(22,46,72,0.82)',   stroke: '#1a3850', alpha: 0.9 },
+  wetland:  { fill: 'rgba(26,46,56,0.72)',   stroke: null },
+  wood:     { fill: 'rgba(20,32,24,0.80)',   stroke: null },
+  forest:   { fill: 'rgba(20,32,24,0.80)',   stroke: null },
+  scrub:    { fill: 'rgba(24,34,24,0.70)',   stroke: null },
+  heath:    { fill: 'rgba(30,32,24,0.70)',   stroke: null },
+  grassland:{ fill: 'rgba(24,40,24,0.70)',   stroke: null },
+  beach:    { fill: 'rgba(40,37,30,0.75)',   stroke: null },
+  sand:     { fill: 'rgba(40,37,30,0.75)',   stroke: null },
+  bare_rock:{ fill: 'rgba(32,34,40,0.75)',   stroke: null },
+  meadow:   { fill: 'rgba(24,40,24,0.70)',   stroke: null },
+  // landuse
+  residential: { fill: 'rgba(28,33,48,0.55)', stroke: null },
+  commercial:  { fill: 'rgba(29,32,53,0.55)', stroke: null },
+  industrial:  { fill: 'rgba(25,30,37,0.55)', stroke: null },
+  retail:      { fill: 'rgba(32,29,48,0.55)', stroke: null },
+  farmland:    { fill: 'rgba(26,37,26,0.55)', stroke: null },
+  grass:       { fill: 'rgba(24,40,28,0.60)', stroke: null },
+  cemetery:    { fill: 'rgba(26,40,32,0.65)', stroke: null },
+  construction:{ fill: 'rgba(30,32,37,0.55)', stroke: null },
+  allotments:  { fill: 'rgba(26,40,24,0.55)', stroke: null },
+  // leisure
+  park:          { fill: 'rgba(23,42,28,0.72)', stroke: '#1d3522' },
+  garden:        { fill: 'rgba(22,40,24,0.72)', stroke: null },
+  playground:    { fill: 'rgba(24,40,24,0.65)', stroke: null },
+  pitch:         { fill: 'rgba(24,32,40,0.72)', stroke: '#1e2e30' },
+  swimming_pool: { fill: 'rgba(24,40,56,0.82)', stroke: '#1e3248' },
+  nature_reserve:{ fill: 'rgba(21,32,24,0.72)', stroke: null },
+};
 
+// ─── Road styles by highway type ──────────────────────────────────────────────
+const ROAD_STYLE = {
+  motorway:     { casing: '#7a5a15', fill: '#e8c050', casingW: 3.5, fillW: 2.2 },
+  trunk:        { casing: '#6a4e15', fill: '#c8a840', casingW: 3.2, fillW: 2.0 },
+  primary:      { casing: '#4a3e28', fill: '#9a8860', casingW: 2.8, fillW: 1.8 },
+  secondary:    { casing: '#303848', fill: '#607080', casingW: 2.4, fillW: 1.5 },
+  tertiary:     { casing: '#283040', fill: '#485868', casingW: 2.0, fillW: 1.2 },
+  residential:  { casing: '#1e2230', fill: '#383d50', casingW: 1.6, fillW: 1.0 },
+  unclassified: { casing: '#252a38', fill: '#404858', casingW: 1.6, fillW: 1.0 },
+  service:      { casing: '#1a1f2e', fill: '#30354a', casingW: 1.2, fillW: 0.7 },
+  living_street:{ casing: '#1e2230', fill: '#383d50', casingW: 1.4, fillW: 0.9 },
+  pedestrian:   { casing: '#252830', fill: '#404860', casingW: 1.4, fillW: 0.9 },
+  footway:      { stroke: '#404858', w: 0.5, dash: [3, 3] },
+  path:         { stroke: '#383a50', w: 0.5, dash: [2, 4] },
+  cycleway:     { stroke: '#255040', w: 0.5, dash: [5, 3] },
+  track:        { stroke: '#384050', w: 0.6, dash: [5, 4] },
+  steps:        { stroke: '#404858', w: 0.6, dash: [1, 2] },
+  bridleway:    { stroke: '#354030', w: 0.5, dash: [4, 3] },
+};
+
+// Render order — lower index drawn first (underneath)
+const ROAD_ORDER = [
+  'footway','path','bridleway','steps','cycleway','track',
+  'service','living_street','residential','unclassified',
+  'tertiary','secondary','primary','trunk','motorway',
+];
+
+// ─── POI classification ────────────────────────────────────────────────────────
 const POI_COLORS = {
   amenity: {
     restaurant:'#ef4444', cafe:'#ef4444', pub:'#ef4444', bar:'#ef4444',
@@ -97,21 +233,20 @@ const POI_COLORS = {
     hospital:'#dc2626', clinic:'#dc2626', pharmacy:'#dc2626', doctors:'#dc2626',
     theatre:'#a78bfa', cinema:'#a78bfa', arts_centre:'#a78bfa',
     place_of_worship:'#f97316',
-    park:'#22c55e', playground:'#22c55e',
     bank:'#eab308', atm:'#eab308',
     fuel:'#6b7280', parking:'#6b7280',
     police:'#3b82f6', fire_station:'#3b82f6', post_office:'#3b82f6',
     default:'#60a5fa',
   },
-  shop:    { default:'#eab308' },
+  shop:    { default: '#eab308' },
   tourism: {
     museum:'#a78bfa', gallery:'#a78bfa', attraction:'#a78bfa',
     hotel:'#f59e0b', hostel:'#f59e0b', information:'#60a5fa', camp_site:'#22c55e',
     default:'#a78bfa',
   },
-  historic: { default:'#f97316' },
-  leisure:  { default:'#22c55e' },
-  office:   { default:'#60a5fa' },
+  historic: { default: '#f97316' },
+  leisure:  { default: '#22c55e' },
+  office:   { default: '#60a5fa' },
   natural:  { peak:'#10b981', spring:'#06b6d4', cave_entrance:'#6b7280', default:'#10b981' },
 };
 
@@ -126,15 +261,48 @@ function classifyPOI(tags) {
     const color = map?.[val] ?? map?.default ?? '#60a5fa';
     const name  = tags.name
       ? tags.name
-      : val.replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase());
-    const label = cat === 'historic' ? `Historic: ${name}` : name;
-    return { color, label, category: cat, value: val };
+      : val.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    return { color, label: cat === 'historic' ? `Historic: ${name}` : name, category: cat, value: val };
   }
   return null;
 }
 
-// ─── Rasterisation ─────────────────────────────────────────────────────────────
+// ─── Geometry helpers ──────────────────────────────────────────────────────────
 
+/**
+ * Project an array of {lat,lon} nodes to tile-space {x,y} using the same
+ * coordinate system the engine uses: lonToGlobalX / latToGlobalY relative to
+ * the entity's own position.  Called inside renderFn so it uses the entity's
+ * stored _ring and _mPerTile.
+ */
+function projectRing(ring, mPerTile) {
+  return ring.map(n => ({
+    x: lonToGlobalX(n.lon, ring[0].lat, mPerTile),
+    y: latToGlobalY(n.lat, mPerTile),
+  }));
+}
+
+/**
+ * Convert tile-space {x,y} points to screen space via worldToScreen.
+ * originTx/Ty is the entity's own tile position used as the local origin
+ * so we can offset into the global grid correctly.
+ */
+function tileToScreen(tilePts, originGX, originGY, entityTx, entityTy, cam) {
+  return tilePts.map(p => {
+    const localX = entityTx + (p.x - originGX);
+    const localY = entityTy + (p.y - originGY);
+    return worldToScreen(localX, localY, 0, cam);
+  });
+}
+
+function ringCentroid(nodes) {
+  let lat = 0, lon = 0;
+  for (const n of nodes) { lat += n.lat; lon += n.lon; }
+  return { lat: lat / nodes.length, lon: lon / nodes.length };
+}
+
+// ─── Rasterisation (tile terrain grid) ────────────────────────────────────────
+// FIX B: string keys — no bitshift collision
 function rasterizePolygon(cache, pts, terrain) {
   if (pts.length < 3) return;
   let minY = Infinity, maxY = -Infinity;
@@ -149,24 +317,95 @@ function rasterizePolygon(cache, pts, terrain) {
     xs.sort((a, b) => a - b);
     for (let i = 0; i < xs.length - 1; i += 2)
       for (let x = Math.ceil(xs[i]); x <= Math.floor(xs[i + 1]); x++)
-        cache.set((x << 16) | (y & 0xFFFF), terrain);
+        cache.set(`${Math.round(x)},${Math.round(y)}`, terrain);
   }
 }
 
 function rasterizeLine(cache, pts, terrain, width) {
   const w2 = width * width;
   for (let i = 0; i < pts.length - 1; i++) {
-    const x0=pts[i].x, y0=pts[i].y, x1=pts[i+1].x, y1=pts[i+1].y;
+    const x0 = pts[i].x, y0 = pts[i].y, x1 = pts[i+1].x, y1 = pts[i+1].y;
     const steps = Math.ceil(Math.hypot(x1-x0, y1-y0) * 2) + 1;
     for (let s = 0; s <= steps; s++) {
       const t  = s / steps;
       const cx = x0 + (x1-x0)*t, cy = y0 + (y1-y0)*t;
-      for (let dx = -width; dx <= width; dx++)
-        for (let dy = -width; dy <= width; dy++)
+      for (let dx = -width; dx <= width; dx++) {
+        for (let dy = -width; dy <= width; dy++) {
           if (dx*dx + dy*dy <= w2)
-            cache.set(`${Math.round(cx+dx)},${Math.round(cy+dy)}`, terrain);
+            cache.set(
+              `${Math.round(cx + dx)},${Math.round(cy + dy)}`,
+              terrain
+            );
+        }
+      }
     }
   }
+}
+
+// ─── Blueprint helpers ─────────────────────────────────────────────────────────
+function blueprintNativeBounds(blueprint) {
+  let maxY = 0, halfXZ = 0;
+  for (const p of blueprint) {
+    maxY   = Math.max(maxY, p.y + p.h);
+    halfXZ = Math.max(halfXZ, Math.abs(p.x + p.w * 0.5), Math.abs(p.z + p.d * 0.5));
+  }
+  return { maxY, halfExtentXZ: halfXZ };
+}
+
+function computeWaySpanM(geometry) {
+  if (!geometry || geometry.length < 2) return 0;
+  const a = geometry[0], b = geometry[geometry.length - 1];
+  const dLat = (b.lat - a.lat) * 111320;
+  const dLon = (b.lon - a.lon) * 111320 * Math.cos(a.lat * Math.PI / 180);
+  return Math.hypot(dLat, dLon);
+}
+
+function computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile, osmSpanM = 0) {
+  const { maxY, halfExtentXZ } = blueprintNativeBounds(blueprint);
+  if (osmSpanM > 0 && halfExtentXZ > 0) {
+    const nativeTileSpan = (halfExtentXZ * 2) / VU;
+    const targetTileSpan = osmSpanM / mPerTile;
+    return targetTileSpan / nativeTileSpan;
+  }
+  if (osmHeightM > 0 && osmAreaM2 > 0 && maxY > 0 && halfExtentXZ > 0) {
+    const targetDiag = Math.hypot(osmHeightM, Math.sqrt(osmAreaM2));
+    const nativeDiag = Math.hypot(maxY, halfExtentXZ * 2);
+    return targetDiag / nativeDiag;
+  }
+  if (osmHeightM > 0 && maxY > 0) {
+    return (osmHeightM / mPerTile) / (maxY / VU);
+  }
+  if (osmAreaM2 > 0 && halfExtentXZ > 0) {
+    return (Math.sqrt(osmAreaM2) / mPerTile / 2) / (halfExtentXZ / VU);
+  }
+  return 1;
+}
+
+function resolveLandmarkKey(tags) {
+  if (!tags) return null;
+  const candidates = [tags['name:en'], tags['int_name'], tags['alt_name:en'], tags['old_name'], tags['name']];
+  for (const c of candidates) {
+    if (!c || typeof c !== 'string') continue;
+    const key = c.toLowerCase().replace(/[\s\-']+/g, '_').replace(/[^a-z0-9_]/g, '');
+    if (Blueprints[key]) return { key, name: c };
+  }
+  return null;
+}
+
+function extractFacingAngle(tags = {}, geometry = null) {
+  const explicit = tags['building:direction'] ?? tags['direction'];
+  if (explicit != null) {
+    const deg = parseFloat(explicit);
+    if (!isNaN(deg)) return deg;
+    const cardinals = { N:0, NE:45, E:90, SE:135, S:180, SW:225, W:270, NW:315 };
+    if (cardinals[explicit.toUpperCase()] != null) return cardinals[explicit.toUpperCase()];
+  }
+  if (geometry?.length >= 2) {
+    const dLon = geometry[1].lon - geometry[0].lon;
+    const dLat = geometry[1].lat - geometry[0].lat;
+    return (Math.atan2(dLon, dLat) * 180 / Math.PI + 360) % 360;
+  }
+  return 180;
 }
 
 function makeBlueprintColliders(id, lat, lon, blueprint, scale, mPerTile) {
@@ -177,9 +416,8 @@ function makeBlueprintColliders(id, lat, lon, blueprint, scale, mPerTile) {
     const localZ = (p.z + p.d * 0.5) * scale / VU;
     const halfW  = (p.w * 0.5) * scale / VU;
     const halfD  = (p.d * 0.5) * scale / VU;
-    const groundY = p.y * scale / VU;
     if (halfW < 0.3 || halfD < 0.3) continue;
-    if (groundY > 4 && halfW < 1 && halfD < 1) continue;
+    if (p.y * scale / VU > 4 && halfW < 1 && halfD < 1) continue;
     colliders.push({
       id:             `${id}_col_${i}`,
       latitude:       lat,
@@ -205,172 +443,346 @@ function makeBlueprintColliders(id, lat, lon, blueprint, scale, mPerTile) {
 function tileOffsetToGeo(dTileX, dTileZ, baseLat, mPerTile) {
   const mLat = 111320;
   const mLon = 111320 * Math.cos(baseLat * Math.PI / 180);
-  const dLat = -(dTileZ * mPerTile) / mLat;
-  const dLon =  (dTileX * mPerTile) / mLon;
-  return { dLat, dLon };
+  return {
+    dLat: -(dTileZ * mPerTile) / mLat,
+    dLon:  (dTileX * mPerTile) / mLon,
+  };
 }
 
-// ─── Blueprint scaling helpers ─────────────────────────────────────────────────
+// ─── Tree species ──────────────────────────────────────────────────────────────
+const TREE_BLUEPRINT_KEY = {
+  conifer: 'tree_pine', palm: 'tree_palm', deciduous: 'tree_oak', default: 'tree_oak',
+};
 
-function blueprintNativeBounds(blueprint) {
-  let maxY = 0, halfXZ = 0;
-  for (const p of blueprint) {
-    maxY   = Math.max(maxY, p.y + p.h);
-    halfXZ = Math.max(halfXZ, Math.abs(p.x + p.w * 0.5), Math.abs(p.z + p.d * 0.5));
-  }
-  return { maxY, halfExtentXZ: halfXZ };
+function treeSpeciesFromTags(tags = {}) {
+  const genus    = (tags.genus ?? '').toLowerCase();
+  const leafType = (tags['leaf_type'] ?? '').toLowerCase();
+  if (genus.includes('pinus') || genus.includes('picea') || leafType === 'needleleaved') return 'conifer';
+  if (genus.includes('palm') || genus.includes('phoenix'))                               return 'palm';
+  return 'deciduous';
 }
 
-function computeWaySpanM(geometry) {
-  if (!geometry || geometry.length < 2) return 0;
-  const a = geometry[0];
-  const b = geometry[geometry.length - 1];
-  const dLat = (b.lat - a.lat) * 111320;
-  const dLon = (b.lon - a.lon) * 111320 * Math.cos(a.lat * Math.PI / 180);
-  return Math.hypot(dLat, dLon);
+function hash(n) {
+  const x = Math.sin(n + 1) * 43758.5453;
+  return x - Math.floor(x);
 }
 
-function computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile, osmSpanM = 0) {
-  const { maxY, halfExtentXZ } = blueprintNativeBounds(blueprint);
+// ─── Entity factory functions ──────────────────────────────────────────────────
 
-  // Linear landmarks (bridges): scale by tip-to-tip span — highest priority
-  if (osmSpanM > 0 && halfExtentXZ > 0) {
-    const nativeTileSpan = (halfExtentXZ * 2) / VU;
-    const targetTileSpan = osmSpanM / mPerTile;
-    return targetTileSpan / nativeTileSpan;
-  }
-  // Both height and area known — use diagonal for best fit
-  if (osmHeightM > 0 && osmAreaM2 > 0 && maxY > 0 && halfExtentXZ > 0) {
-    const targetDiag = Math.hypot(osmHeightM, Math.sqrt(osmAreaM2));
-    const nativeDiag = Math.hypot(maxY, halfExtentXZ * 2);
-    return targetDiag / nativeDiag;
-  }
-  // Height only
-  if (osmHeightM > 0 && maxY > 0) {
-    const nativeTileH = maxY / VU;
-    const targetTileH = osmHeightM / mPerTile;
-    return targetTileH / nativeTileH;
-  }
-  // Area only
-  if (osmAreaM2 > 0 && halfExtentXZ > 0) {
-    const nativeTileR = halfExtentXZ / VU;
-    const targetTileR = Math.sqrt(osmAreaM2) / mPerTile / 2;
-    return targetTileR / nativeTileR;
-  }
-  return 1;
-}
+/**
+ * FIX A + E: Building entity using real OSM footprint polygon.
+ *
+ * The renderFn projects the actual _ring nodes to screen space and draws:
+ *   1. Drop shadow (offset polygon, dark fill)
+ *   2. Wall faces (extruded edges from ground to roof height, with side shading)
+ *   3. Roof face (the polygon itself at the top)
+ *
+ * This produces a convincing isometric 3D building that matches the real
+ * footprint shape regardless of how complex the outline is.
+ */
+function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, elevGrid) {
+  const colorSet = terrainRegistry?.colors?.[TerrainType.BUILDING] ?? {};
+  const topColor   = colorSet.top   ?? '#b0a090';
+  const rightColor = colorSet.right ?? '#8a7a6a';
+  const leftColor  = colorSet.left  ?? '#6a5a4a';
 
-// ─── EntityDef factories ────────────────────────────────────────────────────────
+  // Pre-compute tile-space ring once at definition time
+  const ring = b._ring ?? b.nodes ?? [];
+  // Store origin global tile coords for the first node so we can offset correctly
+  const originGX = ring.length ? lonToGlobalX(ring[0].lon, ring[0].lat, mPerTile) : 0;
+  const originGY = ring.length ? latToGlobalY(ring[0].lat, mPerTile)              : 0;
 
-function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, decorateBuildingFacade) {
-  const halfSideM     = Math.sqrt(Math.max(16, b.areaM2));
-  const halfSideTiles = halfSideM / mPerTile / 2;
-  const colorSet      = terrainRegistry.colors[TerrainType.BUILDING];
-  const rVox          = halfSideTiles * VU;
-  const hVox          = (b.heightM / mPerTile) * VU;
-  const facadeSeed    = Math.abs(Math.round(lat * 31 + lon * 17)) % 1000;
+  // Building height in "tile units" — same convention as VoxelRenderer
+  const heightTiles = b.heightM / mPerTile;
+
+  // Geometric radius (half diagonal in tiles) for depth sort
+  const halfA = (b.obb?.halfA ?? Math.sqrt(Math.max(16, b.areaM2)) / 2) / mPerTile;
+  const halfB = (b.obb?.halfB ?? halfA) / mPerTile;
+  const _geometricR = Math.hypot(halfA, halfB);
 
   return {
-    id:             `building_${b.id || Math.random()}`,
+    id:             `building_${b.id ?? Math.random()}`,
     latitude:       lat,
     longitude:      lon,
     solid:          true,
-    bboxRadius:     halfSideTiles,
-    physicsEnabled: true,
-    physicsRadius:  halfSideTiles,
+    bboxRadius:     _geometricR,
+    _geometricR,
+    physicsEnabled: false,
     fixed:          true,
     renderHeavy:    false,
     _isBuildingBox: true,
     _lodColor:      '#78909C',
     _areaM2:        b.areaM2,
     _heightM:       b.heightM,
+    _facingAngle:   b.obb?.angleDeg ?? 0,
+    _obb:           b.obb ?? null,
+    _ring:          ring,
+    _originGX:      originGX,
+    _originGY:      originGY,
+    _mPerTile:      mPerTile,
 
     renderFn(wr, groundElevPx, extra, entity) {
-      const elev  = groundElevPx + entity.elevOffset;
-      // FIX B: sort by front corner of bounding box
-      const depth = frontDepth(entity.tx, entity.ty, wr.cam.rotation, rVox / VU);
+      const { cam, ctx } = wr;
+      if (cam.tilt < 0.02 || !entity._ring?.length) return;
 
-      wr.submitShadow({ p: { x: entity.tx, y: entity.ty }, elev, r: rVox, engineH: hVox });
+      const elev  = groundElevPx + (entity.elevOffset ?? 0);
+      const depth = frontDepth(entity.tx, entity.ty, cam.rotation, entity._geometricR ?? _geometricR);
+
+      wr.submitShadow({
+        p:       { x: entity.tx, y: entity.ty },
+        elev,
+        r:       halfA * VU,
+        engineH: heightTiles * VU,
+      });
 
       wr.submitWorldObject(depth, () => {
-        wr.beginTile(entity.tx, entity.ty, elev);
-        wr.box(
-          -rVox, 0, -rVox, rVox * 2, hVox, rVox * 2,
-          colorSet?.top   || '#b0a090',
-          colorSet?.right || '#8a7a6a',
-          colorSet?.left  || '#6a5a4a',
+        // Project each node of the footprint ring to screen space
+        const screenPts = entity._ring.map(n => {
+          // Compute the global tile coordinate of this node
+          const gx = lonToGlobalX(n.lon, entity._ring[0].lat, entity._mPerTile ?? mPerTile);
+          const gy = latToGlobalY(n.lat, entity._mPerTile ?? mPerTile);
+          // Offset from entity's own tile position
+          const localTx = entity.tx + (gx - entity._originGX);
+          const localTy = entity.ty + (gy - entity._originGY);
+          return worldToScreen(localTx, localTy, elev, cam);
+        });
+        if (screenPts.length < 3) return;
+
+        const hw = tileHalfWidth(cam.zoom, cam.tileW);
+        // Height of the building in screen pixels — depends on tilt and zoom
+        const hPx = heightTiles * hw * cam.tilt * 2;
+
+        // 1. Drop shadow (simple downward offset)
+        if (hPx > 2) {
+          ctx.beginPath();
+          screenPts.forEach((p, i) =>
+            i === 0 ? ctx.moveTo(p.x + hPx * 0.5, p.y + hPx * 0.25)
+                    : ctx.lineTo(p.x + hPx * 0.5, p.y + hPx * 0.25)
+          );
+          ctx.closePath();
+          ctx.fillStyle = 'rgba(0,0,0,0.30)';
+          ctx.fill();
+        }
+
+        // 2. Wall faces — extrude each edge of the polygon upward
+        //    We only draw the "front" faces (those facing the camera).
+        //    For each edge, compute the wall quad and fill with side colour.
+        if (hPx > 1) {
+          for (let i = 0; i < screenPts.length - 1; i++) {
+            const a = screenPts[i];
+            const b2 = screenPts[i + 1];
+            // Edge direction in screen space
+            const ex = b2.x - a.x, ey = b2.y - a.y;
+            // Normal (pointing "out" from polygon in screen space)
+            // Use cross product z-component to determine front-facing
+            const nx = -ey, ny = ex;
+            // Only draw edges whose outward normal points toward viewer
+            // (i.e. faces toward the bottom of the screen, which is toward camera)
+            if (ny <= 0) continue;
+
+            // Wall quad: bottom-left, bottom-right, top-right, top-left
+            ctx.beginPath();
+            ctx.moveTo(a.x,       a.y);
+            ctx.lineTo(b2.x,      b2.y);
+            ctx.lineTo(b2.x,      b2.y - hPx);
+            ctx.lineTo(a.x,       a.y - hPx);
+            ctx.closePath();
+            // Shade based on edge angle — edges more horizontal = right face, more vertical = left face
+            const angle = Math.abs(Math.atan2(ey, ex));
+            const isRight = angle < Math.PI / 2;
+            ctx.fillStyle = isRight ? rightColor : leftColor;
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+            ctx.lineWidth = 0.5;
+            ctx.stroke();
+          }
+        }
+
+        // 3. Roof face — the actual polygon at the top (shifted up by hPx)
+        ctx.beginPath();
+        screenPts.forEach((p, i) =>
+          i === 0 ? ctx.moveTo(p.x, p.y - hPx) : ctx.lineTo(p.x, p.y - hPx)
         );
-        if (decorateBuildingFacade) {
-          const entry = {
-            p: { x: entity.tx, y: entity.ty },
-            r: rVox, engineH: hVox, elev,
-            tc: colorSet ?? { top: '#b0a090' },
-          };
-          decorateBuildingFacade(wr.ctx, wr.cam, entry, wr._voxel, facadeSeed);
+        ctx.closePath();
+        ctx.fillStyle = topColor;
+        ctx.fill();
+        ctx.strokeStyle = rightColor;
+        ctx.lineWidth = 0.7;
+        ctx.stroke();
+      });
+    },
+  };
+}
+
+/**
+ * FIX D: Polygon feature entity (parks, water, natural areas, leisure).
+ * Projects the actual OSM polygon ring and draws a filled + optionally
+ * stroked polygon on the terrain surface.
+ */
+function makePolygonFeatureDef(el, style, mPerTile) {
+  const nodes = el.geometry.map(g => ({ lat: g.lat, lon: g.lon }));
+  if (nodes.length < 3) return null;
+  const centroid = ringCentroid(nodes);
+
+  const originGX = lonToGlobalX(nodes[0].lon, nodes[0].lat, mPerTile);
+  const originGY = latToGlobalY(nodes[0].lat, mPerTile);
+
+  return {
+    id:             `poly:${el.id}`,
+    latitude:       centroid.lat,
+    longitude:      centroid.lon,
+    solid:          false,
+    bboxRadius:     0.5,
+    physicsEnabled: false,
+    fixed:          true,
+    renderHeavy:    false,
+    _ring:          nodes,
+    _originGX:      originGX,
+    _originGY:      originGY,
+    _mPerTile:      mPerTile,
+    _lodColor:      style.fill,
+
+    renderFn(wr, groundElevPx, extra, entity) {
+      const { cam, ctx } = wr;
+      if (cam.tilt < 0.01 || !entity._ring?.length) return;
+
+      const elev  = groundElevPx + (entity.elevOffset ?? 0);
+      const depth = frontDepth(entity.tx, entity.ty, cam.rotation, 1);
+
+      wr.submitWorldObject(depth, () => {
+        const screenPts = entity._ring.map(n => {
+          const gx = lonToGlobalX(n.lon, entity._ring[0].lat, entity._mPerTile ?? mPerTile);
+          const gy = latToGlobalY(n.lat, entity._mPerTile ?? mPerTile);
+          const localTx = entity.tx + (gx - entity._originGX);
+          const localTy = entity.ty + (gy - entity._originGY);
+          return worldToScreen(localTx, localTy, elev, cam);
+        });
+        if (screenPts.length < 3) return;
+
+        ctx.beginPath();
+        screenPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+        ctx.closePath();
+
+        ctx.globalAlpha = style.alpha ?? 0.75;
+        ctx.fillStyle   = style.fill;
+        ctx.fill();
+
+        if (style.stroke) {
+          ctx.strokeStyle = style.stroke;
+          ctx.lineWidth   = 1;
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      });
+    },
+  };
+}
+
+/**
+ * FIX C: Road entity — projects the actual polyline and draws it with proper
+ * casing + fill two-pass rendering, scaled to road class and camera zoom.
+ * Roads are sorted by ROAD_ORDER so major roads draw on top of minor ones.
+ */
+function makeRoadDef(el, mPerTile) {
+  const nodes = el.geometry.map(g => ({ lat: g.lat, lon: g.lon }));
+  if (nodes.length < 2) return null;
+  const midNode = nodes[Math.floor(nodes.length / 2)];
+
+  const highway = el.tags?.highway ?? 'residential';
+  const style   = ROAD_STYLE[highway] ?? ROAD_STYLE.residential;
+  const sortIdx = ROAD_ORDER.indexOf(highway);
+
+  const originGX = lonToGlobalX(nodes[0].lon, nodes[0].lat, mPerTile);
+  const originGY = latToGlobalY(nodes[0].lat, mPerTile);
+
+  return {
+    id:             `road:${el.id}`,
+    latitude:       midNode.lat,
+    longitude:      midNode.lon,
+    solid:          false,
+    bboxRadius:     0.3,
+    physicsEnabled: false,
+    fixed:          true,
+    renderHeavy:    false,
+    _nodes:         nodes,
+    _originGX:      originGX,
+    _originGY:      originGY,
+    _mPerTile:      mPerTile,
+    _highway:       highway,
+    _roadSortIdx:   sortIdx,
+    _lodColor:      style.fill ?? style.stroke ?? '#606070',
+
+    renderFn(wr, groundElevPx, extra, entity) {
+      const { cam, ctx } = wr;
+      if (cam.tilt < 0.01 || !entity._nodes?.length) return;
+
+      const elev  = groundElevPx + (entity.elevOffset ?? 0);
+      // Roads use sort index as depth so they render in correct order
+      const depth = frontDepth(entity.tx, entity.ty, cam.rotation, 0.3)
+                  - (entity._roadSortIdx ?? 0) * 0.0001;
+
+      wr.submitWorldObject(depth, () => {
+        const hw = tileHalfWidth(cam.zoom, cam.tileW);
+        const zf = Math.max(0.5, hw / 20);
+
+        const screenPts = entity._nodes.map(n => {
+          const gx = lonToGlobalX(n.lon, entity._nodes[0].lat, entity._mPerTile ?? mPerTile);
+          const gy = latToGlobalY(n.lat, entity._mPerTile ?? mPerTile);
+          const localTx = entity.tx + (gx - entity._originGX);
+          const localTy = entity.ty + (gy - entity._originGY);
+          return worldToScreen(localTx, localTy, elev, cam);
+        });
+
+        ctx.lineCap  = 'round';
+        ctx.lineJoin = 'round';
+
+        const st = ROAD_STYLE[entity._highway] ?? ROAD_STYLE.residential;
+
+        if (st.casing) {
+          // Two-pass: casing then fill
+          ctx.beginPath();
+          screenPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+          ctx.strokeStyle = st.casing;
+          ctx.lineWidth   = st.casingW * zf * 2;
+          ctx.setLineDash([]);
+          ctx.stroke();
+
+          ctx.beginPath();
+          screenPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+          ctx.strokeStyle = st.fill;
+          ctx.lineWidth   = st.fillW * zf * 2;
+          ctx.stroke();
+        } else {
+          // Dashed minor paths
+          ctx.beginPath();
+          screenPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+          ctx.strokeStyle = st.stroke ?? '#404858';
+          ctx.lineWidth   = (st.w ?? 0.5) * zf * 2;
+          ctx.setLineDash(st.dash ? st.dash.map(v => v * Math.max(0.8, zf)) : []);
+          ctx.stroke();
+          ctx.setLineDash([]);
         }
       });
     },
   };
 }
 
-function extractFacingAngle(tags = {}, geometry = null) {
-  const explicit = tags['building:direction'] ?? tags['direction'];
-  if (explicit != null) {
-    const deg = parseFloat(explicit);
-    if (!isNaN(deg)) return deg;
-    const cardinals = { N:0, NE:45, E:90, SE:135, S:180, SW:225, W:270, NW:315 };
-    if (cardinals[explicit.toUpperCase()] != null) return cardinals[explicit.toUpperCase()];
-  }
-  if (geometry?.length >= 2) {
-    const dLon = geometry[1].lon - geometry[0].lon;
-    const dLat = geometry[1].lat - geometry[0].lat;
-    const bearing = (Math.atan2(dLon, dLat) * 180 / Math.PI + 360) % 360;
-    return Math.round(bearing / 45) * 45;
-  }
-  return 180;
-}
-
-// ─── Landmark name resolver — restore from doc 1 ──────────────────────────────
-function resolveLandmarkKey(tags) {
-  if (!tags) return null;
-  const candidates = [
-    tags['name:en'],
-    tags['int_name'],
-    tags['alt_name:en'],
-    tags['old_name'],
-    tags['name'],
-  ];
-  for (const c of candidates) {
-    if (!c || typeof c !== 'string') continue;
-    const key = c.toLowerCase().replace(/[\s\-']+/g, '_').replace(/[^a-z0-9_]/g, '');
-    if (Blueprints[key]) return { key, name: c };
-  }
-  return null;
-}
-
 /**
- * Blueprint entity factory.
- *
- * FIX A: renderFn submits a shadow hull using blueprint bounding box dims.
- *         _shadowR and _shadowH are computed once at definition time in
- *         closure so renderFn pays zero cost per frame.
- *
- * FIX B: depth sort uses frontDepth() — the front corner of the bounding
- *         box — instead of the centre, fixing pop-through at diagonal angles.
+ * Blueprint entity (landmarks, trees etc.) — shadow and front-depth fixes
+ * retained from the previous version.
  */
 function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
   const scale       = opts.scale       ?? 1;
   const facingAngle = opts.facingAngle ?? 180;
 
-  // Pre-compute shadow hull dimensions at definition time (closure)
   const _bp0 = Blueprints[bpKey];
-  let _shadowR = 0;  // voxel units
-  let _shadowH = 0;  // voxel units
+  let _shadowR = 0, _shadowH = 0;
   if (_bp0) {
     const { maxY, halfExtentXZ } = blueprintNativeBounds(_bp0);
     _shadowR = halfExtentXZ * scale;
     _shadowH = maxY         * scale;
   }
+  const _geometricR = _bp0 ? (blueprintNativeBounds(_bp0).halfExtentXZ / VU) * scale : 0.35;
 
   return {
     id,
@@ -383,47 +795,39 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
     physicsRadius:   opts.physicsRadius   ?? 0.35,
     fixed:           opts.fixed           ?? true,
     renderHeavy:     true,
-    _lodColor:       opts.lodColor ?? '#2E7D32',
+    _lodColor:       opts.lodColor        ?? '#2E7D32',
     altitudeM:       opts.altitudeM       ?? 0,
     visualAlt:       opts.visualAlt       ?? 0,
     showAltitudeLine:opts.showAltitudeLine ?? false,
     _bpKey:          bpKey,
     _scale:          scale,
     _facingAngle:    facingAngle,
+    _geometricR,
 
     renderFn(wr, groundElevPx, extra, entity) {
       const blueprint = Blueprints[bpKey] ?? Blueprints['tree'];
       const minTilt = (entity._scale ?? 1) > 10 ? 0.01 : 0.04;
       if (!blueprint || wr.cam.tilt < minTilt) return;
 
-      const s     = entity._scale       ?? 1;
-      const angle = entity._facingAngle ?? 180;
-      const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
-      const elev  = groundElevPx + entity.elevOffset;
+      const s      = entity._scale       ?? 1;
+      const angle  = entity._facingAngle ?? 180;
+      const isoA   = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
+      const elev   = groundElevPx + (entity.elevOffset ?? 0);
 
-      // FIX B: front-corner depth for correct sort at diagonal rotations
-      const footR = entity.footprintRadius ?? entity.bboxRadius ?? 0.35;
-      const depth = frontDepth(entity.tx, entity.ty, wr.cam.rotation, footR);
+      const scaleRatio = scale > 0 ? (entity._scale ?? scale) / scale : 1;
+      const geomR  = (entity._geometricR ?? 0.35) * scaleRatio;
+      const depth  = frontDepth(entity.tx, entity.ty, wr.cam.rotation, geomR);
 
-      // FIX A: shadow from blueprint bounding box
-      // If entity._scale differs from closure scale (cache restore), rescale.
-      const scaleRatio = (scale > 0) ? s / scale : 1;
       const shadowR = _shadowR * scaleRatio;
       const shadowH = _shadowH * scaleRatio;
       if (shadowR > 0 && shadowH > 0) {
-        wr.submitShadow({
-          p:       { x: entity.tx, y: entity.ty },
-          elev,
-          r:       shadowR,   // voxel units (same convention as building rVox)
-          engineH: shadowH,
-        });
+        wr.submitShadow({ p: { x: entity.tx, y: entity.ty }, elev, r: shadowR, engineH: shadowH });
       }
 
       wr.submitWorldObject(depth, () => {
         wr.ctx.globalAlpha = isoA;
         wr._voxel.beginTile(entity.tx, entity.ty, elev);
         wr._voxel.setRotation(angle);
-
         for (const p of blueprint) {
           wr._voxel.box(
             p.x * s, p.y * s, p.z * s,
@@ -431,7 +835,6 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
             p.top, p.right ?? p.top, p.front ?? p.top,
           );
         }
-
         wr._voxel.clearRotation();
         wr.ctx.globalAlpha = 1;
       });
@@ -439,28 +842,19 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
   };
 }
 
-/** Standard 2D icon POI feature */
+/** POI / icon feature */
 function makeFeatureDef(f) {
-  let blueprint    = null;
-  let blueprintKey = null;
-  const candidates = [f.title, f.label, f.category];
-  for (const candidate of candidates) {
-    if (candidate && typeof candidate === 'string') {
-      const key = candidate.toLowerCase().replace(/\s+/g, '_');
-      if (Blueprints[key]) {
-        blueprintKey = key;
-        blueprint    = Blueprints[key];
-        break;
-      }
-    }
+  let blueprint = null, blueprintKey = null;
+  for (const candidate of [f.title, f.label, f.category]) {
+    if (!candidate) continue;
+    const key = candidate.toLowerCase()
+      .replace(/[\s\-]+/g, '_')
+      .replace(/[^a-z0-9_]/g, '');
+    if (Blueprints[key]) { blueprintKey = key; blueprint = Blueprints[key]; break; }
   }
 
   const color = f.color ?? '#60a5fa';
   const label = f.label ?? f.title ?? '';
-
-  if (!blueprintKey && (f.title || f.label || f.category)) {
-    console.warn(`[OSMTerrainLoader] Missing blueprint for: ${f.title}, ${label}, ${f.category}`);
-  }
 
   return {
     id:        f.id,
@@ -471,23 +865,23 @@ function makeFeatureDef(f) {
     physicsEnabled: false,
     fixed:     true,
     renderHeavy: false,
-    type: f.category,
+    type:      f.category,
     label, color,
-    category: f.category,
-    value:    f.value,
-    title:    f.title,
+    category:  f.category,
+    value:     f.value,
+    title:     f.title,
 
     renderFn(wr, groundElevPx, extra, entity) {
       const { cam } = wr;
       if (cam.tilt < 0.02) return;
       const elev  = groundElevPx + (entity.elevOffset ?? 0);
-      // POIs are point-sized, centre depth is correct for them
-      const depth = tileDepth(entity.tx, entity.ty, cam.rotation, 0.35);
+      const depth = frontDepth(entity.tx, entity.ty, cam.rotation, 0.35);
       const hw    = tileHalfWidth(cam.zoom, cam.tileW);
       const r     = Math.max(3, hw * 0.7);
       const isoA  = Math.min(1, (cam.tilt - 0.04) / 0.12);
 
       wr.submitWorldObject(depth, () => {
+        wr.ctx.globalAlpha = 1;
         const { x, y } = worldToScreen(entity.tx + 0.5, entity.ty + 0.5, elev, cam);
         const ctx = wr.ctx;
 
@@ -505,10 +899,8 @@ function makeFeatureDef(f) {
           ctx.arc(x, y, r, 0, Math.PI * 2);
           ctx.fillStyle = color;
           ctx.fill();
-          ctx.beginPath();
-          ctx.arc(x, y, r, 0, Math.PI * 2);
           ctx.strokeStyle = 'rgba(0,0,0,0.4)';
-          ctx.lineWidth = 1;
+          ctx.lineWidth   = 1;
           ctx.stroke();
         }
 
@@ -516,7 +908,7 @@ function makeFeatureDef(f) {
           ctx.beginPath();
           ctx.arc(x, y, r * 1.8, 0, Math.PI * 2);
           ctx.strokeStyle = color + 'aa';
-          ctx.lineWidth = 2;
+          ctx.lineWidth   = 2;
           ctx.stroke();
         }
 
@@ -528,37 +920,10 @@ function makeFeatureDef(f) {
   };
 }
 
-// ─── OSM tree species → blueprint key ─────────────────────────────────────────
-
-const TREE_BLUEPRINT_KEY = {
-  conifer:   'tree_pine',
-  palm:      'tree_palm',
-  forest:    'forest',
-  park:      'park',
-  deciduous: 'tree_oak',
-  default:   'tree_oak',
-};
-
-function treeSpeciesFromTags(tags = {}) {
-  const genus    = (tags.genus       ?? '').toLowerCase();
-  const leafType = (tags['leaf_type'] ?? '').toLowerCase();
-  if (genus.includes('pinus') || genus.includes('picea') || leafType === 'needleleaved') return 'conifer';
-  if (genus.includes('palm')  || genus.includes('phoenix'))                              return 'palm';
-  if (genus.includes('quercus') || genus.includes('fagus') || leafType === 'broadleaved') return 'deciduous';
-  return 'deciduous';
-}
-
-function hash(n) {
-  const x = Math.sin(n + 1) * 43758.5453;
-  return x - Math.floor(x);
-}
-
+// ─── Facade window decoration (unchanged from previous version) ────────────────
 function drawFacadeWindows(ctx, faceQuad, rows, cols, color, seed) {
   const lerp  = (a, b, t) => a + (b - a) * t;
   const lerpP = (p1, p2, t) => ({ x: lerp(p1.x, p2.x, t), y: lerp(p1.y, p2.y, t) });
-  const litColor  = '#fffcd0bb';
-  const darkColor = '#1a2a3a99';
-
   ctx.save();
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
@@ -575,7 +940,7 @@ function drawFacadeWindows(ctx, faceQuad, rows, cols, color, seed) {
       ctx.moveTo(tl.x, tl.y); ctx.lineTo(tr.x, tr.y);
       ctx.lineTo(br.x, br.y); ctx.lineTo(bl.x, bl.y);
       ctx.closePath();
-      ctx.fillStyle = isDark ? darkColor : (isLit ? litColor : color + 'bb');
+      ctx.fillStyle = isDark ? '#1a2a3a99' : (isLit ? '#fffcd0bb' : color + 'bb');
       ctx.fill();
     }
   }
@@ -584,56 +949,50 @@ function drawFacadeWindows(ctx, faceQuad, rows, cols, color, seed) {
 
 export function decorateBuildingFacade(ctx, cam, buildingEntry, vr, seed = 0) {
   const { p, r, engineH, tc } = buildingEntry;
-  const VU = 8;
-
   const hw = tileHalfWidth(cam.zoom, cam.tileW);
-  if (hw < 6 || cam.tilt < 0.1) return;
-  if (!p || typeof p.x !== 'number' || !tc || !vr?.proj) return;
-
-  const snap = ((Math.round(cam.rotation / (Math.PI / 2)) % 4) + 4) % 4;
-  const [x, z, w, d, h] = [-r, -r, r * 2, r * 2, engineH];
-
-  const vp = (px, py, pz) => {
-    if (typeof buildingEntry.elev !== 'number') return null;
-    vr.beginTile(p.x, p.y, buildingEntry.elev);
-    const pt = vr.proj(px, py, pz);
-    return pt && typeof pt.x === 'number' ? pt : null;
-  };
-
-  let faceA, faceB;
-  if      (snap === 0) { faceA = [vp(x+w,0,z),   vp(x+w,h,z),   vp(x+w,h,z+d), vp(x+w,0,z+d)]; faceB = [vp(x,0,z+d),   vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)]; }
-  else if (snap === 1) { faceA = [vp(x,0,z+d),   vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)]; faceB = [vp(x,0,z),     vp(x,h,z),     vp(x,h,z+d),   vp(x,0,z+d)]; }
-  else if (snap === 2) { faceA = [vp(x,0,z),     vp(x,h,z),     vp(x,h,z+d),   vp(x,0,z+d)]; faceB = [vp(x,0,z),     vp(x+w,0,z),   vp(x+w,h,z),   vp(x,h,z)]; }
-  else                 { faceA = [vp(x,0,z),     vp(x+w,0,z),   vp(x+w,h,z),   vp(x,h,z)]; faceB = [vp(x+w,0,z),   vp(x+w,h,z),   vp(x+w,h,z+d), vp(x+w,0,z+d)]; }
-
-  const isValid = f => f.length === 4 && f.every(p => p && typeof p.x === 'number');
-  if (!isValid(faceA) || !isValid(faceB)) return;
-
-  const floors   = Math.max(1, Math.round((engineH / VU) * 0.7));
-  const colsA    = Math.max(2, Math.round(r / VU * 3));
-  const colsB    = Math.max(1, Math.round(r / VU * 2));
-  const winAlpha = Math.min(1, (hw - 6) / 14) * Math.min(1, cam.tilt * 4);
-
-  if (winAlpha > 0.05) {
-    ctx.globalAlpha = winAlpha;
-    drawFacadeWindows(ctx, faceA, floors, colsA, '#c8e8ff', seed);
-    drawFacadeWindows(ctx, faceB, floors, colsB, '#c8e8ff', seed + 100);
-    ctx.globalAlpha = 1;
-  }
-
-  if (hw > 10) {
-    const pts = [vp(x,h,z), vp(x+w,h,z), vp(x+w,h,z+d), vp(x,h,z+d)];
-    if (pts.some(p => !p)) return;
-    ctx.beginPath();
-    pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
-    ctx.closePath();
-    ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 1; ctx.stroke();
-    ctx.fillStyle   = shadeHex(tc.top, 0.85) + '88'; ctx.fill();
+  ctx.save();
+  try {
+    if (hw < 6 || cam.tilt < 0.1 || !p || !tc || !vr?.proj) return;
+    const snap = ((Math.round(cam.rotation / (Math.PI / 2)) % 4) + 4) % 4;
+    const [x, z, w, d, h] = [-r, -r, r * 2, r * 2, engineH];
+    const vp = (px, py, pz) => {
+      if (typeof buildingEntry.elev !== 'number') return null;
+      vr.beginTile(p.x, p.y, buildingEntry.elev);
+      const pt = vr.proj(px, py, pz);
+      return pt && typeof pt.x === 'number' ? pt : null;
+    };
+    let faceA, faceB;
+    if      (snap === 0) { faceA = [vp(x+w,0,z),   vp(x+w,h,z),   vp(x+w,h,z+d), vp(x+w,0,z+d)]; faceB = [vp(x,0,z+d),   vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)]; }
+    else if (snap === 1) { faceA = [vp(x,0,z+d),   vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)];   faceB = [vp(x,0,z),     vp(x,h,z),     vp(x,h,z+d),   vp(x,0,z+d)]; }
+    else if (snap === 2) { faceA = [vp(x,0,z),     vp(x,h,z),     vp(x,h,z+d),   vp(x,0,z+d)];   faceB = [vp(x,0,z),     vp(x+w,0,z),   vp(x+w,h,z),   vp(x,h,z)]; }
+    else                 { faceA = [vp(x,0,z),     vp(x+w,0,z),   vp(x+w,h,z),   vp(x,h,z)];     faceB = [vp(x+w,0,z),   vp(x+w,h,z),   vp(x+w,h,z+d), vp(x+w,0,z+d)]; }
+    const isValid = f => f.length === 4 && f.every(pt => pt && typeof pt.x === 'number');
+    if (!isValid(faceA) || !isValid(faceB)) return;
+    const floors = Math.max(1, Math.round((engineH / VU) * 0.7));
+    const colsA  = Math.max(2, Math.round(r / VU * 3));
+    const colsB  = Math.max(1, Math.round(r / VU * 2));
+    const winAlpha = Math.min(1, (hw - 6) / 14) * Math.min(1, cam.tilt * 4);
+    if (winAlpha > 0.05) {
+      ctx.globalAlpha = winAlpha;
+      drawFacadeWindows(ctx, faceA, floors, colsA, '#c8e8ff', seed);
+      drawFacadeWindows(ctx, faceB, floors, colsB, '#c8e8ff', seed + 100);
+      ctx.globalAlpha = 1;
+    }
+    if (hw > 10) {
+      const pts = [vp(x,h,z), vp(x+w,h,z), vp(x+w,h,z+d), vp(x,h,z+d)];
+      if (pts.some(pt => !pt)) return;
+      ctx.beginPath();
+      pts.forEach((pt, i) => (i ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y)));
+      ctx.closePath();
+      ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 1; ctx.stroke();
+      ctx.fillStyle   = shadeHex(tc.top, 0.85) + '88'; ctx.fill();
+    }
+  } finally {
+    ctx.restore();
   }
 }
 
 // ─── Loader ───────────────────────────────────────────────────────────────────
-
 export class OSMTerrainLoader extends BaseLoader {
   get id() { return 'osm-terrain'; }
 
@@ -641,24 +1000,38 @@ export class OSMTerrainLoader extends BaseLoader {
     super(options);
     this._endpoints    = options.endpoint
       ? [options.endpoint]
-      : (options.endpoints || DEFAULT_ENDPOINTS);
+      : (options.endpoints ?? DEFAULT_ENDPOINTS);
     this._endpointIdx  = 0;
-    this._mPerTile     = options.mPerTile     || 2;
-    this._mapW         = options.mapW         || 80;
-    this._mapH         = options.mapH         || 80;
+    this._mPerTile     = options.mPerTile     ?? 2;
+    this._mapW         = options.mapW         ?? 80;
+    this._mapH         = options.mapH         ?? 80;
     this._fetchRadiusM = options.fetchRadiusM ?? 900;
     this._backoffUntil = 0;
     this._abort        = null;
     this._cache        = new PersistentCache('GOE_Overpass', 'osm_terrain');
+
+    // FIX H: live entity cache (avoids IDB reads + factory calls on revisit)
+    this._liveEntityCache = new Map();
+
     this._fetchDebounceMs = options.fetchDebounceMs ?? 800;
     this._debounceTimer   = null;
     this._pendingResolve  = null;
+
     this._decorateBuildingFacade = options.decorateBuildingFacade ?? null;
     this._terrainRegistry        = options.terrainRegistry        ?? null;
+
+    // FIX F: elevation grid — mirrors map.js open-elevation approach
+    this._elevGrid       = [];       // [{latitude, longitude, elevation}]
+    this._elevGridCenter = null;     // {lat,lon} when grid was fetched
+    this._elevFetching   = false;
+    this._bpGen = new ProceduralBlueprintGenerator({
+      mPerTile: this._mPerTile,
+    });
   }
 
   init(engine) {
     this._terrainRegistry = engine.terrainRegistry;
+    this._bpGen._terrainRegistry = this._terrainRegistry;
   }
 
   get _endpoint() { return this._endpoints[this._endpointIdx % this._endpoints.length]; }
@@ -668,6 +1041,34 @@ export class OSMTerrainLoader extends BaseLoader {
     return `${lat.toFixed(2)},${lon.toFixed(2)}`;
   }
 
+  // ── FIX F: elevation helpers ──────────────────────────────────────────────
+  /**
+   * Fetch a new elevation grid if we've moved far enough from the last one.
+   * Threshold = half the grid extent in degrees so we always have coverage.
+   */
+  async _maybeRefreshElevGrid(lat, lon) {
+    const threshold = ELEV_STEP * ELEV_HALF * 0.5;
+    if (this._elevFetching) return;
+    if (this._elevGridCenter) {
+      const d = Math.hypot(lat - this._elevGridCenter.lat, lon - this._elevGridCenter.lon);
+      if (d < threshold) return;
+    }
+    this._elevFetching = true;
+    try {
+      this._elevGrid       = await fetchElevationGrid(lat, lon);
+      this._elevGridCenter = { lat, lon };
+      console.log(`[OSMTerrainLoader] Elevation grid refreshed (${this._elevGrid.length} pts)`);
+    } finally {
+      this._elevFetching = false;
+    }
+  }
+
+  /** Sample elevation at a lat/lon using the cached grid.  Returns metres. */
+  sampleElevation(lat, lon) {
+    return sampleElev(this._elevGrid, lat, lon);
+  }
+
+  // ── Debounced fetch entry point ───────────────────────────────────────────
   async fetch(geoCenter) {
     if (this._debounceTimer !== null) {
       clearTimeout(this._debounceTimer);
@@ -693,46 +1094,43 @@ export class OSMTerrainLoader extends BaseLoader {
       return {};
     }
 
+    const { lat, lon } = geoCenter;
+
+    // Kick off elevation grid refresh in parallel (non-blocking)
+    this._maybeRefreshElevGrid(lat, lon);
+
     const cacheKey = this._getCacheKey(geoCenter);
     try {
+      // Live entity cache (fastest path)
+      if (this._liveEntityCache.has(cacheKey)) {
+        const { terrainUpdates, entities } = this._liveEntityCache.get(cacheKey);
+        console.log(`[OSMTerrainLoader] Live cache hit — ${entities.length} entities`);
+        return { terrainUpdates, entities };
+      }
+
+      // IDB cache
       const cached = await this._cache.get(cacheKey);
       const age    = Date.now() - (cached?.timestamp ?? 0);
       if (cached?.terrainUpdates && age < CACHE_TTL_MS) {
-        console.log(`[OSMTerrainLoader] Cache hit — rebuilding ${cached.entities?.length ?? 0} entities`);
-        const liveEntities = (cached.entities ?? []).map(e => {
-          if (e._type === 'building') {
-            return makeBuildingDef(
-              { id: e.id, areaM2: e.areaM2 ?? 16, heightM: e.heightM ?? 8 },
-              e.latitude, e.longitude,
-              this._mPerTile, this._terrainRegistry, decorateBuildingFacade
-            );
-          }
-          if (e.bpKey) {
-            return makeBlueprintDef(e.id, e.latitude, e.longitude, e.bpKey, {
-              ...e,
-              scale:       e._scale       ?? 1,
-              facingAngle: e._facingAngle ?? 180,
-            });
-          }
-          return makeFeatureDef(e);
-        });
-        return {
-          terrainUpdates: new Map(Object.entries(cached.terrainUpdates)),
-          entities: liveEntities,
-        };
+        console.log(`[OSMTerrainLoader] IDB cache hit — rebuilding entities`);
+        const liveEntities = await this._rebuildEntitiesFromCache(cached, lat, lon);
+        const terrainUpdates = new Map(Object.entries(cached.terrainUpdates));
+        this._liveEntityCache.set(cacheKey, { terrainUpdates, entities: liveEntities });
+        return { terrainUpdates, entities: liveEntities };
       }
-    } catch (err) { console.warn('[OSMTerrainLoader] Cache read error', err); }
+    } catch (err) {
+      console.warn('[OSMTerrainLoader] Cache read error', err);
+    }
 
-    const { lat, lon } = geoCenter;
+    // Build Overpass query
     const r = this._fetchRadiusM;
     const around = `(around:${r},${lat},${lon})`;
-
     const q = `[out:json][timeout:60];(
-      way["natural"~"^(water|wetland|beach|wood|grassland|heath|scrub)$"]${around};
-      way["landuse"~"^(reservoir|basin|grass|meadow|village_green|allotments|forest|park|commercial|residential|retail|industrial)$"]${around};
-      way["leisure"~"^(park|garden|pitch|playground)$"]${around};
+      way["natural"~"^(water|wetland|beach|wood|grassland|heath|scrub|sand|bare_rock|meadow)$"]${around};
+      way["landuse"~"^(reservoir|basin|grass|meadow|village_green|allotments|forest|park|commercial|residential|retail|industrial|cemetery|construction|farmland)$"]${around};
+      way["leisure"~"^(park|garden|pitch|playground|swimming_pool|nature_reserve)$"]${around};
       way["waterway"~"^(river|stream|canal|drain|ditch|riverbank)$"]${around};
-      way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|pedestrian|footway|cycleway|path|track)$"]${around};
+      way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|pedestrian|living_street|footway|cycleway|path|track|steps|bridleway)$"]${around};
       way["building"]${around};
       way["bridge"="yes"]["name"]${around};
       way["man_made"="bridge"]["name"]${around};
@@ -748,7 +1146,7 @@ export class OSMTerrainLoader extends BaseLoader {
 
     for (let attempt = 0; attempt < this._endpoints.length; attempt++) {
       const ctrl    = new AbortController();
-      const timeout = setTimeout(() => ctrl.abort(), 12000);
+      const timeout = setTimeout(() => ctrl.abort(), 14000);
 
       try {
         const res = await fetch(
@@ -760,379 +1158,27 @@ export class OSMTerrainLoader extends BaseLoader {
         if (!res.ok)             { this._nextEndpoint(); continue; }
 
         const data = await res.json();
-        console.log(`[OSMTerrainLoader] ${data.elements?.length ?? 0} elements from ${this._endpoint}`);
+        console.log(`[OSMTerrainLoader] ${data.elements?.length ?? 0} elements`);
 
-        const terrainUpdates        = new Map();
-        const entityDefs            = [];
-        const renderedLandmarkNames = new Set();
+        const result = await this._processOSMData(data, geoCenter);
 
-        const toTile = (eLat, eLon) => ({
-          x: lonToGlobalX(eLon, geoCenter.lat, this._mPerTile),
-          y: latToGlobalY(eLat, this._mPerTile),
-        });
-
-        const mLat = 111320;
-        const mLon = 111320 * Math.cos(lat * Math.PI / 180);
-        const rLat = r / mLat, rLon = r / mLon;
-        const minGX = lonToGlobalX(lon - rLon, lat, this._mPerTile) - 2;
-        const maxGX = lonToGlobalX(lon + rLon, lat, this._mPerTile) + 2;
-        const minGY = latToGlobalY(lat + rLat, this._mPerTile) - 2;
-        const maxGY = latToGlobalY(lat - rLat, this._mPerTile) + 2;
-
-        const buildingWays = [];
-
-        // ── Separate elements by type for ordered processing ──────────────────
-        const wayElements  = [];
-        const nodeElements = [];
-        for (const el of data.elements) {
-          if (el.type === 'way')  wayElements.push(el);
-          if (el.type === 'node') nodeElements.push(el);
-        }
-
-// ── Pass 1: Bridge landmark ways (span-aware — MUST run before nodes) ─
-        // The Golden Gate Bridge (and similar) is split across many OSM way
-        // segments inside a relation. A single way only covers one segment so
-        // computeWaySpanM on it returns ~0. Fix: group all way segments that
-        // share the same resolved landmark key, merge their geometry, then
-        // compute the true tip-to-tip span across the full merged point set.
-
-        // Step A — collect all bridge way segments keyed by landmark name
-        const bridgeSegmentsByKey = new Map(); // nameKey → { match, els: [] }
-
-        for (const el of wayElements) {
-          if (!el.geometry?.length) continue;
-          if (!(el.tags?.bridge === 'yes' || el.tags?.man_made === 'bridge')) continue;
-          const match = resolveLandmarkKey(el.tags);
-          if (!match) continue;
-
-          // Always rasterize road/path terrain under the bridge
-          const cls = classifyOSM(el.tags);
-          if (cls) {
-            const pts = el.geometry.map(g => toTile(g.lat, g.lon));
-            rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width ?? 2);
-          }
-
-          const { key: nameKey } = match;
-          if (!bridgeSegmentsByKey.has(nameKey)) {
-            bridgeSegmentsByKey.set(nameKey, { match, els: [] });
-          }
-          bridgeSegmentsByKey.get(nameKey).els.push(el);
-        }
-
-        // Step B — for each landmark, merge all segments and compute true span
-        for (const [nameKey, { match, els }] of bridgeSegmentsByKey) {
-          if (renderedLandmarkNames.has(nameKey)) continue;
-          const blueprint = Blueprints[nameKey];
-          if (!blueprint) continue;
-
-          const { name } = match;
-
-          // Merge all geometry points from all segments
-          const allGeom = els.flatMap(el => el.geometry ?? []);
-
-          // Centroid across all points
-          let cLat = 0, cLon = 0;
-          for (const g of allGeom) { cLat += g.lat; cLon += g.lon; }
-          if (allGeom.length) { cLat /= allGeom.length; cLon /= allGeom.length; }
-
-          // True tip-to-tip span: project all points onto the principal axis
-          // (bearing of the longest segment), then take max - min projection.
-          const refEl   = els.reduce((a, b) =>
-            (b.geometry?.length ?? 0) > (a.geometry?.length ?? 0) ? b : a
-          );
-          const refGeom = refEl.geometry ?? [];
-          let osmSpanM  = 0;
-
-          if (allGeom.length >= 2 && refGeom.length >= 2) {
-            const a0    = refGeom[0];
-            const a1    = refGeom[refGeom.length - 1];
-            const dLat  = (a1.lat - a0.lat) * 111320;
-            const dLon  = (a1.lon - a0.lon) * 111320 * Math.cos(a0.lat * Math.PI / 180);
-            const axisLen = Math.hypot(dLat, dLon);
-            if (axisLen > 0) {
-              const axLat = dLat / axisLen;
-              const axLon = dLon / axisLen;
-              let minP = Infinity, maxP = -Infinity;
-              for (const g of allGeom) {
-                const gLat = (g.lat - a0.lat) * 111320;
-                const gLon = (g.lon - a0.lon) * 111320 * Math.cos(a0.lat * Math.PI / 180);
-                const proj = gLat * axLat + gLon * axLon;
-                if (proj < minP) minP = proj;
-                if (proj > maxP) maxP = proj;
-              }
-              osmSpanM = maxP - minP;
-            }
-          }
-
-          // Fallback: bounding-box longest axis
-          if (osmSpanM <= 0 && allGeom.length >= 2) {
-            let minLat = Infinity, maxLat = -Infinity;
-            let minLon = Infinity, maxLon = -Infinity;
-            for (const g of allGeom) {
-              if (g.lat < minLat) minLat = g.lat;
-              if (g.lat > maxLat) maxLat = g.lat;
-              if (g.lon < minLon) minLon = g.lon;
-              if (g.lon > maxLon) maxLon = g.lon;
-            }
-            const spanLat = (maxLat - minLat) * 111320;
-            const spanLon = (maxLon - minLon) * 111320 * Math.cos(cLat * Math.PI / 180);
-            osmSpanM = Math.max(spanLat, spanLon);
-          }
-
-          const firstEl    = els[0];
-          const osmHeightM = parseFloat(firstEl.tags?.height ?? firstEl.tags?.['max_height'] ?? 0) || 0;
-          const scale      = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile, osmSpanM);
-
-          const { halfExtentXZ } = blueprintNativeBounds(blueprint);
-
-          // ── Radius decoupling ─────────────────────────────────────────────
-          // scaledR = true visual half-extent in tiles (can be hundreds for GGB).
-          // bboxRadius / physicsRadius must stay small — they drive culling,
-          // collision queries, and frontDepth(). Feeding 677 tiles into
-          // frontDepth pushes the depth sort value far outside the scene range
-          // (~0-80 tiles) so the bridge renders behind everything or not at all.
-          // footprintRadius is capped at 40 tiles — large enough that the bridge
-          // sorts in front of nearby terrain but won't blow up the depth key.
-          const scaledR        = (halfExtentXZ / VU) * scale;
-          const cullingR       = Math.min(Math.max(scaledR, 2), 8);
-          const footprintR     = Math.min(scaledR, 40);
-
-          const facingAngle    = extractFacingAngle(firstEl.tags, refGeom);
-
-          console.log(
-            `[OSMTerrainLoader] Bridge landmark "${name}" — ` +
-            `${els.length} segments, span=${osmSpanM.toFixed(0)}m h=${osmHeightM}m → ` +
-            `scale=${scale.toFixed(2)}x (visualR=${scaledR.toFixed(1)} cullingR=${cullingR.toFixed(1)} tiles)`
-          );
-
-          renderedLandmarkNames.add(nameKey);
-          entityDefs.push(makeBlueprintDef(
-            `landmark:bridge:${els[0].id}`, cLat, cLon, nameKey,
-            {
-              scale,
-              facingAngle,
-              solid:           false,   // bridges: don't block player movement
-              bboxRadius:      cullingR,
-              footprintRadius: footprintR,
-              physicsEnabled:  false,
-              physicsRadius:   cullingR,
-              fixed:           true,
-              lodColor:        '#A1887F',
-            }
-          ));
-
-          // Colliders omitted for bridges — individual segment colliders would
-          // need their own span-aware placement and are rarely useful at this scale.
-        }
-
-        // ── Pass 2: All other ways (terrain + buildings + cars) ───────────────
-        for (const el of wayElements) {
-          if (!el.geometry?.length) continue;
-
-          // Skip bridge landmark ways — fully handled in pass 1
-          if (el.tags?.bridge === 'yes' || el.tags?.man_made === 'bridge') {
-            if (resolveLandmarkKey(el.tags)) continue;
-          }
-
-          const cls = classifyOSM(el.tags);
-          if (!cls) continue;
-
-          const pts = el.geometry.map(g => toTile(g.lat, g.lon));
-          if (cls.type === 'polygon') rasterizePolygon(terrainUpdates, pts, cls.terrain);
-          else                        rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width);
-
-          if (el.tags?.building) buildingWays.push(el);
-
-          if (el.tags?.highway &&
-              ['primary','secondary','tertiary','residential'].includes(el.tags.highway) &&
-              Math.random() > 0.6) {
-            entityDefs.push({
-              id: `car:${el.id}`,
-              latitude:  el.geometry[0].lat,
-              longitude: el.geometry[0].lon,
-              solid: false, bboxRadius: 0.35,
-              physicsEnabled: false, fixed: true, renderHeavy: true,
-              _lodColor: '#607D8B',
-              title: 'car', label: 'car', category: 'car',
-              renderFn(wr, groundElevPx, extra, entity) {
-                const blueprint = Blueprints['car'];
-                const minTilt = (entity._scale ?? 1) > 10 ? 0.01 : 0.04;
-if (!blueprint || wr.cam.tilt < minTilt) return;
-                const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
-                const elev  = groundElevPx + entity.elevOffset;
-                const depth = frontDepth(entity.tx, entity.ty, wr.cam.rotation, 0.35);
-                wr.submitWorldObject(depth, () => {
-                  wr.ctx.globalAlpha = isoA;
-                  wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
-                  wr.ctx.globalAlpha = 1;
-                });
-              },
-            });
-          }
-        }
-
-        // ── Pass 3: Nodes (trees, POIs, landmark nodes) ───────────────────────
-        for (const el of nodeElements) {
-          const { x: gx, y: gy } = toTile(el.lat, el.lon);
-          if (gx < minGX || gx > maxGX || gy < minGY || gy > maxGY) continue;
-
-          if (el.tags?.natural === 'tree') {
-            const species = treeSpeciesFromTags(el.tags);
-            const bpKey   = TREE_BLUEPRINT_KEY[species] ?? 'tree_oak';
-            entityDefs.push(makeBlueprintDef(
-              `tree:${el.id}`, el.lat, el.lon, bpKey,
-              {
-                solid: true, bboxRadius: 0.5, footprintRadius: 1.2,
-                physicsEnabled: true, physicsRadius: 0.5,
-                lodColor: '#2E7D32', facingAngle: 180,
-              }
-            ));
-            continue;
-          }
-
-          const poi = classifyPOI(el.tags);
-          if (!poi) continue;
-
-          const landmarkMatch = resolveLandmarkKey(el.tags);
-          if (landmarkMatch) {
-            const { key: nameKey, name } = landmarkMatch;
-            // If a bridge way already claimed this name (e.g. Golden Gate Bridge),
-            // skip — the span-scaled version is already in entityDefs.
-            if (!renderedLandmarkNames.has(nameKey)) {
-              renderedLandmarkNames.add(nameKey);
-              const blueprint  = Blueprints[nameKey];
-              const osmHeightM = parseFloat(el.tags?.height ?? el.tags?.['building:height'] ?? 0) || 0;
-              const scale      = computeLandmarkScale(blueprint, osmHeightM, 0, this._mPerTile);
-              const { halfExtentXZ } = blueprintNativeBounds(blueprint);
-              const scaledR     = Math.max(2, (halfExtentXZ / VU) * scale);
-              const facingAngle = extractFacingAngle(el.tags);
-
-              console.log(`[OSMTerrainLoader] Landmark node "${name}" — h=${osmHeightM}m → scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`);
-
-              entityDefs.push(makeBlueprintDef(
-                `landmark:node:${el.id}`, el.lat, el.lon, nameKey,
-                {
-                  scale, facingAngle,
-                  solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
-                  physicsEnabled: true, physicsRadius: scaledR,
-                  fixed: true, lodColor: '#A1887F',
-                }
-              ));
-            }
-            continue;
-          }
-
-          entityDefs.push(makeFeatureDef({
-            id:          `osm:node:${el.id}`,
-            latitude:    el.lat,
-            longitude:   el.lon,
-            color:       poi.color,
-            label:       poi.label,
-            category:    poi.category,
-            value:       poi.value,
-            title:       el.tags?.name ?? poi.label,
-            description: el.tags?.name ? `${poi.label} — ${el.tags.name}` : poi.label,
-            tags:        el.tags ?? {},
-          }));
-        }
-
-        // ── Pass 4: Buildings ─────────────────────────────────────────────────
-        if (buildingWays.length && this._terrainRegistry) {
-          const buildings = preprocessBuildings(buildingWays);
-
-          for (const b of buildings) {
-            const match     = resolveLandmarkKey(b.tags);
-            const nameKey   = match?.key  ?? '';
-            const name      = match?.name ?? '';
-            const blueprint = match ? Blueprints[nameKey] : null;
-
-            if (blueprint) {
-              const osmHeightM = parseFloat(b.tags?.height ?? b.tags?.['building:height'] ?? 0) || 0;
-              const osmAreaM2  = b.areaM2 ?? 0;
-              const scale      = computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, this._mPerTile);
-              const { halfExtentXZ } = blueprintNativeBounds(blueprint);
-              const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
-
-              console.log(
-                `[OSMTerrainLoader] Landmark bldg "${name}" — ` +
-                `h=${osmHeightM}m area=${osmAreaM2.toFixed(0)}m² → ` +
-                `scale=${scale.toFixed(2)}x (r=${scaledR.toFixed(1)} tiles)`
-              );
-
-              const facingAngle = extractFacingAngle(b.tags, b.geometry);
-              const landmarkDef = makeBlueprintDef(
-                `landmark:${b.id}`, b.centroid.lat, b.centroid.lon, nameKey,
-                {
-                  scale, facingAngle,
-                  solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
-                  physicsEnabled: true, physicsRadius: scaledR,
-                  fixed: true, lodColor: '#A1887F',
-                }
-              );
-
-              if (!renderedLandmarkNames.has(nameKey)) {
-                renderedLandmarkNames.add(nameKey);
-                entityDefs.push(landmarkDef);
-                const colliders = makeBlueprintColliders(
-                  `landmark:${b.id}`, b.centroid.lat, b.centroid.lon,
-                  blueprint, scale, this._mPerTile
-                );
-                for (const col of colliders) {
-                  const { dLat, dLon } = tileOffsetToGeo(
-                    col._localOffsetX, col._localOffsetZ,
-                    b.centroid.lat, this._mPerTile
-                  );
-                  col.latitude  = b.centroid.lat + dLat;
-                  col.longitude = b.centroid.lon + dLon;
-                  entityDefs.push(col);
-                }
-              } else {
-                // A node entry exists for this landmark — upgrade it to the
-                // building-derived def which has area data for better scaling.
-                const existingIdx = entityDefs.findIndex(
-                  e => e._bpKey === nameKey && e.id.startsWith('landmark:node:')
-                );
-                if (existingIdx !== -1) entityDefs[existingIdx] = landmarkDef;
-              }
-            } else {
-              entityDefs.push(
-                makeBuildingDef(b, b.centroid.lat, b.centroid.lon,
-                  this._mPerTile, this._terrainRegistry, decorateBuildingFacade)
-              );
-            }
-          }
-        }
-
-        console.log(`[OSMTerrainLoader] → ${terrainUpdates.size} terrain tiles, ${entityDefs.length} entities`);
-
+        // Cache to IDB
         try {
           await this._cache.set(cacheKey, {
-            terrainUpdates: Object.fromEntries(terrainUpdates),
-            entities: entityDefs.map(e => ({
-              id:           e.id,
-              latitude:     e.latitude,
-              longitude:    e.longitude,
-              solid:        e.solid,
-              bboxRadius:   e.bboxRadius,
-              _type:        e._isBuildingBox ? 'building' : (e.renderHeavy && e._bpKey ? 'blueprint' : 'poi'),
-              areaM2:       e._areaM2        ?? null,
-              heightM:      e._heightM       ?? null,
-              bpKey:        e._bpKey         ?? null,
-              _scale:       e._scale         ?? null,
-              _facingAngle: e._facingAngle   ?? null,
-              label:        e.label,
-              color:        e.color,
-              category:     e.category,
-              value:        e.value,
-              title:        e.title,
-            })),
-            timestamp: Date.now(),
+            terrainUpdates: Object.fromEntries(result.terrainUpdates),
+            entities:       this._serializeEntities(result.entities),
+            timestamp:      Date.now(),
           });
         } catch (cacheErr) {
-          console.warn('[OSMTerrainLoader] Cache write error (continuing)', cacheErr);
+          console.warn('[OSMTerrainLoader] Cache write error', cacheErr);
         }
 
-        return { terrainUpdates, entities: entityDefs };
+        this._liveEntityCache.set(cacheKey, {
+          terrainUpdates: result.terrainUpdates,
+          entities:       result.entities,
+        });
+
+        return result;
 
       } catch (err) {
         clearTimeout(timeout);
@@ -1146,8 +1192,359 @@ if (!blueprint || wr.cam.tilt < minTilt) return;
     console.warn('[OSMTerrainLoader] All endpoints failed, backing off 8s');
     return {};
   }
-  
 
+  // ── Main OSM data processing ──────────────────────────────────────────────
+  async _processOSMData(data, geoCenter) {
+    const { lat, lon } = geoCenter;
+    const mPerTile     = this._mPerTile;
+
+    const terrainUpdates        = new Map();
+    const entityDefs            = [];
+    const renderedLandmarkNames = new Set();
+
+    const toTile = (eLat, eLon) => ({
+      x: lonToGlobalX(eLon, geoCenter.lat, mPerTile),
+      y: latToGlobalY(eLat, mPerTile),
+    });
+
+    // Bounding box for node culling
+    const mLat  = 111320;
+    const mLon  = 111320 * Math.cos(lat * Math.PI / 180);
+    const r     = this._fetchRadiusM;
+    const rLat  = r / mLat, rLon = r / mLon;
+    const minGX = lonToGlobalX(lon - rLon, lat, mPerTile) - 2;
+    const maxGX = lonToGlobalX(lon + rLon, lat, mPerTile) + 2;
+    const minGY = latToGlobalY(lat + rLat, mPerTile) - 2;
+    const maxGY = latToGlobalY(lat - rLat, mPerTile) + 2;
+
+    const wayElements  = [];
+    const nodeElements = [];
+    for (const el of data.elements ?? []) {
+      if (el.type === 'way')  wayElements.push(el);
+      if (el.type === 'node') nodeElements.push(el);
+    }
+
+    // ── Pass 1: Bridge landmark ways ──────────────────────────────────────
+    const bridgeSegmentsByKey = new Map();
+    for (const el of wayElements) {
+      if (!el.geometry?.length) continue;
+      if (!(el.tags?.bridge === 'yes' || el.tags?.man_made === 'bridge')) continue;
+      const match = resolveLandmarkKey(el.tags);
+      if (!match) continue;
+
+      const cls = classifyOSM(el.tags);
+      if (cls) {
+        const pts = el.geometry.map(g => toTile(g.lat, g.lon));
+        rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width ?? 2);
+      }
+
+      const { key: nameKey } = match;
+      if (!bridgeSegmentsByKey.has(nameKey)) bridgeSegmentsByKey.set(nameKey, { match, els: [] });
+      bridgeSegmentsByKey.get(nameKey).els.push(el);
+    }
+
+    for (const [nameKey, { match, els }] of bridgeSegmentsByKey) {
+      if (renderedLandmarkNames.has(nameKey)) continue;
+      const blueprint = Blueprints[nameKey];
+      if (!blueprint) continue;
+
+      const allGeom = els.flatMap(el => el.geometry ?? []);
+      let cLat = 0, cLon = 0;
+      for (const g of allGeom) { cLat += g.lat; cLon += g.lon; }
+      if (allGeom.length) { cLat /= allGeom.length; cLon /= allGeom.length; }
+
+      const refEl   = els.reduce((a, b) => (b.geometry?.length ?? 0) > (a.geometry?.length ?? 0) ? b : a);
+      const refGeom = refEl.geometry ?? [];
+      let osmSpanM  = 0;
+      if (refGeom.length >= 2) {
+        const a0 = refGeom[0], a1 = refGeom[refGeom.length - 1];
+        osmSpanM = Math.hypot(
+          (a1.lat - a0.lat) * 111320,
+          (a1.lon - a0.lon) * 111320 * Math.cos(a0.lat * Math.PI / 180)
+        );
+      }
+
+      const osmHeightM  = parseFloat(els[0].tags?.height ?? 0) || 0;
+      const scale       = computeLandmarkScale(blueprint, osmHeightM, 0, mPerTile, osmSpanM);
+      const { halfExtentXZ } = blueprintNativeBounds(blueprint);
+      const scaledR     = Math.min(Math.max((halfExtentXZ / VU) * scale, 2), 8);
+      const facingAngle = extractFacingAngle(els[0].tags, refGeom);
+
+      renderedLandmarkNames.add(nameKey);
+      entityDefs.push(makeBlueprintDef(
+        `landmark:bridge:${els[0].id}`, cLat, cLon, nameKey,
+        { scale, facingAngle, solid: false, bboxRadius: scaledR, footprintRadius: scaledR,
+          physicsEnabled: false, physicsRadius: scaledR, fixed: true, lodColor: '#A1887F' }
+      ));
+    }
+
+    // ── Pass 2: All other ways (terrain + roads + polygon features) ───────
+    const buildingWays  = [];
+    // Collect road defs so we can sort by ROAD_ORDER before adding
+    const roadDefs = [];
+
+    for (const el of wayElements) {
+      if (!el.geometry?.length) continue;
+      // Skip bridge landmarks already handled
+      if ((el.tags?.bridge === 'yes' || el.tags?.man_made === 'bridge') && resolveLandmarkKey(el.tags)) continue;
+
+      const cls = classifyOSM(el.tags);
+      if (!cls) continue;
+
+      const pts = el.geometry.map(g => toTile(g.lat, g.lon));
+
+      // Paint terrain grid
+      if (cls.type === 'polygon') rasterizePolygon(terrainUpdates, pts, cls.terrain);
+      else                        rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width);
+
+      // FIX D: Polygon feature entities
+      if (cls.type === 'polygon' && !el.tags?.building) {
+        const tag  = el.tags?.natural ?? el.tags?.landuse ?? el.tags?.leisure ?? el.tags?.waterway;
+        const style = tag ? POLYGON_STYLES[tag] : null;
+        if (style) {
+          const def = makePolygonFeatureDef(el, style, mPerTile);
+          if (def) entityDefs.push(def);
+        }
+      }
+
+      // FIX C: Road entities
+      if (el.tags?.highway) {
+        const def = makeRoadDef(el, mPerTile);
+        if (def) roadDefs.push(def);
+      }
+
+      // Waterway polygon/line feature
+      if (el.tags?.waterway && !el.tags?.building) {
+        const style = POLYGON_STYLES['water'];
+        if (cls.type === 'polygon') {
+          const def = makePolygonFeatureDef(el, style, mPerTile);
+          if (def) entityDefs.push(def);
+        }
+        // Line waterways don't need a separate entity — terrain handles them
+      }
+
+      if (el.tags?.building) buildingWays.push(el);
+    }
+
+    // Add roads sorted by ROAD_ORDER (lowest index = drawn first = underneath)
+    roadDefs.sort((a, b) => (a._roadSortIdx ?? 0) - (b._roadSortIdx ?? 0));
+    for (const def of roadDefs) entityDefs.push(def);
+
+    // ── Pass 3: Nodes (trees, POIs, landmark nodes) ───────────────────────
+    const landmarkNodeCandidates = new Map();
+
+    for (const el of nodeElements) {
+      const { x: gx, y: gy } = toTile(el.lat, el.lon);
+      if (gx < minGX || gx > maxGX || gy < minGY || gy > maxGY) continue;
+
+      if (el.tags?.natural === 'tree') {
+        const species = treeSpeciesFromTags(el.tags);
+        const bpKey   = TREE_BLUEPRINT_KEY[species] ?? 'tree_oak';
+        entityDefs.push(makeBlueprintDef(
+          `tree:${el.id}`, el.lat, el.lon, bpKey,
+          { solid: true, bboxRadius: 0.5, footprintRadius: 1.2,
+            physicsEnabled: false, physicsRadius: 0.5, lodColor: '#2E7D32', facingAngle: 180 }
+        ));
+        continue;
+      }
+
+      const poi = classifyPOI(el.tags);
+      if (!poi) continue;
+
+      const tileKey = `${Math.round(gx)},${Math.round(gy)}`;
+      if (terrainUpdates.get(tileKey) === TerrainType.BUILDING) continue;
+
+      const landmarkMatch = resolveLandmarkKey(el.tags);
+      if (landmarkMatch) {
+        const { key: nameKey, name } = landmarkMatch;
+        if (!renderedLandmarkNames.has(nameKey) && !landmarkNodeCandidates.has(nameKey)) {
+          const blueprint  = Blueprints[nameKey];
+          const osmHeightM = parseFloat(el.tags?.height ?? 0) || 0;
+          const scale      = computeLandmarkScale(blueprint, osmHeightM, 0, mPerTile);
+          const { halfExtentXZ } = blueprintNativeBounds(blueprint);
+          const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
+          const facingAngle = extractFacingAngle(el.tags);
+          landmarkNodeCandidates.set(nameKey, { el, nameKey, name, blueprint, osmHeightM, scale, scaledR, facingAngle });
+        }
+        continue;
+      }
+
+      entityDefs.push(makeFeatureDef({
+        id: `osm:node:${el.id}`,
+        latitude:    el.lat,
+        longitude:   el.lon,
+        color:       poi.color,
+        label:       poi.label,
+        category:    poi.category,
+        value:       poi.value,
+        title:       el.tags?.name ?? poi.label,
+        description: el.tags?.name ? `${poi.label} — ${el.tags.name}` : poi.label,
+        tags:        el.tags ?? {},
+      }));
+    }
+
+    // ── Pass 4: Buildings ─────────────────────────────────────────────────
+    const _buildingPromises = [];
+ 
+    if (buildingWays.length && this._terrainRegistry) {
+      const buildings = preprocessBuildings(buildingWays);
+ 
+      for (const b of buildings) {
+        const match     = resolveLandmarkKey(b.tags);
+        const nameKey   = match?.key ?? '';
+        const blueprint = match ? Blueprints[nameKey] : null;
+ 
+        if (blueprint) {
+          // Named landmark — use hand-crafted blueprint from BluePrintLibrary
+          const osmHeightM = parseFloat(b.tags?.height ?? 0) || 0;
+          const osmAreaM2  = b.areaM2 ?? 0;
+          const scale      = computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile);
+          const { halfExtentXZ } = blueprintNativeBounds(blueprint);
+          const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
+          const facingAngle = extractFacingAngle(b.tags, b.geometry);
+ 
+          if (!renderedLandmarkNames.has(nameKey)) {
+            renderedLandmarkNames.add(nameKey);
+            entityDefs.push(makeBlueprintDef(
+              `landmark:${b.id}`, b.centroid.lat, b.centroid.lon, nameKey,
+              { scale, facingAngle, solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
+                physicsEnabled: false, physicsRadius: scaledR, fixed: true, lodColor: '#A1887F' }
+            ));
+            const colliders = makeBlueprintColliders(
+              `landmark:${b.id}`, b.centroid.lat, b.centroid.lon, blueprint, scale, mPerTile
+            );
+            for (const col of colliders) {
+              const { dLat, dLon } = tileOffsetToGeo(col._localOffsetX, col._localOffsetZ, b.centroid.lat, mPerTile);
+              col.latitude  = b.centroid.lat + dLat;
+              col.longitude = b.centroid.lon + dLon;
+              entityDefs.push(col);
+            }
+          }
+ 
+        } else {
+          // Generic building — generate procedural to-scale blueprint
+          // with face decoration, cached in mem + IDB.
+          _buildingPromises.push(
+            this._bpGen.getBuildingDef(b, mPerTile, this._terrainRegistry, this._elevGrid)
+          );
+        }
+      }
+ 
+      // Resolve all procedural blueprints in parallel
+      const resolvedDefs = await Promise.all(_buildingPromises);
+      for (const def of resolvedDefs) {
+        if (def) entityDefs.push(def);
+      }
+ 
+      // Emit any landmark node candidates not superseded by a building way
+      for (const [nameKey, c] of landmarkNodeCandidates) {
+        if (renderedLandmarkNames.has(nameKey)) continue;
+        renderedLandmarkNames.add(nameKey);
+        entityDefs.push(makeBlueprintDef(
+          `landmark:node:${c.el.id}`, c.el.lat, c.el.lon, nameKey,
+          { scale: c.scale, facingAngle: c.facingAngle, solid: true, bboxRadius: c.scaledR,
+            footprintRadius: c.scaledR, physicsEnabled: false, physicsRadius: c.scaledR,
+            fixed: true, lodColor: '#A1887F' }
+        ));
+      }
+    }
+
+    console.log(`[OSMTerrainLoader] → ${terrainUpdates.size} terrain tiles, ${entityDefs.length} entities`);
+    return { terrainUpdates, entities: entityDefs };
+  }
+
+  // ── Entity serialization / deserialization for IDB cache ─────────────────
+  _serializeEntities(entityDefs) {
+    return entityDefs.map(e => ({
+      id:           e.id,
+      latitude:     e.latitude,
+      longitude:    e.longitude,
+      solid:        e.solid,
+      bboxRadius:   e.bboxRadius,
+      _type:        e._isBuildingBox  ? 'building'
+                  : (e._bpKey && e.renderHeavy) ? 'blueprint'
+                  : e._ring           ? 'polygon'
+                  : e._nodes          ? 'road'
+                  : 'poi',
+      _procBlueprint: e._procBlueprint ?? null,
+      areaM2:       e._areaM2       ?? null,
+      heightM:      e._heightM      ?? null,
+      bpKey:        e._bpKey        ?? null,
+      _scale:       e._scale        ?? null,
+      _facingAngle: e._facingAngle  ?? null,
+      _ring:        e._ring         ?? null,
+      _nodes:       e._nodes        ?? null,
+      _originGX:    e._originGX     ?? null,
+      _originGY:    e._originGY     ?? null,
+      _mPerTile:    e._mPerTile     ?? null,
+      _highway:     e._highway      ?? null,
+      _roadSortIdx: e._roadSortIdx  ?? null,
+      label:        e.label,
+      color:        e.color,
+      category:     e.category,
+      value:        e.value,
+      title:        e.title,
+      _obb:         e._obb          ?? null,
+    }));
+  }
+
+  async _rebuildEntitiesFromCache(cached, lat, lon) {
+    const mPerTile = this._mPerTile;
+    return (await Promise.all((cached.entities ?? []).map(async e => {
+      if (e._type === 'procbp' && e._procBlueprint) {
+        // Restore procedural blueprint entity directly from cached blueprint data
+        const b = {
+          id:       e.id.replace('procbp:', ''),
+          _ring:    e._ring,
+          nodes:    e._ring,
+          areaM2:   e.areaM2  ?? 16,
+          heightM:  e.heightM ?? 8,
+          obb:      e._obb    ?? null,
+          centroid: { lat: e.latitude, lon: e.longitude },
+          tags:     {},
+        };
+        // Reuse the cached blueprint boxes directly — no regeneration needed
+        const def = await this._bpGen.getBuildingDef(b, mPerTile, this._terrainRegistry, this._elevGrid);
+        if (def) def._procBlueprint = e._procBlueprint; // override with cached boxes
+        return def;
+      }
+      if (e._type === 'building' && e._ring) {
+        // Rebuild building with full polygon rendering
+        const b = {
+          id: e.id, _ring: e._ring, nodes: e._ring,
+          areaM2: e.areaM2 ?? 16, heightM: e.heightM ?? 8,
+          obb: e._obb ?? null,
+          centroid: { lat: e.latitude, lon: e.longitude },
+          tags: {},
+        };
+        return makeBuildingDef(b, e.latitude, e.longitude, mPerTile, this._terrainRegistry, this._elevGrid);
+      }
+      if (e._type === 'polygon' && e._ring) {
+        const tag   = e.category ?? '';
+        const style = POLYGON_STYLES[tag] ?? { fill: 'rgba(40,50,60,0.5)', stroke: null };
+        // Reconstruct a minimal el-like object
+        const el = { id: e.id.replace('poly:',''), geometry: e._ring, tags: {} };
+        return makePolygonFeatureDef(el, style, mPerTile);
+      }
+      if (e._type === 'road' && e._nodes) {
+        const el = {
+          id: e.id.replace('road:',''),
+          geometry: e._nodes,
+          tags: { highway: e._highway ?? 'residential' },
+        };
+        return makeRoadDef(el, mPerTile);
+      }
+      if (e.bpKey) {
+        return makeBlueprintDef(e.id, e.latitude, e.longitude, e.bpKey, {
+          scale:       e._scale       ?? 1,
+          facingAngle: e._facingAngle ?? 180,
+        });
+      }
+      return makeFeatureDef(e);
+    }))).filter(Boolean);
+  }
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
   destroy() {
     if (this._debounceTimer !== null) {
       clearTimeout(this._debounceTimer);
@@ -1156,7 +1553,14 @@ if (!blueprint || wr.cam.tilt < minTilt) return;
       this._pendingResolve = null;
     }
     this._abort?.abort();
+    // [ADD]
+    this._bpGen.clearMemCache();
   }
 
-  async clearCache() { await this._cache.clear(); }
+  async clearCache() {
+    this._liveEntityCache.clear();
+    await this._cache.clear();
+    // [ADD]
+    await this._bpGen.clearAllCaches();
+  }
 }

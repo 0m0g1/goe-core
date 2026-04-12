@@ -264,6 +264,7 @@ export function drawPlayer(wr, wx, wy, groundElevPx, player, mPerTile = 2) {
   const { x: sx, y: sy } = worldToScreen(wx, wy, elev, cam);
 
   wr.submitWorldObject(depth, () => {
+  wr.ctx.globalAlpha = 1;
     _drawPlayerCanvas(wr.ctx, cam, sx, sy, player, mPerTile, alpha);
   });
 }

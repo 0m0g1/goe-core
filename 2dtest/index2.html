@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GeoExplorer — Vector OSM Renderer</title>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Bebas+Neue&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #171c28;
+      --panel:   #111520;
+      --border:  #232840;
+      --accent:  #e8d44d;
+      --accent2: #4de8b4;
+      --danger:  #e84d4d;
+      --text:    #c0c8e0;
+      --dim:     #50587a;
+      --radius:  5px;
+      --mono:    'Space Mono', monospace;
+      --display: 'Bebas Neue', sans-serif;
+    }
+
+    html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:var(--mono); }
+
+    #map-canvas {
+      position:absolute; inset:0;
+      cursor:grab; z-index:0; display:block;
+    }
+    #map-canvas.panning { cursor:grabbing; }
+
+    /* ── Topbar ── */
+    #topbar {
+      position:absolute; top:0; left:0; right:0; z-index:20;
+      display:flex; align-items:center; gap:16px;
+      padding:10px 18px;
+      background:linear-gradient(180deg,rgba(17,21,32,.97) 0%,transparent 100%);
+      pointer-events:none;
+    }
+    #logo {
+      font-family:var(--display); font-size:26px; letter-spacing:3px;
+      color:var(--accent); text-shadow:0 0 18px rgba(232,212,77,.35);
+      pointer-events:auto;
+    }
+    #logo small {
+      display:block; font-family:var(--mono);
+      font-size:9px; letter-spacing:2px; color:var(--dim); margin-top:-3px;
+    }
+    #live-coords {
+      margin-left:auto; font-size:10px; color:var(--accent2);
+      letter-spacing:1px; pointer-events:auto; white-space:nowrap;
+    }
+
+    /* ── Panel ── */
+    #panel {
+      position:absolute; top:64px; left:14px; z-index:20;
+      width:290px; display:flex; flex-direction:column; gap:9px;
+    }
+    .card {
+      background:rgba(17,21,32,.91);
+      border:1px solid var(--border); border-radius:var(--radius);
+      backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); overflow:hidden;
+    }
+    .card-hdr {
+      padding:7px 12px; background:rgba(35,40,64,.55);
+      border-bottom:1px solid var(--border);
+      font-size:9px; letter-spacing:2px; color:var(--dim); text-transform:uppercase;
+      display:flex; align-items:center; gap:6px;
+    }
+    .card-hdr::before {
+      content:''; width:5px; height:5px; border-radius:50%;
+      background:var(--accent); box-shadow:0 0 5px var(--accent); flex-shrink:0;
+    }
+
+    /* Search */
+    #search-body { padding:11px; display:flex; flex-direction:column; gap:7px; }
+    .row { display:flex; gap:5px; }
+    .cinput {
+      flex:1; background:var(--bg); border:1px solid var(--border);
+      border-radius:var(--radius); padding:6px 9px;
+      font-family:var(--mono); font-size:11px; color:var(--text); outline:none;
+      transition:border-color .2s;
+    }
+    .cinput::placeholder { color:var(--dim); }
+    .cinput:focus { border-color:var(--accent); box-shadow:0 0 0 2px rgba(232,212,77,.1); }
+    .btn {
+      background:var(--accent); color:var(--bg); border:none; border-radius:var(--radius);
+      padding:6px 12px; font-family:var(--mono); font-size:10px; font-weight:700;
+      letter-spacing:1px; cursor:pointer; white-space:nowrap;
+      transition:background .15s,transform .1s;
+    }
+    .btn:hover { background:#f0df6e; }
+    .btn:active { transform:scale(.97); }
+    .btn-sec { background:transparent; color:var(--accent2); border:1px solid var(--accent2); }
+    .btn-sec:hover { background:rgba(77,232,180,.1); }
+    #err { font-size:10px; color:var(--danger); display:none; letter-spacing:.4px; }
+
+    /* Legend */
+    #legend-body { padding:9px 12px; display:flex; flex-wrap:wrap; gap:6px 14px; }
+    .leg { display:flex; align-items:center; gap:5px; font-size:9px; color:var(--dim); letter-spacing:.5px; }
+    .ls  { width:14px; height:9px; border-radius:2px; flex-shrink:0; }
+    .ll  { width:14px; height:3px; border-radius:1px; flex-shrink:0; }
+
+    /* Location list */
+    #loc-list { max-height:285px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:var(--border) transparent; }
+    #loc-list::-webkit-scrollbar { width:3px; }
+    #loc-list::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+    .loc {
+      display:flex; align-items:center; gap:9px; padding:8px 12px; cursor:pointer;
+      border-bottom:1px solid rgba(35,40,64,.45); transition:background .13s;
+    }
+    .loc:last-child { border-bottom:none; }
+    .loc:hover  { background:rgba(232,212,77,.05); }
+    .loc.active { background:rgba(232,212,77,.09); border-left:2px solid var(--accent); }
+    .ln  { font-size:10px; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .lc  { font-size:8px; color:var(--dim); white-space:nowrap; }
+
+    /* Zoom */
+    #zoom-wrap {
+      position:absolute; bottom:28px; right:16px; z-index:20;
+      display:flex; flex-direction:column; gap:3px;
+    }
+    .zbtn {
+      width:34px; height:34px; background:rgba(17,21,32,.92);
+      border:1px solid var(--border); border-radius:var(--radius);
+      color:var(--text); font-size:18px; cursor:pointer;
+      display:flex; align-items:center; justify-content:center;
+      transition:all .14s; backdrop-filter:blur(6px);
+    }
+    .zbtn:hover { background:var(--accent); color:var(--bg); border-color:var(--accent); }
+    #zoom-num {
+      width:34px; height:26px; display:flex; align-items:center; justify-content:center;
+      font-size:10px; color:var(--accent); letter-spacing:1px;
+      background:rgba(17,21,32,.88); border:1px solid var(--border); border-radius:var(--radius);
+    }
+
+    /* Status bar */
+    #statusbar {
+      position:absolute; bottom:0; left:0; right:0; z-index:20;
+      display:flex; align-items:center; gap:18px; padding:5px 14px;
+      background:rgba(17,21,32,.95); border-top:1px solid var(--border);
+      font-size:9px; letter-spacing:1px; color:var(--dim);
+    }
+    #statusbar em { color:var(--accent2); font-style:normal; }
+    #statusbar b  { color:var(--accent);  font-weight:400; }
+    #st { margin-left:auto; }
+
+    @media (max-width:500px) { #panel { width:calc(100vw - 28px); } }
+  </style>
+</head>
+<body>
+
+<canvas id="map-canvas"></canvas>
+
+<div id="topbar">
+  <div id="logo">GeoExplorer<small>OSM VECTOR RENDERER — TILE-FREE</small></div>
+  <div id="live-coords">LAT — &nbsp;&nbsp; LON —</div>
+</div>
+
+<div id="panel">
+
+  <div class="card">
+    <div class="card-hdr">Coordinate Jump</div>
+    <div id="search-body">
+      <div class="row">
+        <input id="i-lat"  class="cinput" type="number" placeholder="Latitude  (±90)"  step="any" />
+        <input id="i-lon"  class="cinput" type="number" placeholder="Longitude (±180)" step="any" />
+      </div>
+      <div class="row">
+        <input id="i-zoom" class="cinput" type="number" placeholder="Zoom 12–19" min="12" max="19" value="16" />
+        <button class="btn" id="btn-go">GO →</button>
+        <button class="btn btn-sec" id="btn-clr">CLR</button>
+      </div>
+      <div id="err">⚠ Invalid — Lat ±90  Lon ±180</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-hdr">Legend</div>
+    <div id="legend-body">
+      <div class="leg"><div class="ls" style="background:#162e48;border:1px solid #1a3850"></div>Water</div>
+      <div class="leg"><div class="ls" style="background:#172a1c"></div>Park</div>
+      <div class="leg"><div class="ls" style="background:#142018"></div>Forest</div>
+      <div class="leg"><div class="ls" style="background:#232940;border:1px solid #374060"></div>Building</div>
+      <div class="leg"><div class="ll" style="background:#e8c050"></div>Motorway</div>
+      <div class="leg"><div class="ll" style="background:#9a8860"></div>Primary</div>
+      <div class="leg"><div class="ll" style="background:#607080"></div>Secondary</div>
+      <div class="leg"><div class="ll" style="background:#383d50"></div>Residential</div>
+      <div class="leg"><div class="ll" style="background:#505868"></div>Railway</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-hdr">Saved Locations</div>
+    <div id="loc-list"></div>
+  </div>
+
+</div>
+
+<div id="zoom-wrap">
+  <button class="zbtn" id="btn-zi">+</button>
+  <div id="zoom-num">14</div>
+  <button class="zbtn" id="btn-zo">−</button>
+</div>
+
+<div id="statusbar">
+  <div>ENGINE: <em>Canvas 2D + Overpass API</em></div>
+  <div>ZOOM: <b id="sb-zoom">—</b></div>
+  <div>CENTER: <b id="sb-center">—</b></div>
+  <div id="st">Ready — zoom in to load vector data</div>
+</div>
+
+<script src="map.js"></script>
+</body>
+</html>
