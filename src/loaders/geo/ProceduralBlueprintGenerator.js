@@ -661,7 +661,7 @@ export function generateProceduralBlueprint(building, mPerTile) {
   decorate(frontRuns, 'front',
     (y, start) => toVU(start, bbox.minX, centroidScaledX),
     (y, start) => toVU(y,     bbox.minY, centroidScaledY),
-    (y, start) => toVU(y,     bbox.minY, centroidScaledY) + cellVU
+    (y, start) => toVU(y,     bbox.minY, centroidScaledY) + cellVU * 0.5
   );
   decorate(backRuns, 'back',
     (y, start) => toVU(start, bbox.minX, centroidScaledX),
@@ -669,13 +669,13 @@ export function generateProceduralBlueprint(building, mPerTile) {
     (y, start) => toVU(y,     bbox.minY, centroidScaledY) - cellVU * 0.5
   );
   decorate(rightRuns, 'right',
-    (x, start) => toVU(x,     bbox.minX, centroidScaledX),
     (x, start) => toVU(start, bbox.minY, centroidScaledY),
-    (x, start) => toVU(x,     bbox.minX, centroidScaledX) + cellVU
+    (x, start) => toVU(x,     bbox.minX, centroidScaledX),
+    (x, start) => toVU(x,     bbox.minX, centroidScaledX) + cellVU * 0.5
   );
   decorate(leftRuns, 'left',
-    (x, start) => toVU(x,     bbox.minX, centroidScaledX),
     (x, start) => toVU(start, bbox.minY, centroidScaledY),
+    (x, start) => toVU(x,     bbox.minX, centroidScaledX),
     (x, start) => toVU(x,     bbox.minX, centroidScaledX) - cellVU * 0.5
   );
 
