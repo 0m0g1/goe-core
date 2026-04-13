@@ -508,6 +508,12 @@ function selectRoofStyle(buildingType, heightVU, areaM2, tags, seed) {
   return 'flat';
 }
 
+function ringCentroid(nodes) {
+  let lat = 0, lon = 0;
+  for (const n of nodes) { lat += n.lat; lon += n.lon; }
+  return { lat: lat / nodes.length, lon: lon / nodes.length };
+}
+
 // ─── Main blueprint generator ─────────────────────────────────────────────────
 export function generateProceduralBlueprint(building, mPerTile) {
   const {
@@ -563,10 +569,12 @@ export function generateProceduralBlueprint(building, mPerTile) {
 
   const heightVU = Math.max(VU, (clampedHeightM / mPerTile) * VU);
 
-  // Helper: convert a scaled-raster coord to centred VU space
-  // "centred" means the footprint bbox is centred at (0,0,0) in VU
-  const toVU = (scaledCoord, minScaled, totalScaled) =>
-    (scaledCoord - minScaled - totalScaled / 2) / RASTER_SCALE * VU;
+  const centroidTile = ringToTile([effectiveRing[0], ringCentroid(effectiveRing)], mPerTile)[1];
+  const centroidScaledX = centroidTile.x * RASTER_SCALE - bbox.minX;
+  const centroidScaledY = centroidTile.y * RASTER_SCALE - bbox.minY;
+
+  const toVU = (scaledCoord, minScaled, offset) =>
+    (scaledCoord - minScaled - offset) / RASTER_SCALE * VU;
 
   const cellVU = (1 / RASTER_SCALE) * VU;  // VU width of one raster cell
 
@@ -587,8 +595,8 @@ export function generateProceduralBlueprint(building, mPerTile) {
       if (i === xs.length || xs[i] !== xs[i - 1] + 1) {
         const runEnd = xs[i - 1];
         const wx = (runEnd - runStart + 1) / RASTER_SCALE * VU;
-        const bx = toVU(runStart, bbox.minX, totalScaledW);
-        const bz = toVU(y, bbox.minY, totalScaledD);
+        const bx = toVU(runStart, bbox.minX, centroidScaledX);
+        const bz = toVU(y, bbox.minY, centroidScaledY);
         bpBoxes.push(box(bx, 0, bz, wx, heightVU, cellVU,
           wallCols.top, wallCols.right, wallCols.front));
         runStart = xs[i];
@@ -675,8 +683,8 @@ export function generateProceduralBlueprint(building, mPerTile) {
     for (let i = 1; i <= xs.length; i++) {
       if (i === xs.length || xs[i] !== xs[i - 1] + 1) {
         const runEnd = xs[i - 1];
-        const bx   = toVU(runStart, bbox.minX, totalScaledW);
-        const bz   = toVU(scaledY,  bbox.minY, totalScaledD);
+        const bx   = toVU(runStart, bbox.minX, centroidScaledX);
+        const bz   = toVU(scaledY,  bbox.minY, centroidScaledY);
         const runW = (runEnd - runStart + 1) / RASTER_SCALE * VU;
         const sliceBbox = { minX: bx, maxX: bx + runW, minY: bz, maxY: bz + cellVU };
 
@@ -842,7 +850,7 @@ export class ProceduralBlueprintGenerator {
         wr.submitWorldObject(depth, () => {
           wr.ctx.globalAlpha = isoA;
           wr._voxel.beginTile(entity.tx, entity.ty, elev);
-          wr._voxel.setRotation(entity._facingAngle ?? 0);
+          wr._voxel.setRotation(-180);//(entity._facingAngle ?? 0);
           for (const p of blueprint) {
             wr._voxel.box(
               p.x, p.y, p.z,
