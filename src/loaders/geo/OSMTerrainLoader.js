@@ -497,7 +497,7 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, elevGrid) {
       wr.submitShadow({
         p:       { x: entity.tx, y: entity.ty },
         elev,
-        r:       shadowR,
+        r:       Math.min(shadowR, entity._geometricR * VU * 0.5),
         engineH: heightTiles * VU,
       });
 
@@ -1364,16 +1364,8 @@ export class OSMTerrainLoader extends BaseLoader {
             entityDefs.push(landmarkDef);
             this._onPartialResult?.({ terrainUpdates: new Map(), entities: [landmarkDef] });
 
-            const colliders = makeBlueprintColliders(
-              `landmark:${b.id}`, b.centroid.lat, b.centroid.lon, blueprint, scale, mPerTile
-            );
-            for (const col of colliders) {
-              const { dLat, dLon } = tileOffsetToGeo(col._localOffsetX, col._localOffsetZ, b.centroid.lat, mPerTile);
-              col.latitude  = b.centroid.lat + dLat;
-              col.longitude = b.centroid.lon + dLon;
-              entityDefs.push(col);
-            }
-            this._onPartialResult?.({ terrainUpdates: new Map(), entities: colliders });
+            // Colliders skipped — makeBlueprintColliders produces axis-aligned
+            // boxes that don't match landmark footprints and cause phantom solid squares.
           }
         } else {
           b._facingAngle = extractFacingAngle(b.tags, b.geometry ?? b._ring ?? b.nodes);

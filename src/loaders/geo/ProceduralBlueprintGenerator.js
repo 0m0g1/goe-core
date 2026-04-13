@@ -850,7 +850,7 @@ export class ProceduralBlueprintGenerator {
         wr.submitShadow({
           p:       { x: entity.tx, y: entity.ty },
           elev,
-          r:       shadowR,
+          r:       Math.min(shadowR, (entity._geometricR ?? geomR) * VU * 0.5),
           engineH: heightVU,
         });
 
