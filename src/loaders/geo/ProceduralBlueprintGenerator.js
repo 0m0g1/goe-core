@@ -638,19 +638,20 @@ export function generateProceduralBlueprint(building, mPerTile) {
     });
   }
 
-  const decorate = (runs, faceDir, getWX, getWZ) => {
+  const decorate = (runs, faceDir, getWX, getWZ, getWZface) => {
     for (const [coord, vals] of runs) {
       const sorted = vals.slice().sort((a, b) => a - b);
       eachRun(sorted, (start, end) => {
-        const len = (end - start + 1) / RASTER_SCALE * VU;
-        const wx  = getWX(coord, start);
-        const wz  = getWZ(coord, start);
-        bpBoxes.push(...windowsForWall(wx, wz, len, 1.5, heightVU - 1, palette, faceDir, seed + coord));
-        bpBoxes.push(...corniceForWall(wx, wz, len, heightVU, palette, faceDir));
-        bpBoxes.push(...baseForWall(wx, wz, len, palette, faceDir));
+        const len  = (end - start + 1) / RASTER_SCALE * VU;
+        const wx   = getWX(coord, start);
+        const wz   = getWZ(coord, start);      // absolute blueprint Z for positioning
+        const wzf  = getWZface(coord, start);  // face-surface Z for window protrusion
+        bpBoxes.push(...windowsForWall(wx, wzf, len, 1.5, heightVU - 1, palette, faceDir, seed + coord));
+        bpBoxes.push(...corniceForWall(wx, wzf, len, heightVU, palette, faceDir));
+        bpBoxes.push(...baseForWall(wx, wzf, len, palette, faceDir));
         if (!doorPlaced && faceDir === 'front' && longestRun &&
             coord === longestRun.y && start === longestRun.start) {
-          bpBoxes.push(...doorForWall(wx, wz, len, heightVU, palette, faceDir));
+          bpBoxes.push(...doorForWall(wx, wzf, len, heightVU, palette, faceDir));
           doorPlaced = true;
         }
       });
@@ -658,21 +659,27 @@ export function generateProceduralBlueprint(building, mPerTile) {
   };
 
   decorate(frontRuns, 'front',
-    (y, start) => toVU(start, bbox.minX, totalScaledW),
-    (y, start) => toVU(y,     bbox.minY, totalScaledD) + cellVU
+    (y, start) => toVU(start, bbox.minX, centroidScaledX),
+    (y, start) => toVU(y,     bbox.minY, centroidScaledY),
+    (y, start) => toVU(y,     bbox.minY, centroidScaledY) + cellVU
   );
   decorate(backRuns, 'back',
-    (y, start) => toVU(start, bbox.minX, totalScaledW),
-    (y, start) => toVU(y,     bbox.minY, totalScaledD) - cellVU * 0.5
+    (y, start) => toVU(start, bbox.minX, centroidScaledX),
+    (y, start) => toVU(y,     bbox.minY, centroidScaledY),
+    (y, start) => toVU(y,     bbox.minY, centroidScaledY) - cellVU * 0.5
   );
   decorate(rightRuns, 'right',
-    (x, start) => toVU(x,     bbox.minX, totalScaledW) + cellVU,
-    (x, start) => toVU(start, bbox.minY, totalScaledD)
+    (x, start) => toVU(x,     bbox.minX, centroidScaledX),
+    (x, start) => toVU(start, bbox.minY, centroidScaledY),
+    (x, start) => toVU(x,     bbox.minX, centroidScaledX) + cellVU
   );
   decorate(leftRuns, 'left',
-    (x, start) => toVU(x,     bbox.minX, totalScaledW) - cellVU * 0.5,
-    (x, start) => toVU(start, bbox.minY, totalScaledD)
+    (x, start) => toVU(x,     bbox.minX, centroidScaledX),
+    (x, start) => toVU(start, bbox.minY, centroidScaledY),
+    (x, start) => toVU(x,     bbox.minX, centroidScaledX) - cellVU * 0.5
   );
+
+  
 
   // ── 5. Roof (per-row runs follow actual footprint shape) ─────────────────
   const roofStyle = selectRoofStyle(rawType, heightVU, areaM2, tags, seed);
