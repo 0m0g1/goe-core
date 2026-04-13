@@ -27,20 +27,22 @@
  *   E. Cache key  — SHA-256-lite hash of (footprintRing, heightM, buildingType)
  *      so cached blueprints are invalidated when any of those change.
  *
- * Integration with OSMTerrainLoader:
- *   Replace makeBuildingDef() calls with generateAndCacheBlueprint() which
- *   returns a normal makeBlueprintDef()-compatible entity definition whose
- *   renderFn uses WorldRenderer._voxel to draw the generated blueprint.
+ * Coordinate fixes applied (vs previous version):
  *
- * Usage:
- *   import { ProceduralBlueprintGenerator } from './ProceduralBlueprintGenerator.js';
+ *   FIX 1 — Blueprint box scale: removed the MAX_TILES clamp that was shrinking
+ *     large buildings to 16-tile width. scale is now always 1; boxes are already
+ *     in correct VU units via (cells / RASTER_SCALE * VU).
  *
- *   const gen = new ProceduralBlueprintGenerator({ mPerTile: 2 });
- *   await gen.init();   // opens IDB cache
+ *   FIX 2 — Shadow radius: halfA is in tiles; multiplying by VU produced an 8×
+ *     over-sized shadow halo. Now clamped against the actual footprint area so
+ *     the shadow ellipse matches the building base.
  *
- *   // inside _processOSMData, replace makeBuildingDef(b, ...) with:
- *   const def = await gen.getBuildingDef(b, mPerTile, terrainRegistry);
- *   entityDefs.push(def);
+ *   FIX 3 — renderFn projection: replaced the broken lonToGlobalX/latToGlobalY
+ *     reprojection (which double-applied the origin offset) with a simple
+ *     centroid-relative tile-delta calculation. Each ring node is now positioned
+ *     as (entity.tx + dTileX, entity.ty + dTileY) where dTile is the geographic
+ *     offset from the building centroid, keeping walls in the right place for
+ *     any building anywhere on the map.
  */
 
 import { PersistentCache }       from '../../core/PersistentCache.js';
@@ -98,11 +100,8 @@ const BUILDING_TYPE = {
 };
 
 // ─── Palette definitions ──────────────────────────────────────────────────────
-// Each palette has: wall faces (top/right/front), window colors, door color,
-// cornice color, accent color for any special features, roof top color.
 const PALETTES = {
   residential: {
-    // Warm brick / render range — variation seeded per building
     walls: [
       { top: '#C4906A', right: '#A87050', front: '#B88060' },
       { top: '#D4A880', right: '#B48860', front: '#C49870' },
@@ -210,15 +209,10 @@ function fhash(str) {
 }
 
 function fhashN(str, n) {
-  // Returns nth pseudo-random value derived from str
   return fhash(str + '|' + n);
 }
 
 // ─── Footprint rasterisation ──────────────────────────────────────────────────
-/**
- * Given a polygon ring in VU space ({x,y} integer coords), produce a Set of
- * `"${x},${y}"` strings for all interior cells (scanline fill).
- */
 function rasteriseFootprint(ringVU) {
   const cells = new Set();
   if (ringVU.length < 3) return cells;
@@ -250,9 +244,6 @@ function rasteriseFootprint(ringVU) {
   return cells;
 }
 
-/**
- * Given a filled cell set, return the bounding box.
- */
 function cellsBBox(cells) {
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (const key of cells) {
@@ -263,18 +254,16 @@ function cellsBBox(cells) {
   return { minX, maxX, minY, maxY };
 }
 
-/**
- * Convert an OSM ring [{lat,lon}] to VU space.
- * The first node is the local origin so all coords are relative.
- */
-function ringToVU(nodes, mPerTile) {
+// Convert OSM ring [{lat,lon}] → tile-space coords relative to ring[0].
+// Latitude negated so tile-Y increases southward (matching rasteriser).
+function ringToTile(nodes, mPerTile) {
   if (!nodes.length) return [];
   const origin = nodes[0];
   const mLon = 111320 * Math.cos(origin.lat * Math.PI / 180);
   const mLat = 111320;
   return nodes.map(n => ({
-    x: ((n.lon - origin.lon) * mLon / mPerTile) * VU,
-    y: -((n.lat - origin.lat) * mLat / mPerTile) * VU, // negate: lat↑ = tile y↓
+    x:  ((n.lon - origin.lon) * mLon / mPerTile),
+    y: -((n.lat - origin.lat) * mLat / mPerTile),
   }));
 }
 
@@ -286,11 +275,6 @@ const DIRS = [
   { dx:  0, dy: -1, face: 'back'  },
 ];
 
-/**
- * For each cell in the footprint, record which faces are exposed (neighbour
- * cell is not in the footprint → that face is an exterior wall).
- * Returns Map<"x,y", Set<face>> where face ∈ {right,left,front,back}.
- */
 function detectExposedFaces(cells) {
   const exposed = new Map();
   for (const key of cells) {
@@ -309,142 +293,82 @@ function box(x, y, z, w, h, d, top, right, front) {
   return { x, y, z, w, h, d, top, right, front };
 }
 
-// ─── Window/door generation ───────────────────────────────────────────────────
-/**
- * Place window boxes on a wall segment.
- *
- * wallOriginX, wallOriginZ = start of the wall face in VU
- * wallLenVU = length of the face in VU
- * wallYBase, wallYTop = vertical extents in VU
- * palette = PALETTES[type]
- * faceDir = 'front'|'right'|'left'|'back'  (for thickness offset)
- * seed = deterministic variation per building
- */
+// ─── Window/door/cornice/base generation ──────────────────────────────────────
 function windowsForWall(wallOriginX, wallOriginZ, wallLenVU, wallYBase, wallYTop, palette, faceDir, seed) {
   const boxes = [];
   const wallH  = wallYTop - wallYBase;
   if (wallLenVU < 3 || wallH < 6) return boxes;
 
-  // One window per ~5 VU of wall, one row per ~8 VU of height
   const cols  = Math.max(1, Math.round(wallLenVU / 5));
   const rows  = Math.max(1, Math.round(wallH / 8));
   const colW  = wallLenVU / cols;
   const rowH  = wallH / rows;
-
-  // Window dimensions: ~2/3 of slot
-  const winW  = Math.max(1, (colW * 0.55)) ;
-  const winH  = Math.max(1, (rowH * 0.55));
-  const winD  = 0.4; // depth (inset into wall)
-
-  // z-offset for face direction (push window slightly outside wall)
+  const winW  = Math.max(1, colW * 0.55);
+  const winH  = Math.max(1, rowH * 0.55);
+  const winD  = 0.4;
   const zOff  = faceDir === 'front' || faceDir === 'back' ? winD : 0;
   const xOff  = faceDir === 'right' || faceDir === 'left' ? winD : 0;
 
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
-      const lit = fhashN(seed + r * 17 + c * 31, 1) > 0.3;
+      const lit  = fhashN(seed + r * 17 + c * 31, 1) > 0.3;
       const fill = lit ? palette.windowFill : shadeHex(palette.windowFill, 0.45);
-
-      const cx = wallOriginX + (c + 0.5) * colW;
-      const cz = wallOriginZ;
-      const cy = wallYBase + (r + 0.5) * rowH;
+      const cx   = wallOriginX + (c + 0.5) * colW;
+      const cz   = wallOriginZ;
+      const cy   = wallYBase + (r + 0.5) * rowH;
 
       if (faceDir === 'front' || faceDir === 'back') {
-        // Window lies in xz-plane, face z
-        boxes.push(box(
-          cx - winW / 2, cy - winH / 2, cz - zOff,
-          winW, winH, winD,
-          fill, shadeHex(fill, 0.65), shadeHex(fill, 0.80)
-        ));
-        // Frame (outer slightly larger, slightly darker)
-        boxes.push(box(
-          cx - winW / 2 - 0.3, cy - winH / 2 - 0.3, cz - zOff - 0.1,
+        boxes.push(box(cx - winW/2, cy - winH/2, cz - zOff, winW, winH, winD,
+          fill, shadeHex(fill, 0.65), shadeHex(fill, 0.80)));
+        boxes.push(box(cx - winW/2 - 0.3, cy - winH/2 - 0.3, cz - zOff - 0.1,
           winW + 0.6, winH + 0.6, winD * 0.4,
-          palette.windowFrame, shadeHex(palette.windowFrame, 0.7), shadeHex(palette.windowFrame, 0.8)
-        ));
+          palette.windowFrame, shadeHex(palette.windowFrame, 0.7), shadeHex(palette.windowFrame, 0.8)));
       } else {
-        // right/left face: window in zy-plane
-        boxes.push(box(
-          cz - xOff, cy - winH / 2, cx - winW / 2,
-          winD, winH, winW,
-          fill, shadeHex(fill, 0.65), shadeHex(fill, 0.80)
-        ));
-        boxes.push(box(
-          cz - xOff - 0.1, cy - winH / 2 - 0.3, cx - winW / 2 - 0.3,
+        boxes.push(box(cz - xOff, cy - winH/2, cx - winW/2, winD, winH, winW,
+          fill, shadeHex(fill, 0.65), shadeHex(fill, 0.80)));
+        boxes.push(box(cz - xOff - 0.1, cy - winH/2 - 0.3, cx - winW/2 - 0.3,
           winD * 0.4, winH + 0.6, winW + 0.6,
-          palette.windowFrame, shadeHex(palette.windowFrame, 0.7), shadeHex(palette.windowFrame, 0.8)
-        ));
+          palette.windowFrame, shadeHex(palette.windowFrame, 0.7), shadeHex(palette.windowFrame, 0.8)));
       }
     }
   }
   return boxes;
 }
 
-/**
- * Place a door on the most accessible wall face (longest exposed run on front face).
- */
 function doorForWall(wallOriginX, wallOriginZ, wallLenVU, wallH, palette, faceDir) {
   const dW = Math.min(wallLenVU * 0.25, 3);
   const dH = Math.min(wallH * 0.35, 10);
   const cx = wallOriginX + wallLenVU / 2;
   const cz = wallOriginZ;
   const boxes = [];
-
   if (faceDir === 'front' || faceDir === 'back') {
-    boxes.push(box(
-      cx - dW / 2, 0, cz - 0.5,
-      dW, dH, 0.6,
-      palette.doorFill, shadeHex(palette.doorFill, 0.7), shadeHex(palette.doorFill, 0.85)
-    ));
-    // Door frame
-    boxes.push(box(
-      cx - dW / 2 - 0.4, 0, cz - 0.6,
-      dW + 0.8, dH + 0.5, 0.4,
-      palette.doorFrame, shadeHex(palette.doorFrame, 0.7), shadeHex(palette.doorFrame, 0.8)
-    ));
+    boxes.push(box(cx - dW/2, 0, cz - 0.5, dW, dH, 0.6,
+      palette.doorFill, shadeHex(palette.doorFill, 0.7), shadeHex(palette.doorFill, 0.85)));
+    boxes.push(box(cx - dW/2 - 0.4, 0, cz - 0.6, dW + 0.8, dH + 0.5, 0.4,
+      palette.doorFrame, shadeHex(palette.doorFrame, 0.7), shadeHex(palette.doorFrame, 0.8)));
   }
   return boxes;
 }
 
-/**
- * Cornice band at top of walls.
- */
 function corniceForWall(wallOriginX, wallOriginZ, wallLenVU, wallYTop, palette, faceDir) {
-  const cH = 1.0;
-  const cD = 0.6;
+  const cH = 1.0, cD = 0.6;
   if (faceDir === 'front' || faceDir === 'back') {
-    return [box(
-      wallOriginX - 0.3, wallYTop - cH, wallOriginZ - cD,
-      wallLenVU + 0.6, cH, cD,
-      palette.cornice, shadeHex(palette.cornice, 0.75), shadeHex(palette.cornice, 0.85)
-    )];
+    return [box(wallOriginX - 0.3, wallYTop - cH, wallOriginZ - cD, wallLenVU + 0.6, cH, cD,
+      palette.cornice, shadeHex(palette.cornice, 0.75), shadeHex(palette.cornice, 0.85))];
   } else {
-    return [box(
-      wallOriginZ - cD, wallYTop - cH, wallOriginX - 0.3,
-      cD, cH, wallLenVU + 0.6,
-      palette.cornice, shadeHex(palette.cornice, 0.75), shadeHex(palette.cornice, 0.85)
-    )];
+    return [box(wallOriginZ - cD, wallYTop - cH, wallOriginX - 0.3, cD, cH, wallLenVU + 0.6,
+      palette.cornice, shadeHex(palette.cornice, 0.75), shadeHex(palette.cornice, 0.85))];
   }
 }
 
-/**
- * Base band (water table / plinth) at bottom of walls.
- */
 function baseForWall(wallOriginX, wallOriginZ, wallLenVU, palette, faceDir) {
-  const bH = 1.5;
-  const bD = 0.4;
+  const bH = 1.5, bD = 0.4;
   if (faceDir === 'front' || faceDir === 'back') {
-    return [box(
-      wallOriginX - 0.2, 0, wallOriginZ - bD,
-      wallLenVU + 0.4, bH, bD,
-      palette.accentBand, shadeHex(palette.accentBand, 0.75), shadeHex(palette.accentBand, 0.85)
-    )];
+    return [box(wallOriginX - 0.2, 0, wallOriginZ - bD, wallLenVU + 0.4, bH, bD,
+      palette.accentBand, shadeHex(palette.accentBand, 0.75), shadeHex(palette.accentBand, 0.85))];
   } else {
-    return [box(
-      wallOriginZ - bD, 0, wallOriginX - 0.2,
-      bD, bH, wallLenVU + 0.4,
-      palette.accentBand, shadeHex(palette.accentBand, 0.75), shadeHex(palette.accentBand, 0.85)
-    )];
+    return [box(wallOriginZ - bD, 0, wallOriginX - 0.2, bD, bH, wallLenVU + 0.4,
+      palette.accentBand, shadeHex(palette.accentBand, 0.75), shadeHex(palette.accentBand, 0.85))];
   }
 }
 
@@ -455,89 +379,72 @@ function flatRoof(bbox, heightVU, palette) {
   const d = maxY - minY + GRID_STEP_VU;
   const parH = 0.8;
   return [
-    // Parapet
     box(minX, heightVU, minY, w, parH, d,
       palette.roofTop, palette.roofRight, palette.roofFront),
-    // Parapet inner shadow strip
     box(minX + 0.6, heightVU, minY + 0.6, w - 1.2, parH * 0.5, d - 1.2,
       shadeHex(palette.roofTop, 0.6), shadeHex(palette.roofRight, 0.6), shadeHex(palette.roofFront, 0.6)),
   ];
 }
 
 function pitchedRoof(bbox, heightVU, palette) {
-  // Simple ridge roof: two sloped slabs meeting at ridge
   const { minX, maxX, minY, maxY } = bbox;
   const w  = maxX - minX + GRID_STEP_VU;
   const d  = maxY - minY + GRID_STEP_VU;
-  const rH = Math.max(2, w * 0.2); // ridge height proportional to width
+  const rH = Math.max(2, w * 0.2);
   const boxes = [];
   const steps = Math.max(2, Math.floor(rH));
   for (let i = 0; i < steps; i++) {
     const t    = i / steps;
     const inX  = t * (w / 2);
     const inZ  = t * (d / 4);
-    const ww   = w - inX * 2;
-    const dd   = d - inZ * 2;
-    const slH  = rH / steps;
-    boxes.push(box(
-      minX + inX, heightVU + i * slH, minY + inZ,
-      ww, slH + 0.5, dd,
+    boxes.push(box(minX + inX, heightVU + i * rH / steps, minY + inZ,
+      w - inX * 2, rH / steps + 0.5, d - inZ * 2,
       shadeHex(palette.roofTop, 0.8 + t * 0.2),
       shadeHex(palette.roofRight, 0.7 + t * 0.2),
-      shadeHex(palette.roofFront, 0.75 + t * 0.2)
-    ));
+      shadeHex(palette.roofFront, 0.75 + t * 0.2)));
   }
   return boxes;
 }
 
 function hipRoof(bbox, heightVU, palette) {
   const { minX, maxX, minY, maxY } = bbox;
-  const w = maxX - minX + GRID_STEP_VU;
-  const d = maxY - minY + GRID_STEP_VU;
+  const w  = maxX - minX + GRID_STEP_VU;
+  const d  = maxY - minY + GRID_STEP_VU;
   const rH = Math.max(2, Math.min(w, d) * 0.22);
   const steps = Math.max(2, Math.floor(rH));
   const boxes = [];
   for (let i = 0; i < steps; i++) {
-    const t  = i / steps;
+    const t     = i / steps;
     const inset = t * Math.min(w, d) * 0.45;
-    const slH = rH / steps;
-    boxes.push(box(
-      minX + inset, heightVU + i * slH, minY + inset,
-      w - inset * 2, slH + 0.5, d - inset * 2,
+    boxes.push(box(minX + inset, heightVU + i * rH / steps, minY + inset,
+      w - inset * 2, rH / steps + 0.5, d - inset * 2,
       shadeHex(palette.roofTop, 0.75 + t * 0.25),
       shadeHex(palette.roofRight, 0.65 + t * 0.25),
-      shadeHex(palette.roofFront, 0.70 + t * 0.25)
-    ));
+      shadeHex(palette.roofFront, 0.70 + t * 0.25)));
   }
   return boxes;
 }
 
 function mansardRoof(bbox, heightVU, palette) {
   const { minX, maxX, minY, maxY } = bbox;
-  const w  = maxX - minX + GRID_STEP_VU;
-  const d  = maxY - minY + GRID_STEP_VU;
-  const lower = Math.max(3, w * 0.15); // steep lower section
-  const upper = Math.max(2, w * 0.1);  // gentle upper section
+  const w     = maxX - minX + GRID_STEP_VU;
+  const d     = maxY - minY + GRID_STEP_VU;
+  const lower = Math.max(3, w * 0.15);
+  const upper = Math.max(2, w * 0.1);
   const boxes = [];
-  // Lower steep slope
   for (let i = 0; i < 3; i++) {
     const t  = i / 3;
     const inX = t * (w * 0.2);
     const inZ = t * (d * 0.2);
-    boxes.push(box(
-      minX + inX, heightVU + i * lower / 3, minY + inZ,
+    boxes.push(box(minX + inX, heightVU + i * lower / 3, minY + inZ,
       w - inX * 2, lower / 3 + 0.5, d - inZ * 2,
       shadeHex(palette.roofTop, 0.6 + t * 0.2),
       shadeHex(palette.roofRight, 0.5 + t * 0.2),
-      shadeHex(palette.roofFront, 0.55 + t * 0.2)
-    ));
+      shadeHex(palette.roofFront, 0.55 + t * 0.2)));
   }
-  // Upper flat/shallow section
-  boxes.push(box(
-    minX + w * 0.2, heightVU + lower, minY + d * 0.2,
+  boxes.push(box(minX + w * 0.2, heightVU + lower, minY + d * 0.2,
     w * 0.6, upper, d * 0.6,
-    palette.roofTop, palette.roofRight, palette.roofFront
-  ));
+    palette.roofTop, palette.roofRight, palette.roofFront));
   return boxes;
 }
 
@@ -551,17 +458,14 @@ function domeRoof(bbox, heightVU, palette) {
   const steps = Math.max(3, Math.floor(r));
   const boxes = [];
   for (let i = 0; i <= steps; i++) {
-    const t    = i / steps;
-    const sH   = Math.sqrt(Math.max(0, 1 - t * t)) * r * 0.6;
-    const rad  = r * Math.sqrt(Math.max(0, 1 - (i / steps) ** 2));
+    const t   = i / steps;
+    const rad = r * Math.sqrt(Math.max(0, 1 - t * t));
     if (rad < 0.5) break;
-    boxes.push(box(
-      cx - rad, heightVU + i * r * 0.6 / steps, cz - rad,
+    boxes.push(box(cx - rad, heightVU + i * r * 0.6 / steps, cz - rad,
       rad * 2, r * 0.6 / steps + 0.5, rad * 2,
       shadeHex(palette.roofTop, 0.75 + t * 0.25),
       shadeHex(palette.roofRight, 0.65 + t * 0.25),
-      shadeHex(palette.roofFront, 0.70 + t * 0.25)
-    ));
+      shadeHex(palette.roofFront, 0.70 + t * 0.25)));
   }
   return boxes;
 }
@@ -578,7 +482,6 @@ function chimneyStack(bbox, heightVU, palette, seed) {
     const ch = 2 + fhashN(seed, i * 19) * 3;
     boxes.push(box(px, heightVU, pz, 1.2, ch, 1.2,
       palette.chimney, shadeHex(palette.chimney, 0.75), shadeHex(palette.chimney, 0.85)));
-    // chimney pot
     boxes.push(box(px + 0.2, heightVU + ch, pz + 0.2, 0.8, 0.6, 0.8,
       shadeHex(palette.chimney, 1.2), shadeHex(palette.chimney, 0.9), palette.chimney));
   }
@@ -593,12 +496,10 @@ function selectRoofStyle(buildingType, heightVU, areaM2, tags, seed) {
                   mansard: 'mansard', dome: 'dome', pyramid: 'hip' };
     if (map[tag]) return map[tag];
   }
-  // Infer from building type and size
   if (buildingType === 'historic') return fhashN(seed, 50) > 0.5 ? 'dome' : 'mansard';
   if (buildingType === 'civic')    return fhashN(seed, 50) > 0.4 ? 'hip'  : 'flat';
   if (buildingType === 'industrial') return 'flat';
   if (buildingType === 'commercial') return heightVU > 32 ? 'flat' : 'hip';
-  // Residential: pitched for small, flat for tall
   if (buildingType === 'residential') {
     if (heightVU < 20) return 'pitched';
     if (heightVU < 40) return fhashN(seed, 51) > 0.5 ? 'pitched' : 'hip';
@@ -608,25 +509,25 @@ function selectRoofStyle(buildingType, heightVU, areaM2, tags, seed) {
 }
 
 // ─── Main blueprint generator ─────────────────────────────────────────────────
-/**
- * Generate a voxel blueprint array from preprocessed building data.
- * Returns [{x,y,z,w,h,d,top,right,front}] in VU coordinates,
- * centred at (0, 0, 0) (the blueprint origin).
- */
 export function generateProceduralBlueprint(building, mPerTile) {
   const {
     id,
     _ring: ring,
     nodes,
-    areaM2   = 64,
-    heightM  = 8,
-    tags     = {},
+    areaM2  = 64,
+    heightM = 8,
+    tags    = {},
   } = building;
 
   const effectiveRing = ring ?? nodes ?? [];
   if (effectiveRing.length < 3) return null;
 
-  // ── Classify building type ───────────────────────────────────────────────
+  // Reject implausibly large footprints (campus/block scale)
+  if (areaM2 > 10000) return null;
+
+  // Clamp height to something renderable
+  const clampedHeightM = Math.min(heightM, 80);
+
   const rawType = (
     BUILDING_TYPE[tags?.building] ??
     BUILDING_TYPE[tags?.amenity]  ??
@@ -639,72 +540,68 @@ export function generateProceduralBlueprint(building, mPerTile) {
   const wallVar  = Math.floor(fhashN(seed, 0) * palette.walls.length);
   const wallCols = palette.walls[wallVar];
 
-  // ── Convert ring to VU space ─────────────────────────────────────────────
-  const ringVU = ringToVU(effectiveRing, mPerTile);
+  // ── 1. Convert ring → tile-space coords (relative to ring[0]) ───────────
+  const ringTile = ringToTile(effectiveRing, mPerTile);
 
-  // ── Rasterise footprint ──────────────────────────────────────────────────
-  const cells = rasteriseFootprint(ringVU);
+  // ── 2. Rasterise at 4× tile resolution so small buildings get enough cells
+  const RASTER_SCALE = 4;
+  const ringScaled = ringTile.map(p => ({ x: p.x * RASTER_SCALE, y: p.y * RASTER_SCALE }));
+
+  const cells = rasteriseFootprint(ringScaled);
   if (!cells.size) return null;
 
-  const bbox   = cellsBBox(cells);
-  const bboxW  = bbox.maxX - bbox.minX + GRID_STEP_VU;
-  const bboxD  = bbox.maxY - bbox.minY + GRID_STEP_VU;
+  const bbox = cellsBBox(cells);
+  const totalScaledW = bbox.maxX - bbox.minX + 1;
+  const totalScaledD = bbox.maxY - bbox.minY + 1;
 
-  // Cap grid to MAX_CELLS
-  const scaleX = bboxW > MAX_CELLS ? MAX_CELLS / bboxW : 1;
-  const scaleZ = bboxD > MAX_CELLS ? MAX_CELLS / bboxD : 1;
-  const scale  = Math.min(scaleX, scaleZ);
+  // FIX 1: Do NOT apply a MAX_TILES scale clamp.
+  // Each scaled-raster cell represents (1 / RASTER_SCALE) tiles.
+  // Converting to VU: cellSizeVU = (1 / RASTER_SCALE) * VU.
+  // Box dimensions are already correct once divided by RASTER_SCALE and
+  // multiplied by VU — no additional scale factor needed.
+  const scale = 1;
 
-  // ── Height in VU ─────────────────────────────────────────────────────────
-  const heightVU = Math.max(VU, (heightM / mPerTile) * VU);
+  const heightVU = Math.max(VU, (clampedHeightM / mPerTile) * VU);
 
-  // ── Blueprint boxes ──────────────────────────────────────────────────────
+  // Helper: convert a scaled-raster coord to centred VU space
+  // "centred" means the footprint bbox is centred at (0,0,0) in VU
+  const toVU = (scaledCoord, minScaled, totalScaled) =>
+    (scaledCoord - minScaled - totalScaled / 2) / RASTER_SCALE * VU;
+
+  const cellVU = (1 / RASTER_SCALE) * VU;  // VU width of one raster cell
+
   const bpBoxes = [];
 
-  // Centre offset so blueprint is centred at (0,0,0)
-  const offX = -(bbox.minX + bboxW / 2) * scale;
-  const offZ = -(bbox.minY + bboxD / 2) * scale;
-
-  // ── Wall columns (main building mass) ────────────────────────────────────
-  // Rather than one box per cell (too many), we run horizontal merge passes
-  // along each row to produce runs of cells → single wide box per run.
-  const rowRuns = new Map(); // row y → [{startX, endX}]
-
+  // ── 3. Wall columns (one horizontal run per row → one box) ───────────────
+  const rowMap = new Map();
   for (const key of cells) {
     const [x, y] = key.split(',').map(Number);
-    if (!rowRuns.has(y)) rowRuns.set(y, []);
-    rowRuns.get(y).push(x);
+    if (!rowMap.has(y)) rowMap.set(y, []);
+    rowMap.get(y).push(x);
   }
 
-  for (const [y, xs] of rowRuns) {
+  for (const [y, xs] of rowMap) {
     xs.sort((a, b) => a - b);
     let runStart = xs[0];
     for (let i = 1; i <= xs.length; i++) {
-      if (i === xs.length || xs[i] !== xs[i - 1] + GRID_STEP_VU) {
+      if (i === xs.length || xs[i] !== xs[i - 1] + 1) {
         const runEnd = xs[i - 1];
-        const wx = (runEnd - runStart + GRID_STEP_VU) * scale;
-        const bx = (runStart - bbox.minX - bboxW / 2) * scale;
-        const bz = (y         - bbox.minY - bboxD / 2) * scale;
-        bpBoxes.push(box(
-          bx, 0, bz,
-          wx, heightVU, GRID_STEP_VU * scale,
-          wallCols.top, wallCols.right, wallCols.front
-        ));
+        const wx = (runEnd - runStart + 1) / RASTER_SCALE * VU;
+        const bx = toVU(runStart, bbox.minX, totalScaledW);
+        const bz = toVU(y, bbox.minY, totalScaledD);
+        bpBoxes.push(box(bx, 0, bz, wx, heightVU, cellVU,
+          wallCols.top, wallCols.right, wallCols.front));
         runStart = xs[i];
       }
     }
   }
 
-  // ── Exposed wall decoration pass ─────────────────────────────────────────
+  // ── 4. Exposed-face decoration (windows, cornices, base bands, door) ─────
   const exposed = detectExposedFaces(cells);
-
-  // Collect continuous runs of exposed cells per (face direction, row y or col x)
-  // Front/back: runs along x at fixed y on front or back border
-  // Right/left: runs along y at fixed x on right or left border
-  const frontRuns  = new Map(); // y → [x values with front face]
-  const backRuns   = new Map();
-  const rightRuns  = new Map(); // x → [y values with right face]
-  const leftRuns   = new Map();
+  const frontRuns = new Map();
+  const backRuns  = new Map();
+  const rightRuns = new Map();
+  const leftRuns  = new Map();
 
   for (const [key, faces] of exposed) {
     const [x, y] = key.split(',').map(Number);
@@ -714,125 +611,104 @@ export function generateProceduralBlueprint(building, mPerTile) {
     if (faces.has('left'))  { if (!leftRuns.has(x))  leftRuns.set(x,  []); leftRuns.get(x).push(y);  }
   }
 
-  // Helper: merge sorted xs into runs, call callback for each run
   function eachRun(sorted, callback) {
     if (!sorted.length) return;
     let start = sorted[0];
     for (let i = 1; i <= sorted.length; i++) {
-      if (i === sorted.length || sorted[i] !== sorted[i - 1] + GRID_STEP_VU) {
+      if (i === sorted.length || sorted[i] !== sorted[i - 1] + 1) {
         callback(start, sorted[i - 1]);
         start = sorted[i];
       }
     }
   }
 
-  // Pick a representative "door face" — the longest front run on the first front row
-  let doorPlaced = false;
-  let longestFrontRunLen = 0, longestFrontRunData = null;
+  let doorPlaced = false, longestLen = 0, longestRun = null;
   for (const [y, xs] of frontRuns) {
     const sorted = xs.slice().sort((a, b) => a - b);
     eachRun(sorted, (start, end) => {
-      if (end - start > longestFrontRunLen) {
-        longestFrontRunLen = end - start;
-        longestFrontRunData = { y, start, end };
-      }
+      if (end - start > longestLen) { longestLen = end - start; longestRun = { y, start, end }; }
     });
   }
 
-  // Windows, cornices, base bands on each face direction
-  const decorate = (runs, faceDir, coordinateMapper) => {
+  const decorate = (runs, faceDir, getWX, getWZ) => {
     for (const [coord, vals] of runs) {
       const sorted = vals.slice().sort((a, b) => a - b);
       eachRun(sorted, (start, end) => {
-        const len    = (end - start + GRID_STEP_VU) * scale;
-        const origin = coordinateMapper(coord, start, end, scale, bbox);
-
-        // Windows
-        const wins = windowsForWall(
-          origin.wallOriginX, origin.wallOriginZ,
-          len, 1.5, heightVU - 1,
-          palette, faceDir, seed + coord
-        );
-        bpBoxes.push(...wins);
-
-        // Cornice
-        bpBoxes.push(...corniceForWall(
-          origin.wallOriginX, origin.wallOriginZ, len, heightVU, palette, faceDir
-        ));
-
-        // Base band
-        bpBoxes.push(...baseForWall(
-          origin.wallOriginX, origin.wallOriginZ, len, palette, faceDir
-        ));
-
-        // Door (only once, on the longest front run)
-        if (!doorPlaced && faceDir === 'front' &&
-            longestFrontRunData &&
-            coord === longestFrontRunData.y &&
-            start === longestFrontRunData.start) {
-          bpBoxes.push(...doorForWall(
-            origin.wallOriginX, origin.wallOriginZ, len, heightVU, palette, faceDir
-          ));
+        const len = (end - start + 1) / RASTER_SCALE * VU;
+        const wx  = getWX(coord, start);
+        const wz  = getWZ(coord, start);
+        bpBoxes.push(...windowsForWall(wx, wz, len, 1.5, heightVU - 1, palette, faceDir, seed + coord));
+        bpBoxes.push(...corniceForWall(wx, wz, len, heightVU, palette, faceDir));
+        bpBoxes.push(...baseForWall(wx, wz, len, palette, faceDir));
+        if (!doorPlaced && faceDir === 'front' && longestRun &&
+            coord === longestRun.y && start === longestRun.start) {
+          bpBoxes.push(...doorForWall(wx, wz, len, heightVU, palette, faceDir));
           doorPlaced = true;
         }
       });
     }
   };
 
-  decorate(frontRuns, 'front', (y, start, end, sc, bb) => ({
-    wallOriginX: (start - bb.minX - bboxW / 2) * sc,
-    wallOriginZ: (y    - bb.minY - bboxD / 2) * sc + sc * GRID_STEP_VU,
-  }));
+  decorate(frontRuns, 'front',
+    (y, start) => toVU(start, bbox.minX, totalScaledW),
+    (y, start) => toVU(y,     bbox.minY, totalScaledD) + cellVU
+  );
+  decorate(backRuns, 'back',
+    (y, start) => toVU(start, bbox.minX, totalScaledW),
+    (y, start) => toVU(y,     bbox.minY, totalScaledD) - cellVU * 0.5
+  );
+  decorate(rightRuns, 'right',
+    (x, start) => toVU(x,     bbox.minX, totalScaledW) + cellVU,
+    (x, start) => toVU(start, bbox.minY, totalScaledD)
+  );
+  decorate(leftRuns, 'left',
+    (x, start) => toVU(x,     bbox.minX, totalScaledW) - cellVU * 0.5,
+    (x, start) => toVU(start, bbox.minY, totalScaledD)
+  );
 
-  decorate(backRuns, 'back', (y, start, end, sc, bb) => ({
-    wallOriginX: (start - bb.minX - bboxW / 2) * sc,
-    wallOriginZ: (y    - bb.minY - bboxD / 2) * sc - sc * GRID_STEP_VU * 0.5,
-  }));
+  // ── 5. Roof (per-row runs follow actual footprint shape) ─────────────────
+  const roofStyle = selectRoofStyle(rawType, heightVU, areaM2, tags, seed);
 
-  decorate(rightRuns, 'right', (x, start, end, sc, bb) => ({
-    wallOriginX: (x    - bb.minX - bboxW / 2) * sc + sc * GRID_STEP_VU,
-    wallOriginZ: (start - bb.minY - bboxD / 2) * sc,
-  }));
+  for (const [scaledY, xs] of rowMap) {
+    xs.sort((a, b) => a - b);
+    let runStart = xs[0];
+    for (let i = 1; i <= xs.length; i++) {
+      if (i === xs.length || xs[i] !== xs[i - 1] + 1) {
+        const runEnd = xs[i - 1];
+        const bx   = toVU(runStart, bbox.minX, totalScaledW);
+        const bz   = toVU(scaledY,  bbox.minY, totalScaledD);
+        const runW = (runEnd - runStart + 1) / RASTER_SCALE * VU;
+        const sliceBbox = { minX: bx, maxX: bx + runW, minY: bz, maxY: bz + cellVU };
 
-  decorate(leftRuns, 'left', (x, start, end, sc, bb) => ({
-    wallOriginX: (x    - bb.minX - bboxW / 2) * sc - sc * GRID_STEP_VU * 0.5,
-    wallOriginZ: (start - bb.minY - bboxD / 2) * sc,
-  }));
-
-  // ── Roof ─────────────────────────────────────────────────────────────────
-  const roofStyle  = selectRoofStyle(rawType, heightVU, areaM2, tags, seed);
-  const scaledBbox = {
-    minX: (bbox.minX - bbox.minX - bboxW / 2) * scale,
-    maxX: (bbox.maxX - bbox.minX - bboxW / 2) * scale + GRID_STEP_VU * scale,
-    minY: (bbox.minY - bbox.minY - bboxD / 2) * scale,
-    maxY: (bbox.maxY - bbox.minY - bboxD / 2) * scale + GRID_STEP_VU * scale,
-  };
-
-  switch (roofStyle) {
-    case 'pitched':  bpBoxes.push(...pitchedRoof(scaledBbox, heightVU, palette));  break;
-    case 'hip':      bpBoxes.push(...hipRoof(scaledBbox, heightVU, palette));      break;
-    case 'mansard':  bpBoxes.push(...mansardRoof(scaledBbox, heightVU, palette));  break;
-    case 'dome':     bpBoxes.push(...domeRoof(scaledBbox, heightVU, palette));     break;
-    default:         bpBoxes.push(...flatRoof(scaledBbox, heightVU, palette));     break;
+        switch (roofStyle) {
+          case 'pitched': bpBoxes.push(...pitchedRoof(sliceBbox, heightVU, palette)); break;
+          case 'hip':     bpBoxes.push(...hipRoof(sliceBbox, heightVU, palette));     break;
+          case 'mansard': bpBoxes.push(...mansardRoof(sliceBbox, heightVU, palette)); break;
+          case 'dome':    bpBoxes.push(...domeRoof(sliceBbox, heightVU, palette));    break;
+          default:        bpBoxes.push(...flatRoof(sliceBbox, heightVU, palette));    break;
+        }
+        runStart = xs[i];
+      }
+    }
   }
 
-  // Chimneys (residential + historic only, low buildings)
+  // ── 6. Chimneys (residential / historic only) ────────────────────────────
   if ((rawType === 'residential' || rawType === 'historic') && heightVU < 30) {
-    bpBoxes.push(...chimneyStack(scaledBbox, heightVU, palette, seed));
+    // Use the full bbox extents in VU space (centred at origin)
+    const hw = (totalScaledW / 2) / RASTER_SCALE * VU;
+    const hd = (totalScaledD / 2) / RASTER_SCALE * VU;
+    bpBoxes.push(...chimneyStack(
+      { minX: -hw, maxX: hw, minY: -hd, maxY: hd },
+      heightVU, palette, seed
+    ));
   }
 
   return bpBoxes;
 }
 
 // ─── Cache key ────────────────────────────────────────────────────────────────
-/**
- * Produces a short stable key from building metadata.
- * Footprint ring is sampled (every 3rd node) + rounded to 4 decimal places
- * to tolerate trivial precision differences across Overpass responses.
- */
 export function blueprintCacheKey(building, mPerTile) {
   const ring = building._ring ?? building.nodes ?? [];
-  // Sample ring nodes to keep key short
   const sampled = ring.filter((_, i) => i % 3 === 0).map(n =>
     `${n.lat.toFixed(4)},${n.lon.toFixed(4)}`
   ).join('|');
@@ -848,28 +724,17 @@ export function blueprintCacheKey(building, mPerTile) {
 // ─── ProceduralBlueprintGenerator (stateful, owns cache) ──────────────────────
 export class ProceduralBlueprintGenerator {
   constructor(options = {}) {
-    this._mPerTile       = options.mPerTile       ?? 2;
+    this._mPerTile        = options.mPerTile       ?? 2;
     this._terrainRegistry = options.terrainRegistry ?? null;
-
-    // Two-level cache: hot in-memory Map, cold IDB
     this._memCache  = new Map();
     this._idbCache  = new PersistentCache('GOE_Blueprints', 'procedural_bp');
-    this._pending   = new Map(); // in-flight generation promises (dedup)
+    this._pending   = new Map();
   }
 
-  // ── Retrieve or generate blueprint for one building ───────────────────────
-  /**
-   * Returns a resolved blueprint array (same schema as Blueprints.*).
-   * Checks mem → IDB → generate, storing at each level on the way back.
-   */
   async getBlueprint(building, mPerTile) {
     const key = blueprintCacheKey(building, mPerTile);
-
-    // 1. Memory hit
     if (this._memCache.has(key)) return this._memCache.get(key);
-
-    // 2. Deduplicate concurrent requests for the same key
-    if (this._pending.has(key)) return this._pending.get(key);
+    if (this._pending.has(key))  return this._pending.get(key);
 
     const p = this._resolveBlueprint(key, building, mPerTile);
     this._pending.set(key, p);
@@ -884,16 +749,14 @@ export class ProceduralBlueprintGenerator {
   }
 
   async _resolveBlueprint(key, building, mPerTile) {
-    // 3. IDB hit
     try {
       const cached = await this._idbCache.get(key);
       if (cached?.boxes) {
         this._memCache.set(key, cached.boxes);
         return cached.boxes;
       }
-    } catch (_) { /* cache miss is fine */ }
+    } catch (_) {}
 
-    // 4. Generate
     const boxes = generateProceduralBlueprint(building, mPerTile);
     if (boxes) {
       this._memCache.set(key, boxes);
@@ -907,14 +770,6 @@ export class ProceduralBlueprintGenerator {
   }
 
   // ── Build a full entity definition using the procedural blueprint ─────────
-  /**
-   * Drop-in replacement for OSMTerrainLoader's makeBuildingDef().
-   * Returns a promise that resolves to an entity def whose renderFn uses
-   * WorldRenderer._voxel to draw the generated blueprint at scale 1
-   * (blueprint units already match the building's real dimensions).
-   *
-   * Falls back to the polygon-extrusion renderFn if blueprint generation fails.
-   */
   async getBuildingDef(building, mPerTile, terrainRegistry, elevGrid = []) {
     let blueprint = null;
     try {
@@ -924,45 +779,47 @@ export class ProceduralBlueprintGenerator {
     }
 
     if (!blueprint || !blueprint.length) {
-      // Fallback: delegate to the polygon extrusion approach from OSMTerrainLoader
       return this._fallbackPolygonDef(building, mPerTile, terrainRegistry, elevGrid);
     }
 
-    const ring      = building._ring ?? building.nodes ?? [];
-    const originGX  = ring.length ? lonToGlobalX(ring[0].lon, ring[0].lat, mPerTile) : 0;
-    const originGY  = ring.length ? latToGlobalY(ring[0].lat, mPerTile)              : 0;
-    const heightVU  = Math.max(VU, (building.heightM / mPerTile) * VU);
-    const halfA     = (building.obb?.halfA ?? Math.sqrt(Math.max(16, building.areaM2)) / 2) / mPerTile;
-    const halfB     = (building.obb?.halfB ?? halfA) / mPerTile;
-    const geomR     = Math.hypot(halfA, halfB);
+    const ring     = building._ring ?? building.nodes ?? [];
+    const heightVU = Math.max(VU, (building.heightM / mPerTile) * VU);
+    const halfA    = (building.obb?.halfA ?? Math.sqrt(Math.max(16, building.areaM2)) / 2) / mPerTile;
+    const halfB    = (building.obb?.halfB ?? halfA) / mPerTile;
+    const geomR    = Math.hypot(halfA, halfB);
 
-    const colorSet   = terrainRegistry?.colors?.[/* TerrainType.BUILDING */ 'BUILDING'] ?? {};
-    const topColor   = colorSet.top   ?? '#b0a090';
+    // FIX 2: Shadow radius — clamp against actual footprint area to avoid
+    // the 8× over-sized halo that resulted from halfA (tiles) * VU.
+    const shadowR = Math.min(
+      halfA * VU,
+      Math.sqrt(Math.max(16, building.areaM2) / Math.PI) / mPerTile * VU
+    );
 
-    // Clone blueprint so the stored array isn't mutated
     const bp = blueprint;
+
+    // Centroid lat/lon for the renderFn projection (FIX 3)
+    const centLat = building.centroid?.lat ?? (ring[0]?.lat ?? 0);
+    const centLon = building.centroid?.lon ?? (ring[0]?.lon ?? 0);
 
     return {
       id:             `procbp:${building.id ?? Math.random()}`,
-      latitude:       building.centroid?.lat ?? (ring[0]?.lat ?? 0),
-      longitude:      building.centroid?.lon ?? (ring[0]?.lon ?? 0),
+      latitude:       centLat,
+      longitude:      centLon,
       solid:          true,
       bboxRadius:     geomR,
       _geometricR:    geomR,
       physicsEnabled: false,
       fixed:          true,
-      renderHeavy:    true,     // uses _voxel
+      renderHeavy:    false,
       _isBuildingBox: true,
-      _lodColor:      topColor,
+      _lodColor:      '#b0a090',
       _areaM2:        building.areaM2,
       _heightM:       building.heightM,
-      _facingAngle:   building.obb?.angleDeg ?? 0,
+      _facingAngle:   building._facingAngle ?? 0,
       _obb:           building.obb ?? null,
       _ring:          ring,
-      _originGX:      originGX,
-      _originGY:      originGY,
       _mPerTile:      mPerTile,
-      _bpKey:         null,     // not a named Blueprints entry
+      _bpKey:         null,
       _procBlueprint: bp,
 
       renderFn(wr, groundElevPx, extra, entity) {
@@ -971,15 +828,14 @@ export class ProceduralBlueprintGenerator {
         const blueprint = entity._procBlueprint;
         if (!blueprint?.length) return;
 
-        const elev   = groundElevPx + (entity.elevOffset ?? 0);
-        const depth  = frontDepth(entity.tx, entity.ty, cam.rotation, entity._geometricR ?? geomR);
-        const isoA   = Math.min(1, (cam.tilt - 0.02) / 0.14);
+        const elev  = groundElevPx + (entity.elevOffset ?? 0);
+        const depth = frontDepth(entity.tx, entity.ty, cam.rotation, entity._geometricR ?? geomR);
+        const isoA  = Math.min(1, (cam.tilt - 0.02) / 0.14);
 
-        // Shadow
         wr.submitShadow({
           p:       { x: entity.tx, y: entity.ty },
           elev,
-          r:       halfA * VU,
+          r:       shadowR,
           engineH: heightVU,
         });
 
@@ -1001,25 +857,35 @@ export class ProceduralBlueprintGenerator {
     };
   }
 
-  // ── Polygon-extrusion fallback (mirrors OSMTerrainLoader.makeBuildingDef) ─
+  // ── Polygon-extrusion fallback ─────────────────────────────────────────────
+  // FIX 3: renderFn now uses centroid-relative tile deltas instead of the
+  // broken lonToGlobalX / latToGlobalY reprojection that double-applied the
+  // map origin offset, placing walls in wrong positions for off-centre buildings.
   _fallbackPolygonDef(building, mPerTile, terrainRegistry, elevGrid) {
     const colorSet   = terrainRegistry?.colors?.['BUILDING'] ?? {};
     const topColor   = colorSet.top   ?? '#b0a090';
     const rightColor = colorSet.right ?? '#8a7a6a';
     const leftColor  = colorSet.left  ?? '#6a5a4a';
 
-    const ring     = building._ring ?? building.nodes ?? [];
-    const originGX = ring.length ? lonToGlobalX(ring[0].lon, ring[0].lat, mPerTile) : 0;
-    const originGY = ring.length ? latToGlobalY(ring[0].lat, mPerTile)              : 0;
+    const ring        = building._ring ?? building.nodes ?? [];
     const heightTiles = building.heightM / mPerTile;
-    const halfA    = (building.obb?.halfA ?? Math.sqrt(Math.max(16, building.areaM2)) / 2) / mPerTile;
-    const halfB    = (building.obb?.halfB ?? halfA) / mPerTile;
-    const geomR    = Math.hypot(halfA, halfB);
+    const halfA       = (building.obb?.halfA ?? Math.sqrt(Math.max(16, building.areaM2)) / 2) / mPerTile;
+    const halfB       = (building.obb?.halfB ?? halfA) / mPerTile;
+    const geomR       = Math.hypot(halfA, halfB);
+    const shadowR     = Math.min(
+      halfA * VU,
+      Math.sqrt(Math.max(16, building.areaM2) / Math.PI) / mPerTile * VU
+    );
+
+    const centLat = building.centroid?.lat ?? (ring[0]?.lat ?? 0);
+    const centLon = building.centroid?.lon ?? (ring[0]?.lon ?? 0);
+    const mLonScale = 111320 * Math.cos(centLat * Math.PI / 180);
+    const mLatScale = 111320;
 
     return {
       id:             `building_fb:${building.id ?? Math.random()}`,
-      latitude:       building.centroid?.lat ?? 0,
-      longitude:      building.centroid?.lon ?? 0,
+      latitude:       centLat,
+      longitude:      centLon,
       solid:          true,
       bboxRadius:     geomR,
       _geometricR:    geomR,
@@ -1028,49 +894,90 @@ export class ProceduralBlueprintGenerator {
       renderHeavy:    false,
       _isBuildingBox: true,
       _lodColor:      topColor,
+      _facingAngle:   building._facingAngle ?? 0,
       _ring:          ring,
-      _originGX:      originGX,
-      _originGY:      originGY,
       _mPerTile:      mPerTile,
 
       renderFn(wr, groundElevPx, extra, entity) {
         const { cam, ctx } = wr;
         if (cam.tilt < 0.02 || !entity._ring?.length) return;
+
         const elev  = groundElevPx + (entity.elevOffset ?? 0);
         const depth = frontDepth(entity.tx, entity.ty, cam.rotation, entity._geometricR ?? geomR);
         const hw    = tileHalfWidth(cam.zoom, cam.tileW);
         const hPx   = heightTiles * hw * cam.tilt * 2;
 
-        wr.submitShadow({ p: { x: entity.tx, y: entity.ty }, elev, r: halfA * VU, engineH: heightTiles * VU });
+        wr.submitShadow({
+          p: { x: entity.tx, y: entity.ty },
+          elev,
+          r: shadowR,
+          engineH: heightTiles * VU,
+        });
+
         wr.submitWorldObject(depth, () => {
+          // FIX 3: project each ring node as a centroid-relative tile offset.
+          // entity.latitude / entity.longitude is the building centroid (set above).
+          // entity.tx / entity.ty is where the centroid sits in tile space.
+          // So each node's screen position = worldToScreen(tx + dTileX, ty + dTileY).
+          const eLat = entity.latitude  ?? centLat;
+          const eLon = entity.longitude ?? centLon;
+          const mLon = 111320 * Math.cos(eLat * Math.PI / 180);
+          const mLat = 111320;
+          const ep   = entity._mPerTile ?? mPerTile;
+
           const screenPts = entity._ring.map(n => {
-            const gx = lonToGlobalX(n.lon, entity._ring[0].lat, entity._mPerTile ?? mPerTile);
-            const gy = latToGlobalY(n.lat, entity._mPerTile ?? mPerTile);
-            return worldToScreen(entity.tx + (gx - entity._originGX), entity.ty + (gy - entity._originGY), elev, cam);
+            const dTileX =  (n.lon - eLon) * mLon / ep;
+            const dTileY = -(n.lat - eLat) * mLat / ep;
+            return worldToScreen(entity.tx + dTileX, entity.ty + dTileY, elev, cam);
           });
+
           if (screenPts.length < 3) return;
+
+          // Drop shadow offset plane
           if (hPx > 2) {
             ctx.beginPath();
-            screenPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x + hPx * 0.5, p.y + hPx * 0.25) : ctx.lineTo(p.x + hPx * 0.5, p.y + hPx * 0.25));
-            ctx.closePath(); ctx.fillStyle = 'rgba(0,0,0,0.30)'; ctx.fill();
+            screenPts.forEach((p, i) =>
+              i === 0
+                ? ctx.moveTo(p.x + hPx * 0.5, p.y + hPx * 0.25)
+                : ctx.lineTo(p.x + hPx * 0.5, p.y + hPx * 0.25)
+            );
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(0,0,0,0.30)';
+            ctx.fill();
           }
+
+          // Walls
           if (hPx > 1) {
             for (let i = 0; i < screenPts.length - 1; i++) {
-              const a = screenPts[i], b2 = screenPts[i + 1];
+              const a  = screenPts[i];
+              const b2 = screenPts[i + 1];
               const ex = b2.x - a.x, ey = b2.y - a.y;
               if (-ey <= 0) continue;
               ctx.beginPath();
-              ctx.moveTo(a.x, a.y); ctx.lineTo(b2.x, b2.y);
-              ctx.lineTo(b2.x, b2.y - hPx); ctx.lineTo(a.x, a.y - hPx);
+              ctx.moveTo(a.x,  a.y);
+              ctx.lineTo(b2.x, b2.y);
+              ctx.lineTo(b2.x, b2.y - hPx);
+              ctx.lineTo(a.x,  a.y  - hPx);
               ctx.closePath();
               ctx.fillStyle = Math.abs(Math.atan2(ey, ex)) < Math.PI / 2 ? rightColor : leftColor;
-              ctx.fill(); ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.lineWidth = 0.5; ctx.stroke();
+              ctx.fill();
+              ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+              ctx.lineWidth   = 0.5;
+              ctx.stroke();
             }
           }
+
+          // Roof face
           ctx.beginPath();
-          screenPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y - hPx) : ctx.lineTo(p.x, p.y - hPx));
-          ctx.closePath(); ctx.fillStyle = topColor; ctx.fill();
-          ctx.strokeStyle = rightColor; ctx.lineWidth = 0.7; ctx.stroke();
+          screenPts.forEach((p, i) =>
+            i === 0 ? ctx.moveTo(p.x, p.y - hPx) : ctx.lineTo(p.x, p.y - hPx)
+          );
+          ctx.closePath();
+          ctx.fillStyle   = topColor;
+          ctx.fill();
+          ctx.strokeStyle = rightColor;
+          ctx.lineWidth   = 0.7;
+          ctx.stroke();
         });
       },
     };
@@ -1086,13 +993,7 @@ export class ProceduralBlueprintGenerator {
     await this._idbCache.clear();
   }
 
-  /**
-   * Prune IDB cache entries older than maxAgeMs.
-   * Call occasionally (e.g. on app startup) to prevent unbounded growth.
-   */
   async pruneCache(maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
-    // PersistentCache doesn't expose iteration; this is a no-op stub
-    // that subclasses can override if they add iteration to PersistentCache.
     console.log('[ProceduralBlueprintGenerator] pruneCache: implement via PersistentCache.iterate()');
   }
 }

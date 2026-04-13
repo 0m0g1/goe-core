@@ -35,6 +35,32 @@
  *   G. Blueprint landmark shadow and depth fixes from previous version retained.
  *
  *   H. Live entity cache retained (FIX C from previous version).
+ *
+ *   COORDINATE FIX (this version):
+ *      makeBuildingDef and makePolygonFeatureDef renderFns previously used
+ *      lonToGlobalX / latToGlobalY to re-project ring nodes, then added
+ *      (entity.tx - _originGX) as an offset. This double-applied the map
+ *      origin: entity.tx already encodes the building's tile position, so
+ *      subtracting _originGX shifted every node by the building's distance
+ *      from the map centre — placing walls in the wrong position for any
+ *      building not near the centre of the map.
+ *
+ *      Fix: each ring node is now positioned using a centroid-relative
+ *      geographic delta (dTileX, dTileY) added to entity.tx / entity.ty.
+ *      This is equivalent to projecting (centLon + Δlon, centLat + Δlat)
+ *      but avoids the global coordinate system entirely, so the origin
+ *      offset cannot be double-counted.
+ *
+ *   STREAMING UPDATE:
+ *      setPartialResultCallback() wires a callback from the engine. As data
+ *      arrives it is pushed immediately:
+ *        1. Terrain + roads + POIs + trees after Overpass responds (Pass 1-3).
+ *        2. Named landmarks individually (no async work needed).
+ *        3. Generic buildings in batches of BUILDING_BATCH_SIZE with a
+ *           setTimeout(0) yield between each batch so the render loop gets
+ *           frames while blueprints are generating.
+ *      The loader's fetch() promise still resolves with the complete entity
+ *      list so the engine can do stale-entity pruning.
  */
 import { BaseLoader }         from '../BaseLoader.js';
 import { TerrainType }        from '../../terrain/types.js';
@@ -54,19 +80,14 @@ const DEFAULT_ENDPOINTS = [
   'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ];
 
-const CACHE_TTL_MS = 30 * 60 * 1000;
-const VU           = 8;   // voxel units per tile
+const CACHE_TTL_MS      = 30 * 60 * 1000;
+const VU                = 8;   // voxel units per tile
+const BUILDING_BATCH_SIZE = 5;
 
 // ─── Elevation grid ────────────────────────────────────────────────────────────
-// Mirrors map.js: fetch a 5×5 grid from open-elevation, interpolate on lookup.
-const ELEV_STEP    = 0.002; // degrees between grid samples
-const ELEV_HALF    = 2;     // grid goes ±2 steps in each direction → 5×5 = 25pts
+const ELEV_STEP    = 0.002;
+const ELEV_HALF    = 2;
 
-/**
- * Build a lat/lon grid around a centre and fetch elevations from
- * api.open-elevation.com.  Returns a flat array of {latitude,longitude,elevation}
- * objects, identical to what map.js fetchTopology() stores in terrainGrid.
- */
 async function fetchElevationGrid(lat, lon) {
   const locations = [];
   for (let i = -ELEV_HALF; i <= ELEV_HALF; i++) {
@@ -91,14 +112,9 @@ async function fetchElevationGrid(lat, lon) {
   }
 }
 
-/**
- * Bilinear interpolation over the elevation grid.
- * Returns metres, or 0 if the grid hasn't loaded or the point is out of range.
- */
 function sampleElev(grid, lat, lon) {
   if (!grid.length) return 0;
 
-  // Find bounding grid points
   const lats = [...new Set(grid.map(p => p.latitude))].sort((a, b) => a - b);
   const lons = [...new Set(grid.map(p => p.longitude))].sort((a, b) => a - b);
   if (lats.length < 2 || lons.length < 2) return grid[0]?.elevation ?? 0;
@@ -166,7 +182,6 @@ function classifyOSM(tags) {
 
 // ─── Polygon feature fill/stroke styles ───────────────────────────────────────
 const POLYGON_STYLES = {
-  // natural
   water:    { fill: 'rgba(22,46,72,0.82)',   stroke: '#1a3850', alpha: 0.9 },
   wetland:  { fill: 'rgba(26,46,56,0.72)',   stroke: null },
   wood:     { fill: 'rgba(20,32,24,0.80)',   stroke: null },
@@ -178,7 +193,6 @@ const POLYGON_STYLES = {
   sand:     { fill: 'rgba(40,37,30,0.75)',   stroke: null },
   bare_rock:{ fill: 'rgba(32,34,40,0.75)',   stroke: null },
   meadow:   { fill: 'rgba(24,40,24,0.70)',   stroke: null },
-  // landuse
   residential: { fill: 'rgba(28,33,48,0.55)', stroke: null },
   commercial:  { fill: 'rgba(29,32,53,0.55)', stroke: null },
   industrial:  { fill: 'rgba(25,30,37,0.55)', stroke: null },
@@ -188,7 +202,6 @@ const POLYGON_STYLES = {
   cemetery:    { fill: 'rgba(26,40,32,0.65)', stroke: null },
   construction:{ fill: 'rgba(30,32,37,0.55)', stroke: null },
   allotments:  { fill: 'rgba(26,40,24,0.55)', stroke: null },
-  // leisure
   park:          { fill: 'rgba(23,42,28,0.72)', stroke: '#1d3522' },
   garden:        { fill: 'rgba(22,40,24,0.72)', stroke: null },
   playground:    { fill: 'rgba(24,40,24,0.65)', stroke: null },
@@ -217,7 +230,6 @@ const ROAD_STYLE = {
   bridleway:    { stroke: '#354030', w: 0.5, dash: [4, 3] },
 };
 
-// Render order — lower index drawn first (underneath)
 const ROAD_ORDER = [
   'footway','path','bridleway','steps','cycleway','track',
   'service','living_street','residential','unclassified',
@@ -268,41 +280,13 @@ function classifyPOI(tags) {
 }
 
 // ─── Geometry helpers ──────────────────────────────────────────────────────────
-
-/**
- * Project an array of {lat,lon} nodes to tile-space {x,y} using the same
- * coordinate system the engine uses: lonToGlobalX / latToGlobalY relative to
- * the entity's own position.  Called inside renderFn so it uses the entity's
- * stored _ring and _mPerTile.
- */
-function projectRing(ring, mPerTile) {
-  return ring.map(n => ({
-    x: lonToGlobalX(n.lon, ring[0].lat, mPerTile),
-    y: latToGlobalY(n.lat, mPerTile),
-  }));
-}
-
-/**
- * Convert tile-space {x,y} points to screen space via worldToScreen.
- * originTx/Ty is the entity's own tile position used as the local origin
- * so we can offset into the global grid correctly.
- */
-function tileToScreen(tilePts, originGX, originGY, entityTx, entityTy, cam) {
-  return tilePts.map(p => {
-    const localX = entityTx + (p.x - originGX);
-    const localY = entityTy + (p.y - originGY);
-    return worldToScreen(localX, localY, 0, cam);
-  });
-}
-
 function ringCentroid(nodes) {
   let lat = 0, lon = 0;
   for (const n of nodes) { lat += n.lat; lon += n.lon; }
   return { lat: lat / nodes.length, lon: lon / nodes.length };
 }
 
-// ─── Rasterisation (tile terrain grid) ────────────────────────────────────────
-// FIX B: string keys — no bitshift collision
+// ─── Rasterisation ────────────────────────────────────────────────────────────
 function rasterizePolygon(cache, pts, terrain) {
   if (pts.length < 3) return;
   let minY = Infinity, maxY = -Infinity;
@@ -332,10 +316,7 @@ function rasterizeLine(cache, pts, terrain, width) {
       for (let dx = -width; dx <= width; dx++) {
         for (let dy = -width; dy <= width; dy++) {
           if (dx*dx + dy*dy <= w2)
-            cache.set(
-              `${Math.round(cx + dx)},${Math.round(cy + dy)}`,
-              terrain
-            );
+            cache.set(`${Math.round(cx + dx)},${Math.round(cy + dy)}`, terrain);
         }
       }
     }
@@ -350,14 +331,6 @@ function blueprintNativeBounds(blueprint) {
     halfXZ = Math.max(halfXZ, Math.abs(p.x + p.w * 0.5), Math.abs(p.z + p.d * 0.5));
   }
   return { maxY, halfExtentXZ: halfXZ };
-}
-
-function computeWaySpanM(geometry) {
-  if (!geometry || geometry.length < 2) return 0;
-  const a = geometry[0], b = geometry[geometry.length - 1];
-  const dLat = (b.lat - a.lat) * 111320;
-  const dLon = (b.lon - a.lon) * 111320 * Math.cos(a.lat * Math.PI / 180);
-  return Math.hypot(dLat, dLon);
 }
 
 function computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile, osmSpanM = 0) {
@@ -469,41 +442,36 @@ function hash(n) {
 
 // ─── Entity factory functions ──────────────────────────────────────────────────
 
-/**
- * FIX A + E: Building entity using real OSM footprint polygon.
- *
- * The renderFn projects the actual _ring nodes to screen space and draws:
- *   1. Drop shadow (offset polygon, dark fill)
- *   2. Wall faces (extruded edges from ground to roof height, with side shading)
- *   3. Roof face (the polygon itself at the top)
- *
- * This produces a convincing isometric 3D building that matches the real
- * footprint shape regardless of how complex the outline is.
- */
+// FIX 3 applied here: renderFn projects ring nodes using centroid-relative
+// tile deltas instead of lonToGlobalX / latToGlobalY + _originGX offset.
+// The old approach double-applied the map origin for buildings away from centre.
 function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, elevGrid) {
   const colorSet = terrainRegistry?.colors?.[TerrainType.BUILDING] ?? {};
   const topColor   = colorSet.top   ?? '#b0a090';
   const rightColor = colorSet.right ?? '#8a7a6a';
   const leftColor  = colorSet.left  ?? '#6a5a4a';
 
-  // Pre-compute tile-space ring once at definition time
   const ring = b._ring ?? b.nodes ?? [];
-  // Store origin global tile coords for the first node so we can offset correctly
-  const originGX = ring.length ? lonToGlobalX(ring[0].lon, ring[0].lat, mPerTile) : 0;
-  const originGY = ring.length ? latToGlobalY(ring[0].lat, mPerTile)              : 0;
 
-  // Building height in "tile units" — same convention as VoxelRenderer
   const heightTiles = b.heightM / mPerTile;
-
-  // Geometric radius (half diagonal in tiles) for depth sort
   const halfA = (b.obb?.halfA ?? Math.sqrt(Math.max(16, b.areaM2)) / 2) / mPerTile;
   const halfB = (b.obb?.halfB ?? halfA) / mPerTile;
   const _geometricR = Math.hypot(halfA, halfB);
 
+  // FIX 2 shadow radius — clamp against actual footprint area
+  const shadowR = Math.min(
+    halfA * VU,
+    Math.sqrt(Math.max(16, b.areaM2) / Math.PI) / mPerTile * VU
+  );
+
+  // Centroid lat/lon for delta projection in renderFn
+  const centLat = b.centroid?.lat ?? lat;
+  const centLon = b.centroid?.lon ?? lon;
+
   return {
     id:             `building_${b.id ?? Math.random()}`,
-    latitude:       lat,
-    longitude:      lon,
+    latitude:       centLat,
+    longitude:      centLon,
     solid:          true,
     bboxRadius:     _geometricR,
     _geometricR,
@@ -517,8 +485,6 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, elevGrid) {
     _facingAngle:   b.obb?.angleDeg ?? 0,
     _obb:           b.obb ?? null,
     _ring:          ring,
-    _originGX:      originGX,
-    _originGY:      originGY,
     _mPerTile:      mPerTile,
 
     renderFn(wr, groundElevPx, extra, entity) {
@@ -531,101 +497,90 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, elevGrid) {
       wr.submitShadow({
         p:       { x: entity.tx, y: entity.ty },
         elev,
-        r:       halfA * VU,
+        r:       shadowR,
         engineH: heightTiles * VU,
       });
 
       wr.submitWorldObject(depth, () => {
-        // Project each node of the footprint ring to screen space
+        // FIX 3: centroid-relative tile delta projection.
+        // entity.latitude/longitude = building centroid (set above).
+        // entity.tx/ty = where that centroid sits in tile space (set by engine).
+        // Each ring node offset from centroid in geographic coords → tile delta.
+        const eLat = entity.latitude  ?? centLat;
+        const eLon = entity.longitude ?? centLon;
+        const ep   = entity._mPerTile ?? mPerTile;
+        const mLon = 111320 * Math.cos(eLat * Math.PI / 180);
+        const mLat = 111320;
+
         const screenPts = entity._ring.map(n => {
-          // Compute the global tile coordinate of this node
-          const gx = lonToGlobalX(n.lon, entity._ring[0].lat, entity._mPerTile ?? mPerTile);
-          const gy = latToGlobalY(n.lat, entity._mPerTile ?? mPerTile);
-          // Offset from entity's own tile position
-          const localTx = entity.tx + (gx - entity._originGX);
-          const localTy = entity.ty + (gy - entity._originGY);
-          return worldToScreen(localTx, localTy, elev, cam);
+          const dTileX =  (n.lon - eLon) * mLon / ep;
+          const dTileY = -(n.lat - eLat) * mLat / ep;
+          return worldToScreen(entity.tx + dTileX, entity.ty + dTileY, elev, cam);
         });
+
         if (screenPts.length < 3) return;
 
-        const hw = tileHalfWidth(cam.zoom, cam.tileW);
-        // Height of the building in screen pixels — depends on tilt and zoom
+        const hw  = tileHalfWidth(cam.zoom, cam.tileW);
         const hPx = heightTiles * hw * cam.tilt * 2;
 
-        // 1. Drop shadow (simple downward offset)
+        // Drop-shadow plane
         if (hPx > 2) {
           ctx.beginPath();
           screenPts.forEach((p, i) =>
-            i === 0 ? ctx.moveTo(p.x + hPx * 0.5, p.y + hPx * 0.25)
-                    : ctx.lineTo(p.x + hPx * 0.5, p.y + hPx * 0.25)
+            i === 0
+              ? ctx.moveTo(p.x + hPx * 0.5, p.y + hPx * 0.25)
+              : ctx.lineTo(p.x + hPx * 0.5, p.y + hPx * 0.25)
           );
           ctx.closePath();
           ctx.fillStyle = 'rgba(0,0,0,0.30)';
           ctx.fill();
         }
 
-        // 2. Wall faces — extrude each edge of the polygon upward
-        //    We only draw the "front" faces (those facing the camera).
-        //    For each edge, compute the wall quad and fill with side colour.
+        // Walls
         if (hPx > 1) {
           for (let i = 0; i < screenPts.length - 1; i++) {
-            const a = screenPts[i];
+            const a  = screenPts[i];
             const b2 = screenPts[i + 1];
-            // Edge direction in screen space
             const ex = b2.x - a.x, ey = b2.y - a.y;
-            // Normal (pointing "out" from polygon in screen space)
-            // Use cross product z-component to determine front-facing
             const nx = -ey, ny = ex;
-            // Only draw edges whose outward normal points toward viewer
-            // (i.e. faces toward the bottom of the screen, which is toward camera)
             if (ny <= 0) continue;
 
-            // Wall quad: bottom-left, bottom-right, top-right, top-left
             ctx.beginPath();
-            ctx.moveTo(a.x,       a.y);
-            ctx.lineTo(b2.x,      b2.y);
-            ctx.lineTo(b2.x,      b2.y - hPx);
-            ctx.lineTo(a.x,       a.y - hPx);
+            ctx.moveTo(a.x,  a.y);
+            ctx.lineTo(b2.x, b2.y);
+            ctx.lineTo(b2.x, b2.y - hPx);
+            ctx.lineTo(a.x,  a.y  - hPx);
             ctx.closePath();
-            // Shade based on edge angle — edges more horizontal = right face, more vertical = left face
-            const angle = Math.abs(Math.atan2(ey, ex));
-            const isRight = angle < Math.PI / 2;
-            ctx.fillStyle = isRight ? rightColor : leftColor;
+            const angle   = Math.abs(Math.atan2(ey, ex));
+            ctx.fillStyle = angle < Math.PI / 2 ? rightColor : leftColor;
             ctx.fill();
             ctx.strokeStyle = 'rgba(0,0,0,0.15)';
-            ctx.lineWidth = 0.5;
+            ctx.lineWidth   = 0.5;
             ctx.stroke();
           }
         }
 
-        // 3. Roof face — the actual polygon at the top (shifted up by hPx)
+        // Roof face
         ctx.beginPath();
         screenPts.forEach((p, i) =>
           i === 0 ? ctx.moveTo(p.x, p.y - hPx) : ctx.lineTo(p.x, p.y - hPx)
         );
         ctx.closePath();
-        ctx.fillStyle = topColor;
+        ctx.fillStyle   = topColor;
         ctx.fill();
         ctx.strokeStyle = rightColor;
-        ctx.lineWidth = 0.7;
+        ctx.lineWidth   = 0.7;
         ctx.stroke();
       });
     },
   };
 }
 
-/**
- * FIX D: Polygon feature entity (parks, water, natural areas, leisure).
- * Projects the actual OSM polygon ring and draws a filled + optionally
- * stroked polygon on the terrain surface.
- */
+// FIX 3 applied here: same centroid-relative projection as makeBuildingDef.
 function makePolygonFeatureDef(el, style, mPerTile) {
   const nodes = el.geometry.map(g => ({ lat: g.lat, lon: g.lon }));
   if (nodes.length < 3) return null;
   const centroid = ringCentroid(nodes);
-
-  const originGX = lonToGlobalX(nodes[0].lon, nodes[0].lat, mPerTile);
-  const originGY = latToGlobalY(nodes[0].lat, mPerTile);
 
   return {
     id:             `poly:${el.id}`,
@@ -637,8 +592,6 @@ function makePolygonFeatureDef(el, style, mPerTile) {
     fixed:          true,
     renderHeavy:    false,
     _ring:          nodes,
-    _originGX:      originGX,
-    _originGY:      originGY,
     _mPerTile:      mPerTile,
     _lodColor:      style.fill,
 
@@ -650,13 +603,19 @@ function makePolygonFeatureDef(el, style, mPerTile) {
       const depth = frontDepth(entity.tx, entity.ty, cam.rotation, 1);
 
       wr.submitWorldObject(depth, () => {
+        // FIX 3: centroid-relative tile delta projection.
+        const eLat = entity.latitude;
+        const eLon = entity.longitude;
+        const ep   = entity._mPerTile ?? mPerTile;
+        const mLon = 111320 * Math.cos(eLat * Math.PI / 180);
+        const mLat = 111320;
+
         const screenPts = entity._ring.map(n => {
-          const gx = lonToGlobalX(n.lon, entity._ring[0].lat, entity._mPerTile ?? mPerTile);
-          const gy = latToGlobalY(n.lat, entity._mPerTile ?? mPerTile);
-          const localTx = entity.tx + (gx - entity._originGX);
-          const localTy = entity.ty + (gy - entity._originGY);
-          return worldToScreen(localTx, localTy, elev, cam);
+          const dTileX =  (n.lon - eLon) * mLon / ep;
+          const dTileY = -(n.lat - eLat) * mLat / ep;
+          return worldToScreen(entity.tx + dTileX, entity.ty + dTileY, elev, cam);
         });
+
         if (screenPts.length < 3) return;
 
         ctx.beginPath();
@@ -678,11 +637,6 @@ function makePolygonFeatureDef(el, style, mPerTile) {
   };
 }
 
-/**
- * FIX C: Road entity — projects the actual polyline and draws it with proper
- * casing + fill two-pass rendering, scaled to road class and camera zoom.
- * Roads are sorted by ROAD_ORDER so major roads draw on top of minor ones.
- */
 function makeRoadDef(el, mPerTile) {
   const nodes = el.geometry.map(g => ({ lat: g.lat, lon: g.lon }));
   if (nodes.length < 2) return null;
@@ -717,7 +671,6 @@ function makeRoadDef(el, mPerTile) {
       if (cam.tilt < 0.01 || !entity._nodes?.length) return;
 
       const elev  = groundElevPx + (entity.elevOffset ?? 0);
-      // Roads use sort index as depth so they render in correct order
       const depth = frontDepth(entity.tx, entity.ty, cam.rotation, 0.3)
                   - (entity._roadSortIdx ?? 0) * 0.0001;
 
@@ -725,12 +678,22 @@ function makeRoadDef(el, mPerTile) {
         const hw = tileHalfWidth(cam.zoom, cam.tileW);
         const zf = Math.max(0.5, hw / 20);
 
+        // Roads use node[0] as anchor — same logic as before, correct for roads
+        // because the road entity's tx/ty is at the midpoint, not node[0].
+        // We keep _originGX/_originGY for roads only since they're polylines
+        // and the per-node delta approach would need a mid-centroid reference.
+        // Instead we use the same global→local conversion: entity.tx is at
+        // the midpoint's global position; we correct each node relative to that.
+        const eLat = entity.latitude;
+        const eLon = entity.longitude;
+        const ep   = entity._mPerTile ?? mPerTile;
+        const mLon = 111320 * Math.cos(eLat * Math.PI / 180);
+        const mLat = 111320;
+
         const screenPts = entity._nodes.map(n => {
-          const gx = lonToGlobalX(n.lon, entity._nodes[0].lat, entity._mPerTile ?? mPerTile);
-          const gy = latToGlobalY(n.lat, entity._mPerTile ?? mPerTile);
-          const localTx = entity.tx + (gx - entity._originGX);
-          const localTy = entity.ty + (gy - entity._originGY);
-          return worldToScreen(localTx, localTy, elev, cam);
+          const dTileX =  (n.lon - eLon) * mLon / ep;
+          const dTileY = -(n.lat - eLat) * mLat / ep;
+          return worldToScreen(entity.tx + dTileX, entity.ty + dTileY, elev, cam);
         });
 
         ctx.lineCap  = 'round';
@@ -739,7 +702,6 @@ function makeRoadDef(el, mPerTile) {
         const st = ROAD_STYLE[entity._highway] ?? ROAD_STYLE.residential;
 
         if (st.casing) {
-          // Two-pass: casing then fill
           ctx.beginPath();
           screenPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
           ctx.strokeStyle = st.casing;
@@ -753,7 +715,6 @@ function makeRoadDef(el, mPerTile) {
           ctx.lineWidth   = st.fillW * zf * 2;
           ctx.stroke();
         } else {
-          // Dashed minor paths
           ctx.beginPath();
           screenPts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
           ctx.strokeStyle = st.stroke ?? '#404858';
@@ -767,10 +728,6 @@ function makeRoadDef(el, mPerTile) {
   };
 }
 
-/**
- * Blueprint entity (landmarks, trees etc.) — shadow and front-depth fixes
- * retained from the previous version.
- */
 function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
   const scale       = opts.scale       ?? 1;
   const facingAngle = opts.facingAngle ?? 180;
@@ -842,7 +799,6 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
   };
 }
 
-/** POI / icon feature */
 function makeFeatureDef(f) {
   let blueprint = null, blueprintKey = null;
   for (const candidate of [f.title, f.label, f.category]) {
@@ -920,7 +876,6 @@ function makeFeatureDef(f) {
   };
 }
 
-// ─── Facade window decoration (unchanged from previous version) ────────────────
 function drawFacadeWindows(ctx, faceQuad, rows, cols, color, seed) {
   const lerp  = (a, b, t) => a + (b - a) * t;
   const lerpP = (p1, p2, t) => ({ x: lerp(p1.x, p2.x, t), y: lerp(p1.y, p2.y, t) });
@@ -1010,7 +965,6 @@ export class OSMTerrainLoader extends BaseLoader {
     this._abort        = null;
     this._cache        = new PersistentCache('GOE_Overpass', 'osm_terrain');
 
-    // FIX H: live entity cache (avoids IDB reads + factory calls on revisit)
     this._liveEntityCache = new Map();
 
     this._fetchDebounceMs = options.fetchDebounceMs ?? 800;
@@ -1020,18 +974,25 @@ export class OSMTerrainLoader extends BaseLoader {
     this._decorateBuildingFacade = options.decorateBuildingFacade ?? null;
     this._terrainRegistry        = options.terrainRegistry        ?? null;
 
-    // FIX F: elevation grid — mirrors map.js open-elevation approach
-    this._elevGrid       = [];       // [{latitude, longitude, elevation}]
-    this._elevGridCenter = null;     // {lat,lon} when grid was fetched
+    this._elevGrid       = [];
+    this._elevGridCenter = null;
     this._elevFetching   = false;
+
     this._bpGen = new ProceduralBlueprintGenerator({
       mPerTile: this._mPerTile,
     });
+
+    this._onPartialResult = null;
   }
 
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
   init(engine) {
     this._terrainRegistry = engine.terrainRegistry;
     this._bpGen._terrainRegistry = this._terrainRegistry;
+  }
+
+  setPartialResultCallback(cb) {
+    this._onPartialResult = cb;
   }
 
   get _endpoint() { return this._endpoints[this._endpointIdx % this._endpoints.length]; }
@@ -1041,11 +1002,7 @@ export class OSMTerrainLoader extends BaseLoader {
     return `${lat.toFixed(2)},${lon.toFixed(2)}`;
   }
 
-  // ── FIX F: elevation helpers ──────────────────────────────────────────────
-  /**
-   * Fetch a new elevation grid if we've moved far enough from the last one.
-   * Threshold = half the grid extent in degrees so we always have coverage.
-   */
+  // ── Elevation helpers ──────────────────────────────────────────────────────
   async _maybeRefreshElevGrid(lat, lon) {
     const threshold = ELEV_STEP * ELEV_HALF * 0.5;
     if (this._elevFetching) return;
@@ -1063,7 +1020,6 @@ export class OSMTerrainLoader extends BaseLoader {
     }
   }
 
-  /** Sample elevation at a lat/lon using the cached grid.  Returns metres. */
   sampleElevation(lat, lon) {
     return sampleElev(this._elevGrid, lat, lon);
   }
@@ -1096,25 +1052,25 @@ export class OSMTerrainLoader extends BaseLoader {
 
     const { lat, lon } = geoCenter;
 
-    // Kick off elevation grid refresh in parallel (non-blocking)
     this._maybeRefreshElevGrid(lat, lon);
 
     const cacheKey = this._getCacheKey(geoCenter);
     try {
-      // Live entity cache (fastest path)
       if (this._liveEntityCache.has(cacheKey)) {
         const { terrainUpdates, entities } = this._liveEntityCache.get(cacheKey);
         console.log(`[OSMTerrainLoader] Live cache hit — ${entities.length} entities`);
+        this._onPartialResult?.({ terrainUpdates, entities });
         return { terrainUpdates, entities };
       }
 
-      // IDB cache
       const cached = await this._cache.get(cacheKey);
       const age    = Date.now() - (cached?.timestamp ?? 0);
       if (cached?.terrainUpdates && age < CACHE_TTL_MS) {
         console.log(`[OSMTerrainLoader] IDB cache hit — rebuilding entities`);
-        const liveEntities = await this._rebuildEntitiesFromCache(cached, lat, lon);
         const terrainUpdates = new Map(Object.entries(cached.terrainUpdates));
+        this._onPartialResult?.({ terrainUpdates, entities: [] });
+        const liveEntities = await this._rebuildEntitiesFromCache(cached, lat, lon);
+        this._onPartialResult?.({ terrainUpdates: new Map(), entities: liveEntities });
         this._liveEntityCache.set(cacheKey, { terrainUpdates, entities: liveEntities });
         return { terrainUpdates, entities: liveEntities };
       }
@@ -1122,7 +1078,7 @@ export class OSMTerrainLoader extends BaseLoader {
       console.warn('[OSMTerrainLoader] Cache read error', err);
     }
 
-    // Build Overpass query
+    // ── Overpass fetch ─────────────────────────────────────────────────────
     const r = this._fetchRadiusM;
     const around = `(around:${r},${lat},${lon})`;
     const q = `[out:json][timeout:60];(
@@ -1162,7 +1118,6 @@ export class OSMTerrainLoader extends BaseLoader {
 
         const result = await this._processOSMData(data, geoCenter);
 
-        // Cache to IDB
         try {
           await this._cache.set(cacheKey, {
             terrainUpdates: Object.fromEntries(result.terrainUpdates),
@@ -1196,7 +1151,7 @@ export class OSMTerrainLoader extends BaseLoader {
   // ── Main OSM data processing ──────────────────────────────────────────────
   async _processOSMData(data, geoCenter) {
     const { lat, lon } = geoCenter;
-    const mPerTile     = this._mPerTile;
+    const mPerTile      = this._mPerTile;
 
     const terrainUpdates        = new Map();
     const entityDefs            = [];
@@ -1207,7 +1162,6 @@ export class OSMTerrainLoader extends BaseLoader {
       y: latToGlobalY(eLat, mPerTile),
     });
 
-    // Bounding box for node culling
     const mLat  = 111320;
     const mLon  = 111320 * Math.cos(lat * Math.PI / 180);
     const r     = this._fetchRadiusM;
@@ -1279,13 +1233,11 @@ export class OSMTerrainLoader extends BaseLoader {
     }
 
     // ── Pass 2: All other ways (terrain + roads + polygon features) ───────
-    const buildingWays  = [];
-    // Collect road defs so we can sort by ROAD_ORDER before adding
-    const roadDefs = [];
+    const buildingWays = [];
+    const roadDefs     = [];
 
     for (const el of wayElements) {
       if (!el.geometry?.length) continue;
-      // Skip bridge landmarks already handled
       if ((el.tags?.bridge === 'yes' || el.tags?.man_made === 'bridge') && resolveLandmarkKey(el.tags)) continue;
 
       const cls = classifyOSM(el.tags);
@@ -1293,13 +1245,11 @@ export class OSMTerrainLoader extends BaseLoader {
 
       const pts = el.geometry.map(g => toTile(g.lat, g.lon));
 
-      // Paint terrain grid
       if (cls.type === 'polygon') rasterizePolygon(terrainUpdates, pts, cls.terrain);
       else                        rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width);
 
-      // FIX D: Polygon feature entities
       if (cls.type === 'polygon' && !el.tags?.building) {
-        const tag  = el.tags?.natural ?? el.tags?.landuse ?? el.tags?.leisure ?? el.tags?.waterway;
+        const tag   = el.tags?.natural ?? el.tags?.landuse ?? el.tags?.leisure ?? el.tags?.waterway;
         const style = tag ? POLYGON_STYLES[tag] : null;
         if (style) {
           const def = makePolygonFeatureDef(el, style, mPerTile);
@@ -1307,26 +1257,22 @@ export class OSMTerrainLoader extends BaseLoader {
         }
       }
 
-      // FIX C: Road entities
       if (el.tags?.highway) {
         const def = makeRoadDef(el, mPerTile);
         if (def) roadDefs.push(def);
       }
 
-      // Waterway polygon/line feature
       if (el.tags?.waterway && !el.tags?.building) {
         const style = POLYGON_STYLES['water'];
         if (cls.type === 'polygon') {
           const def = makePolygonFeatureDef(el, style, mPerTile);
           if (def) entityDefs.push(def);
         }
-        // Line waterways don't need a separate entity — terrain handles them
       }
 
       if (el.tags?.building) buildingWays.push(el);
     }
 
-    // Add roads sorted by ROAD_ORDER (lowest index = drawn first = underneath)
     roadDefs.sort((a, b) => (a._roadSortIdx ?? 0) - (b._roadSortIdx ?? 0));
     for (const def of roadDefs) entityDefs.push(def);
 
@@ -1383,33 +1329,41 @@ export class OSMTerrainLoader extends BaseLoader {
       }));
     }
 
+    // Stream Pass 1–3 immediately
+    this._onPartialResult?.({
+      terrainUpdates,
+      entities: [...entityDefs],
+    });
+
     // ── Pass 4: Buildings ─────────────────────────────────────────────────
-    const _buildingPromises = [];
- 
     if (buildingWays.length && this._terrainRegistry) {
-      const buildings = preprocessBuildings(buildingWays);
- 
+      const buildings          = preprocessBuildings(buildingWays);
+      const genericBuildingJobs = [];
+
       for (const b of buildings) {
         const match     = resolveLandmarkKey(b.tags);
         const nameKey   = match?.key ?? '';
         const blueprint = match ? Blueprints[nameKey] : null;
- 
+
         if (blueprint) {
-          // Named landmark — use hand-crafted blueprint from BluePrintLibrary
-          const osmHeightM = parseFloat(b.tags?.height ?? 0) || 0;
-          const osmAreaM2  = b.areaM2 ?? 0;
-          const scale      = computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile);
-          const { halfExtentXZ } = blueprintNativeBounds(blueprint);
-          const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
-          const facingAngle = extractFacingAngle(b.tags, b.geometry);
- 
           if (!renderedLandmarkNames.has(nameKey)) {
             renderedLandmarkNames.add(nameKey);
-            entityDefs.push(makeBlueprintDef(
+
+            const osmHeightM = parseFloat(b.tags?.height ?? 0) || 0;
+            const osmAreaM2  = b.areaM2 ?? 0;
+            const scale      = computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile);
+            const { halfExtentXZ } = blueprintNativeBounds(blueprint);
+            const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
+            const facingAngle = extractFacingAngle(b.tags, b.geometry);
+
+            const landmarkDef = makeBlueprintDef(
               `landmark:${b.id}`, b.centroid.lat, b.centroid.lon, nameKey,
               { scale, facingAngle, solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
                 physicsEnabled: false, physicsRadius: scaledR, fixed: true, lodColor: '#A1887F' }
-            ));
+            );
+            entityDefs.push(landmarkDef);
+            this._onPartialResult?.({ terrainUpdates: new Map(), entities: [landmarkDef] });
+
             const colliders = makeBlueprintColliders(
               `landmark:${b.id}`, b.centroid.lat, b.centroid.lon, blueprint, scale, mPerTile
             );
@@ -1419,33 +1373,51 @@ export class OSMTerrainLoader extends BaseLoader {
               col.longitude = b.centroid.lon + dLon;
               entityDefs.push(col);
             }
+            this._onPartialResult?.({ terrainUpdates: new Map(), entities: colliders });
           }
- 
         } else {
-          // Generic building — generate procedural to-scale blueprint
-          // with face decoration, cached in mem + IDB.
-          _buildingPromises.push(
-            this._bpGen.getBuildingDef(b, mPerTile, this._terrainRegistry, this._elevGrid)
-          );
+          b._facingAngle = extractFacingAngle(b.tags, b.geometry ?? b._ring ?? b.nodes);
+          genericBuildingJobs.push(b);
         }
       }
- 
-      // Resolve all procedural blueprints in parallel
-      const resolvedDefs = await Promise.all(_buildingPromises);
-      for (const def of resolvedDefs) {
-        if (def) entityDefs.push(def);
-      }
- 
-      // Emit any landmark node candidates not superseded by a building way
+
+      // Emit landmark node candidates not superseded by a building way
       for (const [nameKey, c] of landmarkNodeCandidates) {
         if (renderedLandmarkNames.has(nameKey)) continue;
         renderedLandmarkNames.add(nameKey);
-        entityDefs.push(makeBlueprintDef(
+        const def = makeBlueprintDef(
           `landmark:node:${c.el.id}`, c.el.lat, c.el.lon, nameKey,
           { scale: c.scale, facingAngle: c.facingAngle, solid: true, bboxRadius: c.scaledR,
             footprintRadius: c.scaledR, physicsEnabled: false, physicsRadius: c.scaledR,
             fixed: true, lodColor: '#A1887F' }
-        ));
+        );
+        entityDefs.push(def);
+        this._onPartialResult?.({ terrainUpdates: new Map(), entities: [def] });
+      }
+
+      // ── Generic buildings: batched with render-loop yields ─────────────
+      for (let i = 0; i < genericBuildingJobs.length; i += BUILDING_BATCH_SIZE) {
+        const batch = genericBuildingJobs.slice(i, i + BUILDING_BATCH_SIZE);
+
+        const batchDefs = (
+          await Promise.all(
+            batch.map(b =>
+              this._bpGen
+                .getBuildingDef(b, mPerTile, this._terrainRegistry, this._elevGrid)
+                .catch(err => {
+                  console.warn('[OSMTerrainLoader] Building gen failed:', err.message);
+                  return null;
+                })
+            )
+          )
+        ).filter(Boolean);
+
+        if (batchDefs.length) {
+          for (const def of batchDefs) entityDefs.push(def);
+          this._onPartialResult?.({ terrainUpdates: new Map(), entities: batchDefs });
+        }
+
+        await new Promise(r => setTimeout(r, 0));
       }
     }
 
@@ -1474,8 +1446,6 @@ export class OSMTerrainLoader extends BaseLoader {
       _facingAngle: e._facingAngle  ?? null,
       _ring:        e._ring         ?? null,
       _nodes:       e._nodes        ?? null,
-      _originGX:    e._originGX     ?? null,
-      _originGY:    e._originGY     ?? null,
       _mPerTile:    e._mPerTile     ?? null,
       _highway:     e._highway      ?? null,
       _roadSortIdx: e._roadSortIdx  ?? null,
@@ -1492,7 +1462,6 @@ export class OSMTerrainLoader extends BaseLoader {
     const mPerTile = this._mPerTile;
     return (await Promise.all((cached.entities ?? []).map(async e => {
       if (e._type === 'procbp' && e._procBlueprint) {
-        // Restore procedural blueprint entity directly from cached blueprint data
         const b = {
           id:       e.id.replace('procbp:', ''),
           _ring:    e._ring,
@@ -1503,13 +1472,11 @@ export class OSMTerrainLoader extends BaseLoader {
           centroid: { lat: e.latitude, lon: e.longitude },
           tags:     {},
         };
-        // Reuse the cached blueprint boxes directly — no regeneration needed
         const def = await this._bpGen.getBuildingDef(b, mPerTile, this._terrainRegistry, this._elevGrid);
-        if (def) def._procBlueprint = e._procBlueprint; // override with cached boxes
+        if (def) def._procBlueprint = e._procBlueprint;
         return def;
       }
       if (e._type === 'building' && e._ring) {
-        // Rebuild building with full polygon rendering
         const b = {
           id: e.id, _ring: e._ring, nodes: e._ring,
           areaM2: e.areaM2 ?? 16, heightM: e.heightM ?? 8,
@@ -1522,7 +1489,6 @@ export class OSMTerrainLoader extends BaseLoader {
       if (e._type === 'polygon' && e._ring) {
         const tag   = e.category ?? '';
         const style = POLYGON_STYLES[tag] ?? { fill: 'rgba(40,50,60,0.5)', stroke: null };
-        // Reconstruct a minimal el-like object
         const el = { id: e.id.replace('poly:',''), geometry: e._ring, tags: {} };
         return makePolygonFeatureDef(el, style, mPerTile);
       }
@@ -1553,14 +1519,12 @@ export class OSMTerrainLoader extends BaseLoader {
       this._pendingResolve = null;
     }
     this._abort?.abort();
-    // [ADD]
     this._bpGen.clearMemCache();
   }
 
   async clearCache() {
     this._liveEntityCache.clear();
     await this._cache.clear();
-    // [ADD]
     await this._bpGen.clearAllCaches();
   }
 }

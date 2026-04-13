@@ -7,6 +7,12 @@
  *   3. entities 1,737        — stale entities from previous locations never removed
  * 
  * All fixes applied below.
+ *
+ * STREAMING UPDATE:
+ *   _doFetch no longer processes results itself. Loaders call
+ *   _ingestLoaderResult() as partial data becomes available (terrain,
+ *   roads, POIs, per-batch buildings) so the scene updates continuously
+ *   instead of freezing until all blueprints are generated.
  */
 
 /**
@@ -210,6 +216,8 @@ class PlayerEntity extends Entity {
   }
 
   render(wr, groundElevPx, extra) {
+     // ADD THIS:
+    if (!this._renderFn && this._isBuildingBox === false) console.warn('[render:missing]', this.id, this.type);
     drawPlayer(wr, this.tx, this.ty, groundElevPx + this.elevOffset, this, extra.mPerTile);
   }
 }
@@ -233,7 +241,6 @@ class GenericEntity extends Entity {
     this.visualAlt      = def.visualAlt      ?? 0;
     this.showAltitudeLine = def.showAltitudeLine ?? false;
 
-    // Flag used by PlayerEntity collision to choose AABB vs circle
     this._isBuildingBox = def._isBuildingBox ?? false;
     this._scale  = def._scale  ?? 1;
     this._facingAngle = def._facingAngle ?? 0;
@@ -243,14 +250,11 @@ class GenericEntity extends Entity {
     this._areaM2     = def._areaM2     ?? null;
     this._heightM    = def._heightM    ?? null;
 
-    // Whether this entity needs an expensive blueprint draw (affects LOD)
     this.renderHeavy = def.renderHeavy ?? false;
 
-    // Rendering and update delegates supplied by the loader
     this._renderFn = def.renderFn ?? null;
     this._updateFn = def.updateFn ?? null;
-
-    // Carry the raw def for anything callers might need
+    this._procBlueprint = def._procBlueprint ?? null;
   }
 
   update(dt, engine) {
@@ -271,7 +275,7 @@ const REFETCH_DIST = 18;
 const M_PER_TILE   = 2;
 
 const CULL_MARGIN             = 4;
-const LOD_HEAVY_MIN_ZOOM      = 0.05;   // min zoom to draw renderHeavy entities
+const LOD_HEAVY_MIN_ZOOM      = 0.05;
 const TILE_CACHE_DIRTY_PX     = 2;
 const TILE_CACHE_DIRTY_ZOOM   = 0.002;
 const TILE_CACHE_DIRTY_TILT   = 0.005;
@@ -294,6 +298,10 @@ export class Engine extends EventEmitter {
     this.geoCenter     = opts.geoCenter ?? { lat: 51.505, lon: -0.09 };
     this._lastFetchPos = { lat: 0, lon: 0 };
     this._fetching     = false;
+
+    // Streaming fetch state
+    this._fetchFreshIds = new Set();
+    this._fetchPending  = 0;
 
     this.camera = new Camera({
       mapW: this._mapW, mapH: this._mapH, mPerTile: this._mPerTile,
@@ -342,7 +350,7 @@ export class Engine extends EventEmitter {
     this._cameraSettleTimer = null;
 
     this._spatialTree = null;
-    this._entityMap = new Map();   // id → entity (excluding player)
+    this._entityMap = new Map();
   }
 
   // ── Physics helpers ───────────────────────────────────────────────────────
@@ -350,14 +358,11 @@ export class Engine extends EventEmitter {
   _attachPhysics(entity) {
     if (!this.physicsWorld || !entity.physicsEnabled) return;
     if (entity._particle) return;
-    // Fixed entities (buildings, trees, landmarks) are handled by the Quadtree
-    // spatial index for player collision. Attaching them to the physics world
-    // costs a Particle2D allocation + per-frame broadphase work with zero benefit.
     if (entity.fixed) return;
 
     const p = new Particle2D(entity.tx, entity.ty);
     p.radius = entity.physicsRadius;
-    p.fixed  = false; // guaranteed by the guard above
+    p.fixed  = false;
     p.isCollidable = true;
     entity._particle = p;
     this.physicsWorld.particles.push(p);
@@ -520,7 +525,13 @@ export class Engine extends EventEmitter {
     });
     this._input.on('click',  ev => this._handleClick(ev));
 
-    for (const loader of this._loaders) loader.init?.(this);
+    // Init loaders and wire streaming callback
+    for (const loader of this._loaders) {
+      loader.init?.(this);
+      if (typeof loader.setPartialResultCallback === 'function') {
+        loader.setPartialResultCallback(partial => this._ingestLoaderResult(partial));
+      }
+    }
 
     this.playerEntity = new PlayerEntity('player', this._mapW / 2, this._mapH / 2);
     this.entities.push(this.playerEntity);
@@ -556,9 +567,6 @@ export class Engine extends EventEmitter {
     this._osmLayer?.setURLFn(urlFn);
   }
 
-  /**
-   * Add any entity (PlayerEntity, GenericEntity, or custom Entity subclass).
-   */
   addEntity(entity) {
     this.entities.push(entity);
     if (entity.type !== 'player') this._entityMap.set(entity.id, entity);
@@ -581,7 +589,16 @@ export class Engine extends EventEmitter {
     if (ent) this._flyToTile(ent.tx + 0.5, ent.ty + 0.5);
   }
 
-  use(loader) { this._loaders.push(loader); return this; }
+  use(loader) {
+    this._loaders.push(loader);
+    if (this._running) {
+      loader.init?.(this);
+      if (typeof loader.setPartialResultCallback === 'function') {
+        loader.setPartialResultCallback(partial => this._ingestLoaderResult(partial));
+      }
+    }
+    return this;
+  }
 
   setElevationLoader(loader) {
     this._elevation = loader;
@@ -687,15 +704,24 @@ export class Engine extends EventEmitter {
   }
 
   // ── FETCH ─────────────────────────────────────────────────────────────────
-  // FIX 3: Remove stale entities after each fetch
+  // Loaders stream partial results via _ingestLoaderResult() as data becomes
+  // available (terrain first, then roads/POIs, then buildings in batches).
+  // Stale-entity pruning only runs once every loader promise has resolved,
+  // using the accumulated _fetchFreshIds set.
   _doFetch(center) {
     if (this._fetching) return;
 
-    const d = Math.hypot(center.lat - this._lastFetchPos.lat, center.lon - this._lastFetchPos.lon);
+    const d = Math.hypot(
+      center.lat - this._lastFetchPos.lat,
+      center.lon - this._lastFetchPos.lon
+    );
     if (d < 0.001 && this._lastFetchPos.lat !== 0) return;
 
-    this._fetching     = true;
-    this._lastFetchPos = { ...center };
+    this._fetching      = true;
+    this._lastFetchPos  = { ...center };
+    this._fetchFreshIds = new Set();
+    this._fetchPending  = this._loaders.length;
+
     this.emit('fetch:start');
 
     const fetches = this._loaders.map(l =>
@@ -705,92 +731,107 @@ export class Engine extends EventEmitter {
       })
     );
 
-    Promise.all(fetches).then(results => {
-      const { x: pGX, y: pGY } = this._pGlobal();
-
-      const toLocal = (globalX, globalY) => ({
-        x: globalX - pGX + this._mapW / 2,
-        y: globalY - pGY + this._mapH / 2,
-      });
-
-      // ── Merge terrain + weather ────────────────────────────────────────────
-      for (const result of results) {
-        if (result.terrainUpdates) {
-          this.terrainCache.merge(result.terrainUpdates);
-        }
-        if (result.weatherUpdate && this.weather) {
-          this.weather.setMode(result.weatherUpdate.mode);
-          this.weather.wind = result.weatherUpdate.wind;
-          this.emit('weather:changed', result.weatherUpdate);
-        }
-      }
-
-      // ── Entity upsert map & fresh set ──────────────────────────────────────
-      const existing = this._entityMap;
-      const freshIds = new Set();
-
-      const upsert = (entity) => {
-        freshIds.add(entity.id);
-        const old = existing.get(entity.id);
-        if (old) {
-          old.tx         = entity.tx;
-          old.ty         = entity.ty;
-          old.solid      = entity.solid;
-          old.bboxRadius = entity.bboxRadius;
-          if (old._particle) {
-            old._particle.position.x = old.tx;
-            old._particle.position.y = old.ty;
-          }
-        } else {
-          this.addEntity(entity);   // use addEntity to keep map & physics in sync
-        }
-      };
-
-      // ── Process loader results ─────────────────────────────────────────────
-      for (const result of results) {
-        if (!result.entities) continue;
-
+    // Each loader promise resolves once — after all its streaming batches are
+    // done. We collect fresh IDs from the final result, then prune once every
+    // loader has resolved.
+    fetches.forEach(p => p.then(result => {
+      // Accumulate every ID this loader ever produced
+      if (result?.entities) {
         for (const def of result.entities) {
-          // Loaders supply geo coordinates; engine converts to local tile space
-          const lat = def.latitude ?? def.lat;
-          const lon = def.longitude ?? def.lon;
-
-          let tx = def.tx, ty = def.ty;
-
-          if (lat != null && lon != null) {
-            const globalX = lonToGlobalX(lon, this.geoCenter.lat, this._mPerTile);
-            const globalY = latToGlobalY(lat, this._mPerTile);
-            const local   = toLocal(globalX, globalY);
-            if (local.x < 0 || local.x >= this._mapW || local.y < 0 || local.y >= this._mapH) continue;
-            tx = local.x;
-            ty = local.y;
-          } else if (tx == null || ty == null) {
-            continue;
-          }
-
-          const entity = new GenericEntity({ ...def, tx, ty });
-          upsert(entity);
+          if (def?.id) this._fetchFreshIds.add(def.id);
         }
       }
 
-      // FIX 3: Remove stale entities — those not returned by this fetch.
-      // Only runs when at least one loader returned entities (freshIds non-empty),
-      // to avoid wiping everything if a loader temporarily returns nothing.
-      if (freshIds.size > 0) {
-        // Walk backwards so splice doesn't invalidate forward indices
+      if (--this._fetchPending > 0) return;
+
+      // ── All loaders done ─────────────────────────────────────────────────
+      // FIX 3: Prune stale entities — those not returned by any loader.
+      if (this._fetchFreshIds.size > 0) {
         for (let i = this.entities.length - 1; i >= 0; i--) {
           const e = this.entities[i];
-          if (e.type === 'player') continue;          // never remove the player
-          if (freshIds.has(e.id)) continue;           // still valid
-          this._detachPhysics(e);                     // clean up physics particle
+          if (e.type === 'player') continue;
+          if (this._fetchFreshIds.has(e.id)) continue;
+          this._detachPhysics(e);
           this.entities.splice(i, 1);
+          this._entityMap.delete(e.id);
         }
       }
 
       this._elevation?.prefetch?.(center);
       this._fetching = false;
       this.emit('fetch:done');
+    }));
+  }
+
+  // ── PARTIAL RESULT INGESTION ──────────────────────────────────────────────
+  // Called by loaders as each chunk of data becomes available. Safe to call
+  // from async contexts — upserts happen synchronously so the next render
+  // frame picks them up immediately.
+  _ingestLoaderResult(result) {
+    if (!result || typeof result !== 'object') return;
+
+    const { x: pGX, y: pGY } = this._pGlobal();
+    const toLocal = (globalX, globalY) => ({
+      x: globalX - pGX + this._mapW / 2,
+      y: globalY - pGY + this._mapH / 2,
     });
+
+    if (result.terrainUpdates?.size) {
+      this.terrainCache.merge(result.terrainUpdates);
+    }
+
+    if (result.weatherUpdate && this.weather) {
+      this.weather.setMode(result.weatherUpdate.mode);
+      this.weather.wind = result.weatherUpdate.wind;
+      this.emit('weather:changed', result.weatherUpdate);
+    }
+
+    if (!result.entities?.length) return;
+
+    for (const def of result.entities) {
+      const lat = def.latitude ?? def.lat;
+      const lon = def.longitude ?? def.lon;
+      let tx = def.tx, ty = def.ty;
+
+      if (lat != null && lon != null) {
+        const globalX = lonToGlobalX(lon, this.geoCenter.lat, this._mPerTile);
+        const globalY = latToGlobalY(lat, this._mPerTile);
+        const local   = toLocal(globalX, globalY);
+        if (
+          local.x < 0 || local.x >= this._mapW ||
+          local.y < 0 || local.y >= this._mapH
+        ) continue;
+        tx = local.x;
+        ty = local.y;
+      } else if (tx == null || ty == null) {
+        continue;
+      }
+
+      const entity = new GenericEntity({ ...def, tx, ty });
+      const old    = this._entityMap.get(entity.id);
+      if (old) {
+        old.tx             = entity.tx;
+        old.ty             = entity.ty;
+        old.solid          = entity.bboxRadius;      // ← was missing
+        old.bboxRadius     = entity.bboxRadius;
+        old._renderFn      = entity._renderFn;       // ← add
+        old._procBlueprint = entity._procBlueprint;  // ← add
+        old._ring          = entity._ring;            // ← add
+        old._nodes         = entity._nodes;           // ← add
+        old._originGX      = entity._originGX;        // ← add
+        old._originGY      = entity._originGY;        // ← add
+        old._mPerTile      = entity._mPerTile;        // ← add
+        old._geometricR    = entity._geometricR;      // ← add
+        old.renderHeavy    = entity.renderHeavy;      // ← add
+        old._lodColor      = entity._lodColor;        // ← add
+        if (old._particle) {
+          old._particle.position.x = old.tx;
+          old._particle.position.y = old.ty;
+        }
+      } else {
+        this.addEntity(entity);
+      }
+    }
   }
 
   // ── OPTIMISED RENDER FRAME ─────────────────────────────────────────────────
@@ -939,7 +980,6 @@ export class Engine extends EventEmitter {
       if (lod > 1) {
         this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overAlpha);
       } else {
-        // FIX 1a & 1b: recycle tile cache array, bail if hw < 2 (already guarded above)
         if (this._isTileCacheDirty()) {
           this._saveTileCacheState();
           const hw  = terrainHW;
@@ -969,7 +1009,6 @@ export class Engine extends EventEmitter {
               writeIdx++;
             }
           }
-          // Trim any leftover slots from a previously larger grid
           this._tileCache.length = writeIdx;
         }
         this._skipTileCacheThisFrame = false;
@@ -989,13 +1028,10 @@ export class Engine extends EventEmitter {
       for (const e of this.entities) {
         if (!e.visible) continue;
 
-        // Frustum culling
         if (!this._isTileVisible(e.tx, e.ty, cam, W, H)) continue;
 
-        // LOD: skip expensive renders at very low zoom
         if (e.renderHeavy && !drawHeavy) continue;
 
-        // Camera animation throttle: replace heavy geometry with a coloured dot
         if (e.renderHeavy && this._cameraAnimating) {
           const elev = this.terrainRegistry.heights[
             this.terrainCache.getLocal(e.tx, e.ty, pGX, pGY, this._mapW, this._mapH)
@@ -1030,10 +1066,9 @@ export class Engine extends EventEmitter {
           featureResolver: this._featR,
         });
 
-        // Altitude line
         if (altPx > 0 && e.showAltitudeLine && cam.zoom > 0.08) {
           const geomR = e._geometricR ?? e.bboxRadius ?? 0.35;
-const depth = frontDepth(e.tx, e.ty, cam.rotation, geomR);
+          const depth = frontDepth(e.tx, e.ty, cam.rotation, geomR);
           this._renderer.submitWorldObject(depth, () => {
             const ground = worldToScreen(e.tx + 0.5, e.ty + 0.5, groundElevPx, cam);
             const airPos = worldToScreen(e.tx + 0.5, e.ty + 0.5, totalElevPx, cam);
