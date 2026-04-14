@@ -47,7 +47,6 @@ export { TerrainCache } from './terrain/TerrainCache.js';
 export { TerrainType, createTerrainRegistry } from './terrain/types.js';
 export { VoxelRenderer }   from './render/VoxelRenderer.js';
 export { TileRenderer }    from './render/TileRenderer.js';
-export { PlayerRenderer }  from './render/PlayerRenderer.js';
 export { OSMLayerRenderer } from './render/OSMLayerRenderer.js';
 export { BaseLoader, OSMTileURL, CartoDarkURL, ESRISatelliteURL, patternURL } from './loaders/BaseLoader.js';
 export { OSMTerrainLoader } from './loaders/geo/OSMTerrainLoader.js';

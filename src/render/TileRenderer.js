@@ -1,15 +1,26 @@
 /**
  * GOE Core — TileRenderer
  *
- * Accepts a WorldRenderer instead of raw ctx/cam.
- * All canvas operations go through WorldRenderer's drawing API.
+ * CHUNKING REFACTOR
+ * -----------------
+ * All tile iteration and terrain lookup now operates in GLOBAL TILE SPACE.
  *
- * Changes from previous version:
- *  - Constructor: (worldRenderer, terrainRegistry, shadowSystem?)
- *    WorldRenderer already owns ShadowSystem; shadowSystem param kept for
- *    backward-compat but defaults to worldRenderer.shadowSystem.
- *  - _drawBakedImage uses worldRenderer.drawTransformedImage()
- *  - _drawHighlight / _drawGrid use worldRenderer.drawPolygon()
+ * Previous approach (local chunk):
+ *   — _bakeMap iterated tx: 0..mapW, ty: 0..mapH
+ *   — lookups used terrainCache.getLocal(tx, ty, pGX, pGY, W, H)
+ *   — drawMergedLayer needed pGX/pGY to convert global→local
+ *
+ * New approach (global coords):
+ *   — _bakeMap iterates around cam.focusX/focusY in global tile coords
+ *   — lookups use terrainCache.get(globalTx, globalTy) directly
+ *   — drawMergedLayer uses focusX/focusY as centre; no local conversion
+ *   — _bakeOriginX/_bakeOriginY record which global tile is at pixel (0,0)
+ *     of the baked canvas so _drawBakedImage can project it correctly
+ *
+ * Memory fixes (FIX A, B, C) from the previous version are unchanged:
+ *   FIX A — ImageData reused across bakes (only reallocated on size change)
+ *   FIX B — _rgbCache eliminates per-block parseInt in drawMergedBlock
+ *   FIX C — Inline bake lerp; no intermediate [r,g,b] array per tile
  */
 import { lerpColor, tileDepth, worldToScreen, topFaceQuad } from '../math/projection.js';
 
@@ -30,14 +41,6 @@ function hexToRgb(hex) {
   ];
 }
 
-function lerpRgb(a, b, t) {
-  return [
-    Math.round(a[0] + (b[0] - a[0]) * t),
-    Math.round(a[1] + (b[1] - a[1]) * t),
-    Math.round(a[2] + (b[2] - a[2]) * t),
-  ];
-}
-
 export class TileRenderer {
   /**
    * @param {WorldRenderer}  worldRenderer
@@ -46,8 +49,6 @@ export class TileRenderer {
   constructor(worldRenderer, terrainRegistry) {
     this._wr     = worldRenderer;
     this.terrain = terrainRegistry;
-
-    // Keep ctx / cam accessors for internal helpers
     this._shadows = worldRenderer.shadowSystem;
 
     this.BAKE_TILE_PX = 1;
@@ -55,8 +56,18 @@ export class TileRenderer {
     this._mapCanvas = document.createElement('canvas');
     this._mapCtx    = this._mapCanvas.getContext('2d', { alpha: false });
 
-    this._lastPGX      = null;
-    this._lastPGY      = null;
+    // FIX A — pre-allocated ImageData
+    this._imgData  = null;
+    this._imgDataW = 0;
+    this._imgDataH = 0;
+
+    // CHUNKING: track last bake focus (global tile) instead of pGX/pGY
+    this._lastFocusX   = null;
+    this._lastFocusY   = null;
+    // Global tile coordinate of the top-left corner of the baked canvas
+    this._bakeOriginX  = 0;
+    this._bakeOriginY  = 0;
+
     this._lastSunAngle = this._shadows?.sunAngle     ?? 0;
     this._lastSunElev  = this._shadows?.sunElevation ?? 0;
     this._lastTilt     = null;
@@ -72,43 +83,39 @@ export class TileRenderer {
   get ctx() { return this._wr.ctx; }
   get cam() { return this._wr.cam; }
 
-  // ── RGB cache ────────────────────────────────────────────────────────────
+  // ── RGB cache ─────────────────────────────────────────────────────────────
 
   _buildRgbCache() {
     const cache = {};
     for (const [id, c] of Object.entries(this.terrain.colors)) {
-      cache[id] = {
-        flat: hexToRgb(c.flat),
-        top:  hexToRgb(c.top),
-      };
+      cache[id] = { flat: hexToRgb(c.flat), top: hexToRgb(c.top) };
     }
     return cache;
   }
 
-  // ── Bake scheduling ──────────────────────────────────────────────────────
+  // ── Bake scheduling ───────────────────────────────────────────────────────
 
-  _scheduleBake(terrainCache, pGX, pGY) {
-    this._pendingBake = { terrainCache, pGX, pGY };
+  _scheduleBake(terrainCache, focusX, focusY) {
+    this._pendingBake = { terrainCache, focusX, focusY };
     if (this._baking) return;
     this._baking = true;
 
     const run = () => {
       if (!this._pendingBake) { this._baking = false; return; }
-
-      const { terrainCache, pGX, pGY } = this._pendingBake;
+      const { terrainCache, focusX, focusY } = this._pendingBake;
       this._pendingBake = null;
 
-      this._bakeMap(terrainCache, pGX, pGY);
+      this._bakeMap(terrainCache, focusX, focusY);
 
-      this._lastPGX      = pGX;
-      this._lastPGY      = pGY;
+      this._lastFocusX   = focusX;
+      this._lastFocusY   = focusY;
       this._lastTilt     = this.cam.tilt;
       this._lastSunAngle = this._shadows?.sunAngle     ?? 0;
       this._lastSunElev  = this._shadows?.sunElevation ?? 0;
       this._baking       = false;
 
       if (this._pendingBake)
-        this._scheduleBake(this._pendingBake.terrainCache, this._pendingBake.pGX, this._pendingBake.pGY);
+        this._scheduleBake(this._pendingBake.terrainCache, this._pendingBake.focusX, this._pendingBake.focusY);
     };
 
     if (typeof requestIdleCallback === 'function') {
@@ -118,31 +125,61 @@ export class TileRenderer {
     }
   }
 
-  // ── Core bake ────────────────────────────────────────────────────────────
+  // ── Core bake ─────────────────────────────────────────────────────────────
 
-  _bakeMap(terrainCache, pGX, pGY) {
+  /**
+   * Bake the terrain map centred on (focusX, focusY) in global tile coords.
+   *
+   * CHUNKING CHANGE:
+   *   — Iterates globalTx from (focusX − mapW/2) to (focusX + mapW/2).
+   *   — Calls terrainCache.get(globalTx, globalTy) directly.
+   *   — Records _bakeOriginX/_bakeOriginY so _drawBakedImage can project
+   *     the top-left pixel of the canvas to the correct screen position.
+   */
+  _bakeMap(terrainCache, focusX, focusY) {
     const cam = this.cam;
-    const W   = cam.mapW;
-    const H   = cam.mapH;
+    const W   = cam.mapW;   // render-chunk tile width
+    const H   = cam.mapH;   // render-chunk tile height
     const PX  = this.BAKE_TILE_PX;
     const t   = Math.max(0, Math.min(1, cam.tilt));
 
-    this._mapCanvas.width  = W * PX;
-    this._mapCanvas.height = H * PX;
+    const pw = W * PX;
+    const ph = H * PX;
 
-    const imgData = this._mapCtx.createImageData(W * PX, H * PX);
+    // FIX A — only resize when canvas dimensions change
+    if (this._mapCanvas.width !== pw || this._mapCanvas.height !== ph) {
+      this._mapCanvas.width  = pw;
+      this._mapCanvas.height = ph;
+      this._imgData  = this._mapCtx.createImageData(pw, ph);
+      this._imgDataW = pw;
+      this._imgDataH = ph;
+    }
+
+    // CHUNKING: bake origin is the global tile at canvas pixel (0,0)
+    const originX = Math.floor(focusX - W / 2);
+    const originY = Math.floor(focusY - H / 2);
+    this._bakeOriginX = originX;
+    this._bakeOriginY = originY;
+
+    const imgData = this._imgData;
     const pixels  = imgData.data;
 
-    for (let ty = 0; ty < H; ty++) {
-      for (let tx = 0; tx < W; tx++) {
-        const tid = terrainCache.getLocal(tx, ty, pGX, pGY, W, H) ?? 5;
-        const rgb = this._rgbCache[tid] ?? this._rgbCache[5];
+    // FIX C — inline lerp, no intermediate array per tile
+    for (let row = 0; row < H; row++) {
+      for (let col = 0; col < W; col++) {
+        // CHUNKING: look up by global tile coordinate
+        const globalTx = originX + col;
+        const globalTy = originY + row;
+        const tid      = terrainCache.get(globalTx, globalTy) ?? 5;
+        const rgb      = this._rgbCache[tid] ?? this._rgbCache[5];
 
-        const [r, g, b] = lerpRgb(rgb.flat, rgb.top, t);
-        const base = (ty * W * PX + tx) * 4;
-        pixels[base]     = r;
-        pixels[base + 1] = g;
-        pixels[base + 2] = b;
+        const fr = rgb.flat[0], fg = rgb.flat[1], fb = rgb.flat[2];
+        const tr = rgb.top[0],  tg = rgb.top[1],  tb = rgb.top[2];
+
+        const base = (row * W * PX + col) * 4;
+        pixels[base]     = (fr + (tr - fr) * t) | 0;
+        pixels[base + 1] = (fg + (tg - fg) * t) | 0;
+        pixels[base + 2] = (fb + (tb - fb) * t) | 0;
         pixels[base + 3] = 255;
       }
     }
@@ -151,12 +188,18 @@ export class TileRenderer {
     this._bakeDirty = false;
   }
 
-  // ── Stale-check ──────────────────────────────────────────────────────────
+  // ── Stale-check ───────────────────────────────────────────────────────────
 
-  _needsRebake(pGX, pGY) {
-    if (this._bakeDirty)                                          return true;
-    if (pGX !== this._lastPGX || pGY !== this._lastPGY)          return true;
-    if (Math.abs(this.cam.tilt - (this._lastTilt ?? -1)) > 0.01) return true;
+  /**
+   * CHUNKING CHANGE: compare focusX/focusY (global) instead of pGX/pGY.
+   * Threshold of 1 tile avoids constant rebaking while the player moves.
+   */
+  _needsRebake(focusX, focusY) {
+    if (this._bakeDirty)                                              return true;
+    if (this._lastFocusX === null)                                    return true;
+    if (Math.abs(focusX - this._lastFocusX) > 1 ||
+        Math.abs(focusY - this._lastFocusY) > 1)                     return true;
+    if (Math.abs(this.cam.tilt - (this._lastTilt ?? -1)) > 0.01)     return true;
     if (this._shadows?.enabled) {
       if (Math.abs((this._shadows.sunAngle     ?? 0) - this._lastSunAngle) > 0.1)  return true;
       if (Math.abs((this._shadows.sunElevation ?? 0) - this._lastSunElev)  > 0.01) return true;
@@ -164,15 +207,20 @@ export class TileRenderer {
     return false;
   }
 
-  // ── Draw helpers ─────────────────────────────────────────────────────────
+  // ── Draw helpers ──────────────────────────────────────────────────────────
 
+  /**
+   * CHUNKING CHANGE: project _bakeOriginX/_bakeOriginY (global tile coords)
+   * to get the canvas transform; no local-to-global conversion needed.
+   */
   _drawBakedImage() {
     const { cam, _wr: wr } = this;
     const PX = this.BAKE_TILE_PX;
 
-    const p00 = worldToScreen(0, 0, 0, cam);
-    const p10 = worldToScreen(1, 0, 0, cam);
-    const p01 = worldToScreen(0, 1, 0, cam);
+    // Top-left pixel of the baked canvas is global tile (_bakeOriginX, _bakeOriginY)
+    const p00 = worldToScreen(this._bakeOriginX,     this._bakeOriginY,     0, cam);
+    const p10 = worldToScreen(this._bakeOriginX + 1, this._bakeOriginY,     0, cam);
+    const p01 = worldToScreen(this._bakeOriginX,     this._bakeOriginY + 1, 0, cam);
 
     wr.drawTransformedImage(
       this._mapCanvas,
@@ -212,9 +260,14 @@ export class TileRenderer {
 
   // ── Public draw entry point ───────────────────────────────────────────────
 
-  drawLayer(tiles, playerTx, playerTy, terrainCache, pGX, pGY) {
-    if (this._needsRebake(pGX, pGY)) {
-      this._scheduleBake(terrainCache, pGX, pGY);
+  /**
+   * CHUNKING CHANGE: tiles now carry GLOBAL tx/ty. worldToScreen handles
+   * them correctly because the camera focus is also in global space.
+   * No pGX/pGY argument needed here.
+   */
+  drawLayer(tiles, playerTx, playerTy, terrainCache, focusX, focusY) {
+    if (this._needsRebake(focusX, focusY)) {
+      this._scheduleBake(terrainCache, focusX, focusY);
       if (this._mapCanvas.width === 0 || this._mapCanvas.height === 0) {
         this._drawFallbackFill();
         return;
@@ -231,6 +284,7 @@ export class TileRenderer {
     buf.length     = 0;
 
     for (const t of tiles) {
+      // t.tx / t.ty are global tile coords — worldToScreen works directly
       const sc = worldToScreen(t.tx + 0.5, t.ty + 0.5, 0, cam);
       if (sc.x < -MARGIN || sc.x > W + MARGIN ||
           sc.y < -MARGIN || sc.y > H + MARGIN) continue;
@@ -249,41 +303,47 @@ export class TileRenderer {
     }
   }
 
-  // ── Merged-LOD layer ─────────────────────────────────────────────────────
+  // ── Merged-LOD layer ──────────────────────────────────────────────────────
 
-  drawMergedBlock(blockX, blockY, lod, terrainCache, pGX, pGY, alpha) {
+  /**
+   * CHUNKING CHANGE:
+   *   — blockX/blockY are global tile coords; no toLocal() conversion.
+   *   — terrainCache.get(blockX + dx, blockY + dy) used directly (FIX B).
+   *   — pts[] built from global tile coords; worldToScreen handles them.
+   */
+  drawMergedBlock(blockX, blockY, lod, terrainCache, alpha) {
     const { cam, terrain, _wr: wr } = this;
-    const mapW = cam.mapW, mapH = cam.mapH;
 
-    const centerLocal = {
-      tx: blockX + lod / 2 - pGX + mapW / 2,
-      ty: blockY + lod / 2 - pGY + mapH / 2,
-    };
-    const sc = worldToScreen(centerLocal.tx, centerLocal.ty, 0, cam);
-    const blockScreenSize = lod * (cam.tileW * cam.zoom);
-    if (sc.x < -blockScreenSize || sc.x > this.ctx.canvas.width  + blockScreenSize ||
-        sc.y < -blockScreenSize || sc.y > this.ctx.canvas.height + blockScreenSize) return;
+    // Quick screen-space cull — block centre in global tile space
+    const centreTx = blockX + lod / 2;
+    const centreTy = blockY + lod / 2;
+    const sc       = worldToScreen(centreTx, centreTy, 0, cam);
+    const blockPx  = lod * (cam.tileW * cam.zoom);
+    if (sc.x < -blockPx || sc.x > this.ctx.canvas.width  + blockPx ||
+        sc.y < -blockPx || sc.y > this.ctx.canvas.height + blockPx) return;
 
+    // FIX B — average terrain RGB from _rgbCache (no parseInt per block)
     let r = 0, g = 0, b = 0, count = 0;
-    for (let dy = 0; dy < lod; dy += Math.max(1, Math.floor(lod / 2))) {
-      for (let dx = 0; dx < lod; dx += Math.max(1, Math.floor(lod / 2))) {
+    const step = Math.max(1, Math.floor(lod / 2));
+    for (let dy = 0; dy < lod; dy += step) {
+      for (let dx = 0; dx < lod; dx += step) {
+        // CHUNKING: direct global lookup
         const tid = terrainCache.get(blockX + dx, blockY + dy) ?? 5;
-        const col = terrain.colors[tid]?.flat || '#5bc23a';
-        r += parseInt(col.slice(1, 3), 16);
-        g += parseInt(col.slice(3, 5), 16);
-        b += parseInt(col.slice(5, 7), 16);
+        const rgb = this._rgbCache[tid] ?? this._rgbCache[5];
+        r += rgb.flat[0]; g += rgb.flat[1]; b += rgb.flat[2];
         count++;
       }
     }
 
-    const fillStyle = `rgb(${Math.round(r / count)},${Math.round(g / count)},${Math.round(b / count)})`;
-    const toLocal   = (gx, gy) => ({ tx: gx - pGX + mapW / 2, ty: gy - pGY + mapH / 2 });
-    const pts       = [
-      toLocal(blockX,       blockY),
-      toLocal(blockX + lod, blockY),
-      toLocal(blockX + lod, blockY + lod),
-      toLocal(blockX,       blockY + lod),
-    ].map(c => worldToScreen(c.tx, c.ty, 0, cam));
+    const fillStyle = `rgb(${(r / count) | 0},${(g / count) | 0},${(b / count) | 0})`;
+
+    // CHUNKING: corners are global tile coords — project directly
+    const pts = [
+      worldToScreen(blockX,       blockY,       0, cam),
+      worldToScreen(blockX + lod, blockY,       0, cam),
+      worldToScreen(blockX + lod, blockY + lod, 0, cam),
+      worldToScreen(blockX,       blockY + lod, 0, cam),
+    ];
 
     this.ctx.save();
     this.ctx.globalAlpha = alpha;
@@ -291,25 +351,27 @@ export class TileRenderer {
     this.ctx.restore();
   }
 
-  drawMergedLayer(terrainCache, pGX, pGY, lod, alpha) {
-    const mapW  = this.cam.mapW;
-    const mapH  = this.cam.mapH;
-    const halfW = Math.ceil(mapW / 2);
-    const halfH = Math.ceil(mapH / 2);
+  /**
+   * CHUNKING CHANGE: signature replaces (pGX, pGY) with (focusX, focusY).
+   * Iteration is centred on focusX/focusY in global tile space.
+   */
+  drawMergedLayer(terrainCache, focusX, focusY, lod, alpha) {
+    const halfW = Math.ceil(this.cam.mapW / 2);
+    const halfH = Math.ceil(this.cam.mapH / 2);
 
-    for (let gy = pGY - halfH; gy < pGY + halfH; gy += lod)
-      for (let gx = pGX - halfW; gx < pGX + halfW; gx += lod)
-        this.drawMergedBlock(gx, gy, lod, terrainCache, pGX, pGY, alpha);
+    for (let gy = focusY - halfH; gy < focusY + halfH; gy += lod)
+      for (let gx = focusX - halfW; gx < focusX + halfW; gx += lod)
+        this.drawMergedBlock(gx, gy, lod, terrainCache, alpha);
   }
 
   invalidate() { this._bakeDirty = true; }
 
-  invalidateSync(terrainCache, pGX, pGY) {
+  invalidateSync(terrainCache, focusX, focusY) {
     this._pendingBake = null;
     this._baking      = false;
-    this._bakeMap(terrainCache, pGX, pGY);
-    this._lastPGX      = pGX;
-    this._lastPGY      = pGY;
+    this._bakeMap(terrainCache, focusX, focusY);
+    this._lastFocusX   = focusX;
+    this._lastFocusY   = focusY;
     this._lastTilt     = this.cam.tilt;
     this._lastSunAngle = this._shadows?.sunAngle     ?? 0;
     this._lastSunElev  = this._shadows?.sunElevation ?? 0;

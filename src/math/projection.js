@@ -1,25 +1,30 @@
 /**
  * GOE Core — Projection Math
- * All coordinate transform math for the isometric / flat-map hybrid renderer.
+ *
+ * CHUNKING REFACTOR
+ * -----------------
+ * worldToScreen() and screenToWorld() now use cam.focusX / cam.focusY
+ * as the world-space origin instead of cam.mapW/2 and cam.mapH/2.
+ *
+ * All entity coordinates are now GLOBAL TILE COORDINATES. The camera's
+ * focusX/focusY (kept == player.tx/ty every frame) is the point that
+ * maps to screen-pixel (−camX, −camY).  Setting camX = −W/2, camY = −H/2
+ * centres the focus on a canvas of width W and height H.
+ *
+ * Nothing else in this file changes.
  *
  * Coordinate spaces:
- *   World (tx, ty) — tile-space floats, origin top-left of the local chunk
+ *   World (tx, ty) — global tile-space floats, origin at geo (0,0)
  *   Screen (sx, sy) — pixel coords on the canvas, origin top-left
- *   Camera  (camX, camY) — scroll offset from world-origin to canvas top-left
+ *   Camera (camX,camY) — pixel nudge; focus maps to screen (−camX, −camY)
  */
 
 // ─── TILT / EASE ─────────────────────────────────────────────────────────────
 
-/** Ease-in-out interpolation */
 export function easeInOut(t) {
   return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
 }
 
-/**
- * Map zoom level to a 0-1 tilt factor.
- * Below ZOOM_FLAT → completely flat (top-down).
- * Above ZOOM_ISO  → full isometric.
- */
 export function zoomToTilt(zoom, zoomFlat = 0.18, zoomIso = 0.58) {
   if (zoom <= zoomFlat) return 0;
   if (zoom >= zoomIso)  return 1;
@@ -39,19 +44,26 @@ export function getElevOffset(tileHeight, tilt, zoom) {
 // ─── WORLD → SCREEN ──────────────────────────────────────────────────────────
 
 /**
- * Project a world-tile position to screen pixels.
- * @param {number} tx   World tile X
- * @param {number} ty   World tile Y
+ * Project a global-tile position to screen pixels.
+ *
+ * @param {number} tx   Global tile X  (entity's static world coordinate)
+ * @param {number} ty   Global tile Y
  * @param {number} elev Elevation offset in pixels (already scaled)
- * @param {object} cam  Camera state {tilt, zoom, camX, camY, rotation, mapW, mapH, tileW}
+ * @param {object} cam  Camera state:
+ *                        { tilt, zoom, camX, camY, rotation,
+ *                          focusX, focusY, tileW }
+ *
+ * Key change: origin is now cam.focusX / cam.focusY, not cam.mapW/2 / cam.mapH/2.
  */
 export function worldToScreen(tx, ty, elev, cam) {
   const hw = tileHalfWidth(cam.zoom, cam.tileW);
   const hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-  const xw = tx - cam.mapW / 2;
-  const zw = ty - cam.mapH / 2;
-  const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
-  const xr = xw * cr + zw * sr;
+  // Offset from the camera's focus tile
+  const xw = tx - cam.focusX;
+  const zw = ty - cam.focusY;
+  const cr = Math.cos(cam.rotation);
+  const sr = Math.sin(cam.rotation);
+  const xr =  xw * cr + zw * sr;
   const zr = -xw * sr + zw * cr;
   return {
     x: (xr - zr) * hw - cam.camX,
@@ -65,22 +77,26 @@ export function worldToScreen(tx, ty, elev, cam) {
 export function topFaceQuad(tx, ty, elev, cam) {
   const hw = tileHalfWidth(cam.zoom, cam.tileW);
   const hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-  const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
-  const cx = tx - cam.mapW / 2, cz = ty - cam.mapH / 2;
+  const cr = Math.cos(cam.rotation);
+  const sr = Math.sin(cam.rotation);
+  // Offset from focus
+  const cx = tx - cam.focusX;
+  const cz = ty - cam.focusY;
   return [[0, 0], [1, 0], [1, 1], [0, 1]].map(([dx, dz]) => {
-    const xw = cx + dx, zw = cz + dz;
-    const xr = xw * cr + zw * sr, zr = -xw * sr + zw * cr;
+    const xw = cx + dx;
+    const zw = cz + dz;
+    const xr =  xw * cr + zw * sr;
+    const zr = -xw * sr + zw * cr;
     return { x: (xr - zr) * hw - cam.camX, y: (xr + zr) * hh - elev - cam.camY };
   });
 }
 
 /**
- * Depth sort key for a tile — used to determine back-to-front draw order.
+ * Depth sort key — back-to-front draw order.
  */
 export function tileDepth(tx, ty, rotation, footprintRadius = 0) {
   const cr = Math.cos(rotation);
   const sr = Math.sin(rotation);
-  // Sort from the back corner of the footprint
   const bx = tx - footprintRadius;
   const bz = ty - footprintRadius;
   const xr =  bx * cr + bz * sr;
@@ -88,19 +104,8 @@ export function tileDepth(tx, ty, rotation, footprintRadius = 0) {
   return xr + zr;
 }
 
-
-// ─── Depth sort helper ────────────────────────────────────────────────────────
 /**
- * Returns the depth of the FRONT CORNER of a square bounding box.
- *
- * The isometric depth axis is:  depth = tx·cos(rot) + ty·sin(rot)
- *
- * For a box centred at (tx,ty) with half-extent r tiles the front corner
- * (the one geometrically closest to the camera = highest depth = drawn last)
- * is at (tx + sign(cos)·r,  ty + sign(sin)·r).
- *
- * Using the front corner instead of the centre prevents large objects from
- * being buried behind smaller ones at non-cardinal camera angles.
+ * Depth of the FRONT CORNER of a square bounding box.
  */
 export function frontDepth(tx, ty, rot, r) {
   const cr = Math.cos(rot);
@@ -108,30 +113,37 @@ export function frontDepth(tx, ty, rot, r) {
   return (tx + Math.sign(cr) * r) * cr + (ty + Math.sign(sr) * r) * sr;
 }
 
-
 // ─── SCREEN → WORLD ──────────────────────────────────────────────────────────
 
 /**
- * Unproject a screen point back to world-tile coordinates (flat / top-down only).
+ * Unproject a screen point back to GLOBAL tile coordinates.
+ *
+ * Key change: result is offset from cam.focusX / cam.focusY,
+ * returning a global tile position.
  */
 export function screenToWorld(sx, sy, cam) {
-  const px = sx + cam.camX, py = sy + cam.camY;
+  const px = sx + cam.camX;
+  const py = sy + cam.camY;
   const hw = tileHalfWidth(cam.zoom, cam.tileW);
   const hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-  const rx = px / hw, rz = py / hh;
-  const xr = (rx + rz) * 0.5, zr = (rz - rx) * 0.5;
-  const cr = Math.cos(cam.rotation), sr = Math.sin(cam.rotation);
+  const rx = px / hw;
+  const rz = py / hh;
+  const xr = (rx + rz) * 0.5;
+  const zr = (rz - rx) * 0.5;
+  const cr = Math.cos(cam.rotation);
+  const sr = Math.sin(cam.rotation);
   return {
-    x: xr * cr - zr * sr + cam.mapW / 2,
-    y: xr * sr + zr * cr + cam.mapH / 2,
+    // Add back the global focus to get a global tile coordinate
+    x: xr * cr - zr * sr + cam.focusX,
+    y: xr * sr + zr * cr + cam.focusY,
   };
 }
 
 // ─── COLOUR UTILS ────────────────────────────────────────────────────────────
 
-/** Linear-interpolate between two hex colours. */
 export function lerpColor(a, b, t) {
-  const ah = parseInt(a.slice(1), 16), bh = parseInt(b.slice(1), 16);
+  const ah = parseInt(a.slice(1), 16);
+  const bh = parseInt(b.slice(1), 16);
   const ch = (h, s) => (h >> s) & 255;
   return `rgb(${
     Math.round(ch(ah, 16) + (ch(bh, 16) - ch(ah, 16)) * t)},${
@@ -139,7 +151,6 @@ export function lerpColor(a, b, t) {
     Math.round((ah & 255) + ((bh & 255) - (ah & 255))  * t)})`;
 }
 
-/** Multiply a hex colour's brightness by factor f (0–1). */
 export function shadeHex(hex, f) {
   const h = parseInt(hex.slice(1), 16);
   return '#' + [16, 8, 0]
@@ -149,10 +160,6 @@ export function shadeHex(hex, f) {
 
 // ─── ZOOM HELPER ─────────────────────────────────────────────────────────────
 
-/**
- * Apply a zoom delta anchored to a screen point (ax, ay).
- * Mutates cam in place; returns cam.
- */
 export function applyZoom(cam, newZoom, ax, ay, zoomMin, zoomMax) {
   newZoom = Math.max(zoomMin, Math.min(zoomMax, newZoom));
   ax = ax ?? 0;

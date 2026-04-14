@@ -1,50 +1,86 @@
 /**
- * ENGINE.JS — THREE TARGETED FIXES
- * 
- * Confirmed causes of the 500+ MB tab memory from profiling:
- *   1. tileCacheSize 56,640 — tile cache built even when tiles are sub-pixel
- *   2. physicsParticles 522  — fixed entities attached to physics unnecessarily  
- *   3. entities 1,737        — stale entities from previous locations never removed
- * 
- * All fixes applied below.
+ * ENGINE.JS — CHUNKING REFACTOR
  *
- * STREAMING UPDATE:
- *   _doFetch no longer processes results itself. Loaders call
- *   _ingestLoaderResult() as partial data becomes available (terrain,
- *   roads, POIs, per-batch buildings) so the scene updates continuously
- *   instead of freezing until all blueprints are generated.
+ * ════════════════════════════════════════════════════════════════════════════
+ * WHAT CHANGED (summary)
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * OLD: "Local chunk" model
+ *   — All entities lived in a 80×80 local tile grid.
+ *   — When the player walked ~18 tiles from the centre, the engine stopped the
+ *     world, looped through every one of the 15,000+ entities, subtracted a
+ *     (shiftX, shiftY) offset from each, rebuilt both spatial trees, and reset
+ *     the physics particles. This "world re-centre" event caused a visible
+ *     frame hitch and accumulated GC pressure with every step.
+ *
+ * NEW: "Static global coord" model
+ *   — Entities are placed once with GLOBAL TILE COORDINATES derived from
+ *     lonToGlobalX / latToGlobalY. Those coordinates NEVER change.
+ *   — camera.focusX / focusY (set to player.tx / player.ty every frame)
+ *     is the only moving part. worldToScreen() subtracts the focus, so
+ *     entities near the focus appear near the screen centre automatically.
+ *   — The world re-centre block is gone. "Pan" is a constant-time camera
+ *     operation that already happened anyway.
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * DETAILED CHANGE LIST
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * Engine constructor / mount
+ *   + camera.focusX / focusY initialised from geoCenter at startup.
+ *   + playerEntity spawned at global tile position (lonToGlobalX/latToGlobalY).
+ *   − _lastFetchPos / _fetching remain (fetch is still geo-triggered).
+ *   − _exactPG / _pGlobal() removed (not needed; pGlobal = player tile pos).
+ *
+ * _centreCameraOnPlayer()
+ *   — Sets cam.focusX = player.tx, cam.focusY = player.ty, then hard-snaps
+ *     camX = −canvas.width/2, camY = −(playerElev + canvas.height/2).
+ *
+ * _frameOptimized()
+ *   − World re-centre block (was: if (dFC > REFETCH_DIST) {...}) REMOVED.
+ *   + Camera focus update: cam.focusX/Y = player.tx/ty every frame.
+ *   + Geo fetch trigger: if player moved > REFETCH_GEO_DIST degrees, call
+ *     _doFetch(). geoCenter is updated to the player's current geo position.
+ *   + All terrainCache.getLocal(tx, ty, pGX, pGY, mapW, mapH) calls replaced
+ *     with terrainCache.get(tx, ty) — entities already carry global coords.
+ *   + Tile cache (_tileCache) iterates global coords around cam.focusX/Y.
+ *     No tile-shifting is needed when the player moves.
+ *   + drawLayer / drawMergedLayer receive focusX/Y instead of pGX/pGY.
+ *
+ * _ingestLoaderResult()
+ *   — For entities with lat/lon: converts to GLOBAL tile coords via
+ *     lonToGlobalX / latToGlobalY. No local-chunk subtraction.
+ *
+ * panTo() / flyTo()
+ *   — Moves the player's global tile position to the new geo location,
+ *     clears all non-player entities, resets the camera focus, and refetches.
+ *     No _rebuildAllEntitiesGeo() needed.
+ *
+ * _doFetch()
+ *   — Fresh-ID pruning unchanged: entities not returned by any loader after
+ *     a fetch are removed. Their global coords mean they simply won't be
+ *     returned if the player is now far away — correct behaviour.
+ *
+ * Spatial trees (collision + render)
+ *   — Bounds are recomputed around the player each time they are rebuilt.
+ *     With global coords this is the only correct approach.
+ *
+ * _playerGeo() helper
+ *   — Converts player.tx/ty (global tile coords) back to {lat,lon} using a
+ *     linear approximation relative to geoCenter. Used for fetch triggering,
+ *     elevation queries, and the HUD.
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * ALL PREVIOUS PERFORMANCE FIXES ARE PRESERVED
+ * ════════════════════════════════════════════════════════════════════════════
+ * FIX 1  Tile-cache sub-pixel skip
+ * FIX 2  Spatial-tree rebuilt only when dirty, only solid entities in radius
+ * FIX 3  TerrainCache capped at 200k entries
+ * FIX 4  Per-entity terrain lookup cached per frame
+ * FIX 5  Sub-pixel zoom cull
+ * FIX 6  RenderTree frustum query
  */
 
-/**
- * GOE Core — Engine (WorldRenderer architecture)
- *
- * The Engine is entity-type agnostic. It has no knowledge of trees, buildings,
- * fauna, aviation, or any other domain concept. All such logic lives in loaders.
- *
- * Loaders return `entities` — an array of EntityDef plain objects:
- *   {
- *     id:             string          — stable unique key
- *     tx:             number          — tile X
- *     ty:             number          — tile Y
- *     solid:          boolean         — blocks player movement
- *     bboxRadius:     number          — collision radius in tiles
- *     physicsEnabled: boolean         — attach to physics world
- *     physicsRadius:  number
- *     fixed:          boolean         — immovable in physics sim
- *     elevOffset:     number          — extra height offset (optional)
- *     renderFn:       (wr, groundElevPx, extra) => void   — how to draw it
- *     updateFn:       (dt, engine) => void | null         — per-frame logic
- *   }
- *
- * Performance optimisations:
- *   - Frustum culling (CULL_MARGIN = 4)
- *   - Tile cache rebuilt only when camera moves
- *   - Physics world updates only when dynamic entities exist
- *   - LOD at low zoom (renderHeavy flag on EntityDef)
- *   - Camera animation throttle drops expensive geometry
- *   - VoxelRenderer: cached hex colours, no save/restore
- *   - OSMLayerRenderer: concurrent tile fetch limit (6)
- */
 import { EventEmitter }      from './core/EventEmitter.js';
 import { Camera }            from './core/Camera.js';
 import { InputManager }      from './core/InputManager.js';
@@ -56,7 +92,7 @@ import { WorldRenderer }     from './render/Renderer.js';
 import { drawPlayer }        from './assets/PlayerBlueprint.js';
 import {
   worldToScreen, screenToWorld, tileHalfWidth, tileHalfHeight,
-  getElevOffset, tileDepth, frontDepth
+  getElevOffset, tileDepth, frontDepth,
 } from './math/projection.js';
 import {
   geoToTile, tileToGeo, lonToGlobalX, latToGlobalY,
@@ -67,12 +103,14 @@ import PhysicsWorld2D from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/phy
 import Particle2D     from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/particle2d.js';
 import { Entity }     from './core/Entity.js';
 import { Quadtree }   from './spatial/Quadtree.js';
+import { RenderTree } from './spatial/RenderTree.js';
+import { SpriteCache } from './spatial/SpriteCache.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PlayerEntity — the one concrete entity the engine knows about
+// PlayerEntity
 // ─────────────────────────────────────────────────────────────────────────────
 class PlayerEntity extends Entity {
-  constructor(id = 'player', tx = 40, ty = 40) {
+  constructor(id = 'player', tx = 0, ty = 0) {
     super(id, 'player', tx, ty);
     this.walkCycle  = 0;
     this.isMoving   = false;
@@ -116,8 +154,9 @@ class PlayerEntity extends Entity {
 
       for (const attempt of attempts) {
         if (!this._isBlocked(attempt.x, attempt.y, engine)) {
-          this.tx = Math.max(0.5, Math.min(engine._mapW - 0.5, attempt.x));
-          this.ty = Math.max(0.5, Math.min(engine._mapH - 0.5, attempt.y));
+          // CHUNKING: no map boundary clamp — global coords are unbounded
+          this.tx = attempt.x;
+          this.ty = attempt.y;
           break;
         }
       }
@@ -128,8 +167,14 @@ class PlayerEntity extends Entity {
 
     this._resolveOverlap(engine);
 
-    // Contact-push dynamic physics entities
-    for (const other of engine.entities) {
+    const pushRadius = this.physicsRadius + 2;
+    const pushRange  = {
+      x: this.tx - pushRadius, y: this.ty - pushRadius,
+      w: pushRadius * 2,       h: pushRadius * 2,
+    };
+    const pushCandidates = engine._spatialTree?.queryRange(pushRange) ?? [];
+    for (const candidate of pushCandidates) {
+      const other = candidate.entity;
       if (other === this || !other._particle || other.fixed) continue;
       const dx   = other.tx - this.tx;
       const dy   = other.ty - this.ty;
@@ -157,8 +202,8 @@ class PlayerEntity extends Entity {
   }
 
   _isBlocked(newX, newY, engine) {
-    const queryRadius = this.bboxRadius + 1.5;
-    const range = { x: newX - queryRadius, y: newY - queryRadius, w: queryRadius * 2, h: queryRadius * 2 };
+    const qr = this.bboxRadius + 1.5;
+    const range = { x: newX - qr, y: newY - qr, w: qr * 2, h: qr * 2 };
     const candidates = engine._spatialTree.queryRange(range);
     for (const candidate of candidates) {
       const other = candidate.entity;
@@ -182,7 +227,11 @@ class PlayerEntity extends Entity {
   }
 
   _resolveOverlap(engine) {
-    for (const e of engine.entities) {
+    const qr = this.bboxRadius + 2;
+    const range = { x: this.tx - qr, y: this.ty - qr, w: qr * 2, h: qr * 2 };
+    const candidates = engine._spatialTree?.queryRange(range) ?? [];
+    for (const candidate of candidates) {
+      const e = candidate.entity;
       if (e === this || !e.solid) continue;
       if (!this._overlaps(this.tx, this.ty, e)) continue;
       if (e._isBuildingBox) {
@@ -193,10 +242,10 @@ class PlayerEntity extends Entity {
         const overlapT = (this.ty + this.bboxRadius) - (e.ty - hd);
         const overlapB = (e.ty + hd) - (this.ty - this.bboxRadius);
         const min = Math.min(overlapL, overlapR, overlapT, overlapB);
-        if (min === overlapL) this.tx -= overlapL;
+        if      (min === overlapL) this.tx -= overlapL;
         else if (min === overlapR) this.tx += overlapR;
         else if (min === overlapT) this.ty -= overlapT;
-        else this.ty += overlapB;
+        else                       this.ty += overlapB;
       } else {
         const dx = this.tx - e.tx, dy = this.ty - e.ty;
         const dist = Math.hypot(dx, dy) || 0.001;
@@ -216,45 +265,41 @@ class PlayerEntity extends Entity {
   }
 
   render(wr, groundElevPx, extra) {
-     // ADD THIS:
-    if (!this._renderFn && this._isBuildingBox === false) console.warn('[render:missing]', this.id, this.type);
     drawPlayer(wr, this.tx, this.ty, groundElevPx + this.elevOffset, this, extra.mPerTile);
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GenericEntity — wraps any EntityDef from a loader
+// GenericEntity
 // ─────────────────────────────────────────────────────────────────────────────
 class GenericEntity extends Entity {
-  /**
-   * @param {object} def  EntityDef supplied by a loader
-   */
   constructor(def) {
     super(def.id, def.type ?? 'generic', def.tx, def.ty);
-    this.solid          = def.solid          ?? false;
-    this.bboxRadius     = def.bboxRadius     ?? 0.35;
-    this.physicsEnabled = def.physicsEnabled ?? false;
-    this.physicsRadius  = def.physicsRadius  ?? 0.35;
-    this.fixed          = def.fixed          ?? true;
-    this.elevOffset     = def.elevOffset     ?? 0;
-    this.altitudeM      = def.altitudeM      ?? 0;
-    this.visualAlt      = def.visualAlt      ?? 0;
-    this.showAltitudeLine = def.showAltitudeLine ?? false;
+    this.solid            = def.solid            ?? false;
+    this.bboxRadius       = def.bboxRadius       ?? 0.35;
+    this.physicsEnabled   = def.physicsEnabled   ?? false;
+    this.physicsRadius    = def.physicsRadius     ?? 0.35;
+    this.fixed            = def.fixed             ?? true;
+    this.elevOffset       = def.elevOffset        ?? 0;
+    this.altitudeM        = def.altitudeM         ?? 0;
+    this.visualAlt        = def.visualAlt         ?? 0;
+    this.showAltitudeLine = def.showAltitudeLine  ?? false;
 
     this._isBuildingBox = def._isBuildingBox ?? false;
-    this._scale  = def._scale  ?? 1;
-    this._facingAngle = def._facingAngle ?? 0;
-    this._bpKey  = def._bpKey  ?? null;
-
-    this._lodColor   = def._lodColor   ?? null;
-    this._areaM2     = def._areaM2     ?? null;
-    this._heightM    = def._heightM    ?? null;
-
-    this.renderHeavy = def.renderHeavy ?? false;
-
-    this._renderFn = def.renderFn ?? null;
-    this._updateFn = def.updateFn ?? null;
+    this._scale         = def._scale         ?? 1;
+    this._facingAngle   = def._facingAngle   ?? 0;
+    this._bpKey         = def._bpKey         ?? null;
+    this._lodColor      = def._lodColor      ?? null;
+    this._areaM2        = def._areaM2        ?? null;
+    this._heightM       = def._heightM       ?? null;
+    this.renderHeavy    = def.renderHeavy    ?? false;
+    this._renderFn      = def.renderFn       ?? null;
+    this._updateFn      = def.updateFn       ?? null;
     this._procBlueprint = def._procBlueprint ?? null;
+    this._batches       = def._batches       ?? null;
+
+    // Per-frame terrain cache (FIX 4)
+    this._cachedTerrainId = null;
   }
 
   update(dt, engine) {
@@ -269,10 +314,15 @@ class GenericEntity extends Entity {
 // ─────────────────────────────────────────────────────────────────────────────
 // Engine constants
 // ─────────────────────────────────────────────────────────────────────────────
-const MAP_W        = 80;
-const MAP_H        = 80;
-const REFETCH_DIST = 18;
-const M_PER_TILE   = 2;
+
+const MAP_W = 80;   // render-chunk tile width  (kept for terrain iteration)
+const MAP_H = 80;   // render-chunk tile height
+
+// Geographic distance (degrees) that triggers a new OSM fetch.
+// ~0.002° ≈ 220 m, comfortably within a typical OSM query radius.
+const REFETCH_GEO_DIST = 0.002;
+
+const M_PER_TILE = 2;
 
 const CULL_MARGIN             = 4;
 const LOD_HEAVY_MIN_ZOOM      = 0.05;
@@ -281,6 +331,18 @@ const TILE_CACHE_DIRTY_ZOOM   = 0.002;
 const TILE_CACHE_DIRTY_TILT   = 0.005;
 const CAMERA_SETTLE_MS        = 120;
 const MAX_CONCURRENT_TILES    = 6;
+
+const MAX_TERRAIN_ENTRIES = 200_000;   // FIX 3
+const TERRAIN_EVICT_TO    = 160_000;
+
+// Collision tree: only index solid entities within this tile radius
+const SPATIAL_SOLID_RADIUS = 20;       // FIX 2
+
+// Render tree query margin
+const RENDER_CULL_MARGIN = CULL_MARGIN * 2;  // FIX 6
+
+// Radius of the per-rebuild spatial-tree bounds (global tile space)
+const QUADTREE_HALF = 400;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Engine
@@ -299,25 +361,26 @@ export class Engine extends EventEmitter {
     this._lastFetchPos = { lat: 0, lon: 0 };
     this._fetching     = false;
 
-    // Streaming fetch state
     this._fetchFreshIds = new Set();
     this._fetchPending  = 0;
 
+    // CHUNKING: camera is initialised with focusX/Y = player global tile pos.
+    // They will be properly set to the player spawn position in mount().
     this.camera = new Camera({
       mapW: this._mapW, mapH: this._mapH, mPerTile: this._mPerTile,
       ...opts.cameraOpts,
     });
 
-    this.entities     = [];
-    this.playerEntity = null;
-    this._selectedId  = null;
+    this.entities         = [];
+    this._dynamicEntities = [];
+    this.playerEntity     = null;
+    this._selectedId      = null;
 
     this.physicsWorld   = null;
     this.physicsEnabled = true;
 
     this.terrainRegistry = createTerrainRegistry(opts.terrainOverrides);
     this.terrainCache    = new TerrainCache();
-    this.terrainCache.setOrigin(0, 0);
     this.terrainCache.mPerTile = this._mPerTile;
     this._loaders = [];
 
@@ -349,17 +412,19 @@ export class Engine extends EventEmitter {
     this._cameraAnimating   = false;
     this._cameraSettleTimer = null;
 
-    this._spatialTree = null;
-    this._entityMap = new Map();
+    this._spatialTree  = null;
+    this._entityMap    = new Map();
+    this._spatialDirty = true;
+
+    this._renderTree      = null;
+    this._renderTreeDirty = true;
   }
 
   // ── Physics helpers ───────────────────────────────────────────────────────
-  // FIX 2: Skip fixed entities entirely
   _attachPhysics(entity) {
     if (!this.physicsWorld || !entity.physicsEnabled) return;
     if (entity._particle) return;
     if (entity.fixed) return;
-
     const p = new Particle2D(entity.tx, entity.ty);
     p.radius = entity.physicsRadius;
     p.fixed  = false;
@@ -377,25 +442,19 @@ export class Engine extends EventEmitter {
   }
 
   // ── Performance helpers ───────────────────────────────────────────────────
-  _isTileVisible(tx, ty, cam, W, H) {
-    const sc = worldToScreen(tx + 0.5, ty + 0.5, 0, cam);
-    const hw = tileHalfWidth(cam.zoom, cam.tileW);
-    const hh = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-    const mx = hw * CULL_MARGIN * 2;
-    const my = hh * CULL_MARGIN * 2;
-    return (sc.x > -mx && sc.x < W + mx && sc.y > -my && sc.y < H + my);
-  }
-
   _isTileCacheDirty() {
     const c = this._tileCacheState;
     if (!c) return true;
     const cam = this.camera;
     return (
-      Math.abs(cam.camX - c.camX) > TILE_CACHE_DIRTY_PX   ||
-      Math.abs(cam.camY - c.camY) > TILE_CACHE_DIRTY_PX   ||
-      Math.abs(cam.zoom - c.zoom)  > TILE_CACHE_DIRTY_ZOOM  ||
-      Math.abs(cam.tilt - c.tilt)  > TILE_CACHE_DIRTY_TILT  ||
-      Math.abs(cam.rotation - c.rot) > 0.002
+      Math.abs(cam.camX   - c.camX)   > TILE_CACHE_DIRTY_PX   ||
+      Math.abs(cam.camY   - c.camY)   > TILE_CACHE_DIRTY_PX   ||
+      // CHUNKING: also dirty when the camera focus (player) has moved enough
+      Math.abs(cam.focusX - c.focusX) > 0.5                    ||
+      Math.abs(cam.focusY - c.focusY) > 0.5                    ||
+      Math.abs(cam.zoom   - c.zoom)   > TILE_CACHE_DIRTY_ZOOM  ||
+      Math.abs(cam.tilt   - c.tilt)   > TILE_CACHE_DIRTY_TILT  ||
+      Math.abs(cam.rotation - c.rot)  > 0.002
     );
   }
 
@@ -403,6 +462,7 @@ export class Engine extends EventEmitter {
     const cam = this.camera;
     this._tileCacheState = {
       camX: cam.camX, camY: cam.camY,
+      focusX: cam.focusX, focusY: cam.focusY,
       zoom: cam.zoom, tilt: cam.tilt, rot: cam.rotation,
     };
   }
@@ -418,7 +478,6 @@ export class Engine extends EventEmitter {
   _patchVoxelRenderer(voxel) {
     if (voxel.__perfPatched) return;
     voxel.__perfPatched = true;
-
     const hexCache = new Map();
     const cachedHex = (hex) => {
       if (hexCache.has(hex)) return hexCache.get(hex);
@@ -427,17 +486,15 @@ export class Engine extends EventEmitter {
       hexCache.set(hex, h);
       return h;
     };
-
     const origBeginFrame = voxel.beginFrame?.bind(voxel);
     voxel.beginFrame = function() {
       if (origBeginFrame) origBeginFrame();
-      this.ctx.globalAlpha = 1;
-      this.ctx.shadowBlur = 0;
-      this.ctx.shadowColor = 'transparent';
-      this.ctx.lineCap = 'butt';
-      this.ctx.lineJoin = 'miter';
+      this.ctx.globalAlpha  = 1;
+      this.ctx.shadowBlur   = 0;
+      this.ctx.shadowColor  = 'transparent';
+      this.ctx.lineCap      = 'butt';
+      this.ctx.lineJoin     = 'miter';
     };
-
     const origBox = voxel.box?.bind(voxel);
     voxel.box = function(x, y, z, w, h, d, top, right, front) {
       this._topFill   = cachedHex(top);
@@ -450,10 +507,8 @@ export class Engine extends EventEmitter {
   _patchOSMLayerRenderer(osmLayer) {
     if (osmLayer.__perfPatched) return;
     osmLayer.__perfPatched = true;
-
-    osmLayer._inFlight    = 0;
+    osmLayer._inFlight     = 0;
     osmLayer._pendingLoads = [];
-
     const startLoad = (img, src) => {
       if (osmLayer._inFlight < MAX_CONCURRENT_TILES) {
         osmLayer._inFlight++;
@@ -464,7 +519,6 @@ export class Engine extends EventEmitter {
         osmLayer._pendingLoads.push({ img, src });
       }
     };
-
     osmLayer._flushPending = function() {
       while (this._inFlight < MAX_CONCURRENT_TILES && this._pendingLoads.length) {
         const { img, src } = this._pendingLoads.shift();
@@ -474,13 +528,45 @@ export class Engine extends EventEmitter {
         img.src = src;
       }
     };
-
     if (osmLayer._loadTile) {
       const origLoadTile = osmLayer._loadTile.bind(osmLayer);
       osmLayer._loadTile = function(img, src) { startLoad(img, src); };
     } else {
       osmLayer._startLoad = startLoad;
     }
+  }
+
+  // ── GEO HELPERS ───────────────────────────────────────────────────────────
+
+  /**
+   * Return the global tile X coordinate for a geographic longitude.
+   * Thin wrapper kept for readability.
+   */
+  _geoToGlobalTile(lat, lon) {
+    return {
+      tx: lonToGlobalX(lon, lat, this._mPerTile),
+      ty: latToGlobalY(lat, this._mPerTile),
+    };
+  }
+
+  /**
+   * Convert the player's global tile position back to {lat, lon}.
+   *
+   * Uses a linear (small-angle) approximation relative to geoCenter —
+   * accurate to within a few metres at the distances we care about.
+   * Only used for fetch triggering, elevation sampling, and the HUD.
+   */
+  _playerGeo() {
+    if (!this.playerEntity) return this.geoCenter;
+    const refTx = lonToGlobalX(this.geoCenter.lon, this.geoCenter.lat, this._mPerTile);
+    const refTy = latToGlobalY(this.geoCenter.lat, this._mPerTile);
+    const dxM   = (this.playerEntity.tx - refTx) * this._mPerTile;
+    const dyM   = (this.playerEntity.ty - refTy) * this._mPerTile;
+    const cosLat = Math.cos(this.geoCenter.lat * Math.PI / 180);
+    return {
+      lat: this.geoCenter.lat - (dyM / 111_111),
+      lon: this.geoCenter.lon + (dxM / (111_111 * cosLat)),
+    };
   }
 
   // ── MOUNT ─────────────────────────────────────────────────────────────────
@@ -499,7 +585,7 @@ export class Engine extends EventEmitter {
     this._osmLayer = new OSMLayerRenderer(this._renderer, this._tileURLFn);
     this._patchOSMLayerRenderer(this._osmLayer);
 
-    this.physicsWorld = new PhysicsWorld2D(this._mapW, this._mapH, 0.0);
+    this.physicsWorld = new PhysicsWorld2D(this._mapW * 10, this._mapH * 10, 0.0);
 
     const resize = () => {
       canvas.width  = canvas.offsetWidth  || window.innerWidth;
@@ -525,7 +611,6 @@ export class Engine extends EventEmitter {
     });
     this._input.on('click',  ev => this._handleClick(ev));
 
-    // Init loaders and wire streaming callback
     for (const loader of this._loaders) {
       loader.init?.(this);
       if (typeof loader.setPartialResultCallback === 'function') {
@@ -533,9 +618,15 @@ export class Engine extends EventEmitter {
       }
     }
 
-    this.playerEntity = new PlayerEntity('player', this._mapW / 2, this._mapH / 2);
+    // CHUNKING: spawn player at the GLOBAL tile position of geoCenter
+    const spawnTile = this._geoToGlobalTile(this.geoCenter.lat, this.geoCenter.lon);
+    this.playerEntity = new PlayerEntity('player', spawnTile.tx, spawnTile.ty);
     this.entities.push(this.playerEntity);
     this._attachPhysics(this.playerEntity);
+
+    // Align camera focus to player before the first fetch
+    cam.focusX = spawnTile.tx;
+    cam.focusY = spawnTile.ty;
 
     this._doFetch(this.geoCenter);
     this._lastT = 0;
@@ -547,7 +638,14 @@ export class Engine extends EventEmitter {
     this.weather = new WeatherSystem(this._renderer);
     this.weather.setMode('none');
 
-    this._spatialTree = new Quadtree({ x: 0, y: 0, w: this._mapW, h: this._mapH }, 8);
+    // Spatial trees — bounds will be recalculated on first dirty rebuild
+    this._spatialTree  = new Quadtree({ x: 0, y: 0, w: 1, h: 1 }, 8);
+    this._renderTree   = new RenderTree({ x: 0, y: 0, w: 1, h: 1 }, 8);
+    this._spatialDirty = true;
+    this._renderTreeDirty = true;
+
+    this._spriteCache      = new SpriteCache();
+    this._treeRebuildTimer = 0;
 
     return this;
   }
@@ -571,6 +669,9 @@ export class Engine extends EventEmitter {
     this.entities.push(entity);
     if (entity.type !== 'player') this._entityMap.set(entity.id, entity);
     if (entity.physicsEnabled) this._attachPhysics(entity);
+    if (!entity.fixed) this._dynamicEntities.push(entity);
+    this._spatialDirty    = true;
+    this._renderTreeDirty = true;
   }
 
   removeEntity(id) {
@@ -579,14 +680,24 @@ export class Engine extends EventEmitter {
       const entity = this.entities[idx];
       this._detachPhysics(entity);
       this.entities.splice(idx, 1);
+      if (!entity.fixed) {
+        this._dynamicEntities = this._dynamicEntities.filter(e => e.id !== id);
+      }
       if (entity.type !== 'player') this._entityMap.delete(id);
+      this._spatialDirty    = true;
+      this._renderTreeDirty = true;
     }
   }
 
   selectEntity(id) {
     this._selectedId = id;
     const ent = this.entities.find(e => e.id === id);
-    if (ent) this._flyToTile(ent.tx + 0.5, ent.ty + 0.5);
+    if (ent) {
+      // CHUNKING: fly to the entity's global tile position
+      const { x, y } = worldToScreen(ent.tx + 0.5, ent.ty + 0.5, 0, this.camera);
+      this.camera.camX = x - (this._canvas?.width  ?? 800) / 2;
+      this.camera.camY = y - (this._canvas?.height ?? 600) / 2;
+    }
   }
 
   use(loader) {
@@ -605,19 +716,48 @@ export class Engine extends EventEmitter {
     if (this._running && this.geoCenter) loader.prefetch?.(this.geoCenter);
   }
 
+  /**
+   * Teleport the player to a new geographic location.
+   *
+   * CHUNKING CHANGE: instead of shifting 15k entities, we:
+   *   1. Move the player to the new global tile position.
+   *   2. Clear all non-player entities (they belong to the old location).
+   *   3. Reset the camera focus and OSM tile cache.
+   *   4. Trigger a fresh fetch.
+   */
   panTo(lat, lon) {
-    const prevGeo = { ...this.geoCenter };
     this.geoCenter = { lat, lon };
     this._osmLayer.resetTileCache();
-    this._exactPG  = null;
+
     if (this.playerEntity) {
-      this.playerEntity.tx = this._mapW / 2;
-      this.playerEntity.ty = this._mapH / 2;
+      const tile = this._geoToGlobalTile(lat, lon);
+      this.playerEntity.tx = tile.tx;
+      this.playerEntity.ty = tile.ty;
       this.playerEntity._posHistory = [];
+      if (this.playerEntity._particle) {
+        this.playerEntity._particle.position.x     = tile.tx;
+        this.playerEntity._particle.position.y     = tile.ty;
+        this.playerEntity._particle.prevPosition.x = tile.tx;
+        this.playerEntity._particle.prevPosition.y = tile.ty;
+      }
     }
+
+    // Remove all non-player entities — they live at the old location
+    for (let i = this.entities.length - 1; i >= 0; i--) {
+      const e = this.entities[i];
+      if (e.type === 'player') continue;
+      this._detachPhysics(e);
+      this.entities.splice(i, 1);
+      this._entityMap.delete(e.id);
+    }
+    this._dynamicEntities = this._dynamicEntities.filter(e => e.type === 'player');
+
     this._lastFetchPos = { lat: 0, lon: 0 };
     this._fetching     = false;
-    this._rebuildAllEntitiesGeo(prevGeo);
+    this._spatialDirty    = true;
+    this._renderTreeDirty = true;
+    this._tileCacheState  = null;
+
     this._centreCameraOnPlayer();
     this._doFetch(this.geoCenter);
   }
@@ -633,87 +773,40 @@ export class Engine extends EventEmitter {
   setSunAngle(angle, elev) { this._renderer.setSunAngle(angle, elev); }
 
   // ── INTERNAL HELPERS ──────────────────────────────────────────────────────
-  _rebuildAllEntitiesGeo(prevGeoCenter = this.geoCenter, shiftX, shiftY) {
-    if (shiftX !== undefined && shiftY !== undefined) {
-      for (const e of this.entities) {
-        if (e.type === 'player') continue;
-        e.tx -= shiftX;
-        e.ty -= shiftY;
-        e._geoDirty = true;
-        if (e._particle) {
-          e._particle.position.x     = e.tx;
-          e._particle.position.y     = e.ty;
-          if (e._particle.prevPosition) {
-            e._particle.prevPosition.x -= shiftX;
-            e._particle.prevPosition.y -= shiftY;
-          }
-        }
-      }
-      return;
-    }
-    for (const e of this.entities) {
-      if (e.type === 'player') continue;
-      const geo = e.getGeo(prevGeoCenter, this._mPerTile, this._mapW, this._mapH);
-      e.setGeo(geo.lat, geo.lon, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-      e._geoDirty = false;
-      if (e._particle) {
-        const dx = e.tx - e._particle.position.x;
-        const dy = e.ty - e._particle.position.y;
-        e._particle.position.x     = e.tx;
-        e._particle.position.y     = e.ty;
-        if (e._particle.prevPosition) {
-          e._particle.prevPosition.x += dx;
-          e._particle.prevPosition.y += dy;
-        }
-      }
-    }
-  }
 
+  /**
+   * Hard-snap the camera to centre on the player.
+   *
+   * CHUNKING CHANGE: sets focusX/Y = player tile position, then computes
+   * camX/Y so the player is pixel-centred on the canvas.
+   */
   _centreCameraOnPlayer() {
     if (!this._canvas || !this.playerEntity) return;
+    const cam  = this.camera;
+    cam.focusX = this.playerEntity.tx;
+    cam.focusY = this.playerEntity.ty;
+    // With focus == player, worldToScreen(player, 0, {...cam, camX:0, camY:0}) = (0, -elev).
+    // To centre on screen: camX = -W/2, camY = -elev - H/2.
     const elev = this._playerElev();
-    const { x, y } = worldToScreen(
-      this.playerEntity.tx, this.playerEntity.ty, elev,
-      { ...this.camera, camX: 0, camY: 0 }
-    );
-    this.camera.camX = x - this._canvas.width  / 2;
-    this.camera.camY = y - this._canvas.height / 2;
-  }
-
-  _flyToTile(tx, ty) {
-    const { x, y } = worldToScreen(tx, ty, 0, this.camera);
-    this.camera.camX = x - (this._canvas?.width  ?? 800) / 2;
-    this.camera.camY = y - (this._canvas?.height ?? 600) / 2;
+    cam.camX   = -this._canvas.width  / 2;
+    cam.camY   = -(elev + this._canvas.height / 2);
   }
 
   _playerElev() {
     if (!this.playerEntity) return 0;
-    const geo   = this.playerEntity.getGeo(this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+    // CHUNKING: derive geo from global tile position
+    const geo   = this._playerGeo();
     const elevM = this._elevation?.sampleElevation(geo.lat, geo.lon) ?? 0;
     return getElevOffset(this._elevation?.toTileHeight(elevM) ?? 4, this.camera.tilt, this.camera.zoom);
   }
 
-  _pGlobal() {
-    if (!this._exactPG) {
-      this._exactPG = {
-        x: lonToGlobalX(this.geoCenter.lon, this.geoCenter.lat, this._mPerTile),
-        y: latToGlobalY(this.geoCenter.lat, this._mPerTile),
-      };
-    }
-    return this._exactPG;
-  }
-
   // ── FETCH ─────────────────────────────────────────────────────────────────
-  // Loaders stream partial results via _ingestLoaderResult() as data becomes
-  // available (terrain first, then roads/POIs, then buildings in batches).
-  // Stale-entity pruning only runs once every loader promise has resolved,
-  // using the accumulated _fetchFreshIds set.
   _doFetch(center) {
     if (this._fetching) return;
 
     const d = Math.hypot(
       center.lat - this._lastFetchPos.lat,
-      center.lon - this._lastFetchPos.lon
+      center.lon - this._lastFetchPos.lon,
     );
     if (d < 0.001 && this._lastFetchPos.lat !== 0) return;
 
@@ -731,11 +824,7 @@ export class Engine extends EventEmitter {
       })
     );
 
-    // Each loader promise resolves once — after all its streaming batches are
-    // done. We collect fresh IDs from the final result, then prune once every
-    // loader has resolved.
     fetches.forEach(p => p.then(result => {
-      // Accumulate every ID this loader ever produced
       if (result?.entities) {
         for (const def of result.entities) {
           if (def?.id) this._fetchFreshIds.add(def.id);
@@ -744,8 +833,7 @@ export class Engine extends EventEmitter {
 
       if (--this._fetchPending > 0) return;
 
-      // ── All loaders done ─────────────────────────────────────────────────
-      // FIX 3: Prune stale entities — those not returned by any loader.
+      // Prune stale entities (those not returned by any loader for this fetch)
       if (this._fetchFreshIds.size > 0) {
         for (let i = this.entities.length - 1; i >= 0; i--) {
           const e = this.entities[i];
@@ -755,29 +843,42 @@ export class Engine extends EventEmitter {
           this.entities.splice(i, 1);
           this._entityMap.delete(e.id);
         }
+        this._dynamicEntities = this._dynamicEntities.filter(
+          e => e.type === 'player' || this._fetchFreshIds.has(e.id)
+        );
+        this._spatialDirty    = true;
+        this._renderTreeDirty = true;
       }
 
       this._elevation?.prefetch?.(center);
+      for (const loader of this._loaders) {
+        loader._cache?.evictDistant(center.lat, center.lon, 0.5);
+      }
+
       this._fetching = false;
       this.emit('fetch:done');
     }));
+
+    this._renderTreeDirty = true;
   }
 
   // ── PARTIAL RESULT INGESTION ──────────────────────────────────────────────
-  // Called by loaders as each chunk of data becomes available. Safe to call
-  // from async contexts — upserts happen synchronously so the next render
-  // frame picks them up immediately.
   _ingestLoaderResult(result) {
     if (!result || typeof result !== 'object') return;
 
-    const { x: pGX, y: pGY } = this._pGlobal();
-    const toLocal = (globalX, globalY) => ({
-      x: globalX - pGX + this._mapW / 2,
-      y: globalY - pGY + this._mapH / 2,
-    });
+    if (result.terrainUpdates?.size) {
+      if (!this._pendingTerrainUpdates) this._pendingTerrainUpdates = new Map();
+      for (const [k, v] of result.terrainUpdates) {
+        this._pendingTerrainUpdates.set(k, v);
+      }
+    }
 
     if (result.terrainUpdates?.size) {
       this.terrainCache.merge(result.terrainUpdates);
+      // CHUNKING: evict around player's global tile position
+      if (this.playerEntity) {
+        this.terrainCache.evictDistant(this.playerEntity.tx, this.playerEntity.ty, 600);
+      }
     }
 
     if (result.weatherUpdate && this.weather) {
@@ -789,41 +890,42 @@ export class Engine extends EventEmitter {
     if (!result.entities?.length) return;
 
     for (const def of result.entities) {
+      if (def.id) this._fetchFreshIds.add(def.id);
+
       const lat = def.latitude ?? def.lat;
       const lon = def.longitude ?? def.lon;
-      let tx = def.tx, ty = def.ty;
+
+      let tx = def.tx;
+      let ty = def.ty;
 
       if (lat != null && lon != null) {
-        const globalX = lonToGlobalX(lon, this.geoCenter.lat, this._mPerTile);
-        const globalY = latToGlobalY(lat, this._mPerTile);
-        const local   = toLocal(globalX, globalY);
-        if (
-          local.x < 0 || local.x >= this._mapW ||
-          local.y < 0 || local.y >= this._mapH
-        ) continue;
-        tx = local.x;
-        ty = local.y;
+        // CHUNKING: convert to GLOBAL tile coordinates directly.
+        // No local-chunk subtraction; the entity lives at this position forever.
+        tx = lonToGlobalX(lon, this.geoCenter.lat, this._mPerTile);
+        ty = latToGlobalY(lat, this._mPerTile);
       } else if (tx == null || ty == null) {
         continue;
       }
 
       const entity = new GenericEntity({ ...def, tx, ty });
       const old    = this._entityMap.get(entity.id);
+
       if (old) {
+        // CHUNKING: positions should already be identical between refreshes
+        // (same global coords from same lat/lon). Update them anyway in case
+        // of loader corrections.
         old.tx             = entity.tx;
         old.ty             = entity.ty;
-        old.solid          = entity.bboxRadius;      // ← was missing
+        old.solid          = entity.solid;
         old.bboxRadius     = entity.bboxRadius;
-        old._renderFn      = entity._renderFn;       // ← add
-        old._procBlueprint = entity._procBlueprint;  // ← add
-        old._ring          = entity._ring;            // ← add
-        old._nodes         = entity._nodes;           // ← add
-        old._originGX      = entity._originGX;        // ← add
-        old._originGY      = entity._originGY;        // ← add
-        old._mPerTile      = entity._mPerTile;        // ← add
-        old._geometricR    = entity._geometricR;      // ← add
-        old.renderHeavy    = entity.renderHeavy;      // ← add
-        old._lodColor      = entity._lodColor;        // ← add
+        old._renderFn      = entity._renderFn;
+        old._procBlueprint = entity._procBlueprint;
+        old._ring          = entity._ring;
+        old._nodes         = entity._nodes;
+        old._batches       = entity._batches;
+        old._geometricR    = entity._geometricR;
+        old.renderHeavy    = entity.renderHeavy;
+        old._lodColor      = entity._lodColor;
         if (old._particle) {
           old._particle.position.x = old.tx;
           old._particle.position.y = old.ty;
@@ -834,10 +936,20 @@ export class Engine extends EventEmitter {
     }
   }
 
-  // ── OPTIMISED RENDER FRAME ─────────────────────────────────────────────────
+  // ── OPTIMISED RENDER FRAME ────────────────────────────────────────────────
   _frameOptimized(ts) {
     if (!this._running) return;
     this._raf = requestAnimationFrame(ts2 => this._frameOptimized(ts2));
+
+    // Apply terrain updates accumulated since last frame
+    if (this._pendingTerrainUpdates?.size) {
+      this.terrainCache.merge(this._pendingTerrainUpdates);
+      if (this.playerEntity) {
+        this.terrainCache.evictDistant(this.playerEntity.tx, this.playerEntity.ty, 600);
+      }
+      this._pendingTerrainUpdates = null;
+      this._tileCacheState = null;
+    }
 
     const dt = Math.min((ts - (this._lastT || ts)) / 1000, 0.05);
     this._lastT = ts;
@@ -848,36 +960,93 @@ export class Engine extends EventEmitter {
     const W      = canvas.width;
     const H      = canvas.height;
 
-    // Rebuild spatial index
-    if (this._spatialTree) {
+    // ── 1. Update all entities ────────────────────────────────────────────
+    for (const e of this.entities) e.update(dt, this);
+
+    // ── CHUNKING: update camera focus to player's current global position ─
+    // This is the only "move" that happens — the camera pans to the player;
+    // no entity coordinates are changed.
+    if (this.playerEntity) {
+      cam.focusX = this.playerEntity.tx;
+      cam.focusY = this.playerEntity.ty;
+    }
+
+    // ── CHUNKING: geo-based fetch trigger ─────────────────────────────────
+    // Replace the old world-recentre block (which shifted 15k entities) with
+    // a simple geo-distance check. If the player has moved far enough, update
+    // geoCenter and fetch new OSM data. No entity coordinates are touched.
+    if (this.playerEntity) {
+      const playerGeo = this._playerGeo();
+      const geoD = Math.hypot(
+        playerGeo.lat - this._lastFetchPos.lat,
+        playerGeo.lon - this._lastFetchPos.lon,
+      );
+      if (geoD > REFETCH_GEO_DIST) {
+        this.geoCenter = playerGeo;
+        this._doFetch(this.geoCenter);
+        this.emit('center:changed', this.geoCenter);
+      }
+    }
+
+    // ── 2. Rebuild collision spatial index when dirty (FIX 2) ─────────────
+    if (this._spatialTree && this._spatialDirty) {
       if (!this._collidableScratch) this._collidableScratch = [];
       const scratch = this._collidableScratch;
       scratch.length = 0;
+
+      const px = this.playerEntity?.tx ?? 0;
+      const py = this.playerEntity?.ty ?? 0;
+
+      // CHUNKING: bounds are centred on player's global tile position
+      this._spatialTree = new Quadtree(
+        { x: px - QUADTREE_HALF, y: py - QUADTREE_HALF, w: QUADTREE_HALF * 2, h: QUADTREE_HALF * 2 },
+        8,
+      );
+
       for (const e of this.entities) {
-        if (e.solid) scratch.push({ x: e.tx, y: e.ty, entity: e, radius: e.bboxRadius });
+        if (!e.solid) continue;
+        if (Math.abs(e.tx - px) > SPATIAL_SOLID_RADIUS ||
+            Math.abs(e.ty - py) > SPATIAL_SOLID_RADIUS) continue;
+        scratch.push({ x: e.tx, y: e.ty, entity: e, radius: e.bboxRadius });
       }
       this._spatialTree.rebuild(scratch);
+      this._spatialDirty = false;
     }
 
-    // 1. Update entities
-    for (const e of this.entities) e.update(dt, this);
+    // ── 3. Rebuild render tree when entities change (FIX 6) ───────────────
+    if (this._renderTreeDirty) {
+      const now = performance.now();
+      if (!this._fetching || (now - this._treeRebuildTimer > 250)) {
+        const px = this.playerEntity?.tx ?? 0;
+        const py = this.playerEntity?.ty ?? 0;
+        this._renderTree = new RenderTree(
+          { x: px - QUADTREE_HALF, y: py - QUADTREE_HALF, w: QUADTREE_HALF * 2, h: QUADTREE_HALF * 2 },
+          8,
+        );
+        this._renderTree.rebuild(this.entities);
+        this._renderTreeDirty  = false;
+        this._treeRebuildTimer = now;
+      }
+    }
 
-    // 2. Camera
+    // ── 4. Camera physics ─────────────────────────────────────────────────
     cam.updateTilt(dt);
-    cam.updateRotation(dt, this.playerEntity?.tx ?? 0, this.playerEntity?.ty ?? 0, worldToScreen);
+    cam.updateRotation(
+      dt,
+      this.playerEntity?.tx ?? 0,
+      this.playerEntity?.ty ?? 0,
+      worldToScreen,
+    );
     if (this._input.isRotatingLeft())  cam.rotVel -= 2.2 * dt;
     if (this._input.isRotatingRight()) cam.rotVel += 2.2 * dt;
     if (this.weather) this.weather.update(dt, this.playerEntity?.tx ?? 0, this.playerEntity?.ty ?? 0);
 
-    // 3. Elevations
+    // ── 5. Player elevation ───────────────────────────────────────────────
     const pElev = this._playerElev();
 
-    // 4. Physics
+    // ── 6. Physics ────────────────────────────────────────────────────────
     if (this.physicsWorld && this.physicsEnabled) {
-      let hasDynamic = false;
-      for (const e of this.entities) {
-        if (e._particle && !e.fixed) { hasDynamic = true; break; }
-      }
+      const hasDynamic = this._dynamicEntities.length > 0;
       if (hasDynamic) {
         if (this.playerEntity?._particle) {
           const pp = this.playerEntity._particle;
@@ -885,7 +1054,7 @@ export class Engine extends EventEmitter {
           pp.position.y = this.playerEntity.ty;
         }
         this.physicsWorld.update();
-        for (const e of this.entities) {
+        for (const e of this._dynamicEntities) {
           if (!e._particle) continue;
           if (e === this.playerEntity || e.fixed) {
             e._particle.position.x     = e.tx;
@@ -899,109 +1068,61 @@ export class Engine extends EventEmitter {
       }
     }
 
-    // 5. World re-centre
-    let didRecentre = false;
-    if (this.playerEntity) {
-      const dx  = this.playerEntity.tx - this._mapW / 2;
-      const dy  = this.playerEntity.ty - this._mapH / 2;
-      const dFC = Math.hypot(dx, dy);
-
-      if (dFC > REFETCH_DIST) {
-        didRecentre = true;
-        const nx = dx / dFC, ny = dy / dFC;
-        const shiftX = Math.round(nx * REFETCH_DIST);
-        const shiftY = Math.round(ny * REFETCH_DIST);
-        const snapTx = this._mapW / 2 + shiftX;
-        const snapTy = this._mapH / 2 + shiftY;
-        const oldScreen = worldToScreen(snapTx, snapTy, pElev, cam);
-        const prevGeo   = { ...this.geoCenter };
-
-        if (!this._exactPG) this._pGlobal();
-        this._exactPG.x += shiftX;
-        this._exactPG.y += shiftY;
-        this.geoCenter = tileToGeo(snapTx, snapTy, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-        this._osmLayer.resetTileCache();
-
-        this.playerEntity.tx -= shiftX;
-        this.playerEntity.ty -= shiftY;
-        for (const p of this.playerEntity._posHistory) { p.x -= shiftX; p.y -= shiftY; }
-        if (this.playerEntity._particle?.prevPosition) {
-          this.playerEntity._particle.prevPosition.x -= shiftX;
-          this.playerEntity._particle.prevPosition.y -= shiftY;
-        }
-
-        const newScreen = worldToScreen(this._mapW / 2, this._mapH / 2, pElev, cam);
-        cam.camX += newScreen.x - oldScreen.x;
-        cam.camY += newScreen.y - oldScreen.y;
-
-        this._rebuildAllEntitiesGeo(prevGeo, shiftX, shiftY);
-
-        for (const t of this._tileCache) { t.tx -= shiftX; t.ty -= shiftY; }
-
-        this._tileCacheState = null;
-        this._tileCache      = [];
-        this._skipTileCacheThisFrame = true;
-
-        this._doFetch(this.geoCenter);
-        this.emit('center:changed', this.geoCenter);
-      }
+    // ── 7. Smooth camera follow ───────────────────────────────────────────
+    // With focusX/Y == player.tx/ty, worldToScreen(player, 0, {camX:0,camY:0})
+    // returns (0, −pElev). Target: player at screen centre (W/2, H/2).
+    // → target camX = −W/2,  target camY = −(pElev + H/2).
+    if (cam.tilt > 0.08 && this.playerEntity) {
+      cam.camX += (-W / 2 - cam.camX) * 0.08;
+      cam.camY += (-(pElev + H / 2) - cam.camY) * 0.08;
     }
 
-    let pGX, pGY;
-    { const r = this._pGlobal(); pGX = r.x; pGY = r.y; }
-
-    // 6. Smooth camera follow
-    if (!didRecentre && cam.tilt > 0.08 && this.playerEntity) {
-      const { x: px, y: py } = worldToScreen(
-        this.playerEntity.tx, this.playerEntity.ty, pElev,
-        { ...cam, camX: 0, camY: 0 }
-      );
-      cam.camX += (px - W / 2 - cam.camX) * 0.08;
-      cam.camY += (py - H / 2 - cam.camY) * 0.08;
-    }
-
-    // ═══════════════════════ RENDERING ════════════════════════════════════
+    // ═══════════════════════ RENDERING ═══════════════════════════════════
     ctx.fillStyle = this.weather?.mode === 'rain' ? '#020308' : '#04060a';
     ctx.fillRect(0, 0, W, H);
 
     this._renderer.beginFrame();
 
-    // 7. OSM tiles
+    // 8. OSM tiles
     if (this.debugLayers.osmTiles) {
       this._osmLayer.draw(canvas, this.geoCenter);
     }
 
-    // 8. Terrain tiles — FIX 1: early-out when tiles are sub-pixel
-    const overAlpha = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
-    const terrainHW = tileHalfWidth(cam.zoom, cam.tileW);
+    // 9. Terrain tiles
+    // CHUNKING: all terrain coordinates are global; pass cam.focusX/Y instead of pGX/pGY.
+    const focusX   = cam.focusX;
+    const focusY   = cam.focusY;
+    const overAlpha  = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
+    const terrainHW  = tileHalfWidth(cam.zoom, cam.tileW);
+
     if (overAlpha > 0 && this.debugLayers.overpass && terrainHW >= 2) {
       const lod = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
 
       if (lod > 1) {
-        this._tileR.drawMergedLayer(this.terrainCache, pGX, pGY, lod, overAlpha);
+        // CHUNKING: pass focusX/Y (global) instead of pGX/pGY (local origin)
+        this._tileR.drawMergedLayer(this.terrainCache, focusX, focusY, lod, overAlpha);
       } else {
         if (this._isTileCacheDirty()) {
           this._saveTileCacheState();
           const hw  = terrainHW;
           const hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
           const txs = Math.min(120, Math.ceil(W / Math.max(1, hw)) + 4);
-          const tys = Math.min(120, Math.ceil(H / Math.max(1, Math.max(1, hh))) + 4);
-          const vC  = screenToWorld(W / 2, H / 2, cam);
-          const cx  = Math.round(Math.max(0, Math.min(this._mapW, vC.x)));
-          const cy  = Math.round(Math.max(0, Math.min(this._mapH, vC.y)));
+          const tys = Math.min(120, Math.ceil(H / Math.max(1, hh)) + 4);
+
+          // CHUNKING: screenToWorld returns global tile coords
+          const vC = screenToWorld(W / 2, H / 2, cam);
+          const cx = Math.round(vC.x);
+          const cy = Math.round(vC.y);
 
           let writeIdx = 0;
-          for (let ty = Math.max(0, cy - tys); ty < Math.min(this._mapH, cy + tys); ty++) {
-            for (let tx = Math.max(0, cx - txs); tx < Math.min(this._mapW, cx + txs); tx++) {
-              const terrainId = this.terrainCache.get(
-                tx - this._mapW / 2 + pGX,
-                ty - this._mapH / 2 + pGY
-              ) ?? TerrainType.GRASS;
-
+          for (let ty = cy - tys; ty < cy + tys; ty++) {
+            for (let tx = cx - txs; tx < cx + txs; tx++) {
+              // CHUNKING: terrainCache.get() with global tile coords directly
+              const terrainId = this.terrainCache.get(tx, ty) ?? TerrainType.GRASS;
               if (writeIdx < this._tileCache.length) {
-                const slot = this._tileCache[writeIdx];
-                slot.tx        = tx;
-                slot.ty        = ty;
+                const slot    = this._tileCache[writeIdx];
+                slot.tx       = tx;   // global tile X
+                slot.ty       = ty;   // global tile Y
                 slot.terrainId = terrainId;
               } else {
                 this._tileCache.push({ tx, ty, terrainId });
@@ -1011,98 +1132,146 @@ export class Engine extends EventEmitter {
           }
           this._tileCache.length = writeIdx;
         }
-        this._skipTileCacheThisFrame = false;
+
+        // CHUNKING: pass focusX/Y instead of pGX/pGY
         this._tileR.drawLayer(
           this._tileCache,
           this.playerEntity?.tx ?? 0,
           this.playerEntity?.ty ?? 0,
-          this.terrainCache, pGX, pGY
+          this.terrainCache, focusX, focusY,
         );
       }
     }
 
-    // 9. Entities — frustum culling + LOD
+    // ── 10. Entity rendering (FIX 6 RenderTree query) ─────────────────────
     if (overAlpha > 0 && this.debugLayers.entities) {
       const drawHeavy = cam.zoom >= LOD_HEAVY_MIN_ZOOM;
+      const hw        = tileHalfWidth(cam.zoom, cam.tileW);
+      const subPixel  = hw < 1.5;   // FIX 5
 
-      for (const e of this.entities) {
-        if (!e.visible) continue;
+      if (!subPixel && this._renderTree) {
+        const worldCorners = [
+          screenToWorld(0, 0, cam),
+          screenToWorld(W, 0, cam),
+          screenToWorld(W, H, cam),
+          screenToWorld(0, H, cam),
+        ];
+        const visibleEntities = this._renderTree.queryFrustum(worldCorners, RENDER_CULL_MARGIN);
 
-        if (!this._isTileVisible(e.tx, e.ty, cam, W, H)) continue;
-
-        if (e.renderHeavy && !drawHeavy) continue;
-
-        if (e.renderHeavy && this._cameraAnimating) {
-          const elev = this.terrainRegistry.heights[
-            this.terrainCache.getLocal(e.tx, e.ty, pGX, pGY, this._mapW, this._mapH)
-          ] ?? 4;
-          const groundElevPx = getElevOffset(elev, cam.tilt, cam.zoom) + (e.elevOffset ?? 0);
-          const geomR = e._geometricR ?? e.bboxRadius ?? 0.35;
-          const depth = frontDepth(e.tx, e.ty, cam.rotation, geomR);
-          this._renderer.submitWorldObject(depth, () => {
-            const sc = worldToScreen(e.tx + 0.5, e.ty + 0.5, groundElevPx, cam);
-            const r  = Math.max(2, cam.zoom * cam.tileW * 0.3);
-            ctx.beginPath();
-            ctx.arc(sc.x, sc.y, r, 0, Math.PI * 2);
-            ctx.fillStyle = e._lodColor ?? '#78909C';
-            ctx.fill();
-          });
-          continue;
+        if (this.playerEntity && !visibleEntities.includes(this.playerEntity)) {
+          visibleEntities.push(this.playerEntity);
         }
 
-        const groundH = this.terrainRegistry.heights[
-          this.terrainCache.getLocal(e.tx, e.ty, pGX, pGY, this._mapW, this._mapH)
-        ] ?? 4;
+        // FIX 4 — cache terrain lookup for visible entities only
+        // CHUNKING: terrainCache.get(tx, ty) with global coords directly
+        for (const e of visibleEntities) {
+          if (!e.visible) continue;
+          e._cachedTerrainId = this.terrainCache.get(e.tx, e.ty);
+        }
 
+        for (const e of visibleEntities) {
+          if (!e.visible) continue;
+          if (e.renderHeavy && !drawHeavy) continue;
+
+          const terrainId    = e._cachedTerrainId ?? this.terrainCache.get(e.tx, e.ty);
+          const groundH      = this.terrainRegistry.heights[terrainId] ?? 4;
+          const groundElevPx = getElevOffset(groundH, cam.tilt, cam.zoom);
+          const altPx        = e.getAltitudePx?.(cam) ?? 0;
+          const totalElevPx  = groundElevPx + altPx;
+
+          if (e.renderHeavy && this._cameraAnimating) {
+            const geomR = e._geometricR ?? e.bboxRadius ?? 0.35;
+            const depth = frontDepth(e.tx, e.ty, cam.rotation, geomR);
+            this._renderer.submitWorldObject(depth, () => {
+              const sc = worldToScreen(e.tx + 0.5, e.ty + 0.5, groundElevPx, cam);
+              const r  = Math.max(2, cam.zoom * cam.tileW * 0.3);
+              ctx.beginPath();
+              ctx.arc(sc.x, sc.y, r, 0, Math.PI * 2);
+              ctx.fillStyle = e._lodColor ?? '#78909C';
+              ctx.fill();
+            });
+            continue;
+          }
+
+          if (e.fixed && this._spriteCache && !this._cameraAnimating && e.type !== 'player') {
+            const { x: sx, y: sy } = worldToScreen(e.tx + 0.5, e.ty + 0.5, totalElevPx, cam);
+            const geomR = e._geometricR ?? e.bboxRadius ?? 0.35;
+            const pxR   = geomR * tileHalfWidth(cam.zoom, cam.tileW) * 2 + 16;
+
+            // Notice we now pass 'bakedCam' into the callback
+            this._spriteCache.draw(ctx, e, cam, sx, sy, (oCtx, bakedCam) => {
+              const prevCtx = this._renderer.ctx;
+              const prevCam = this._renderer.cam;
+              
+              // Use the new helper to correctly switch contexts for all sub-systems
+              this._renderer.setRenderTarget(oCtx || prevCtx, bakedCam || prevCam);
+
+              e.render(this._renderer, totalElevPx, {
+                selectedId:   this._selectedId,
+                terrainCache: this.terrainCache,
+                mPerTile:     this._mPerTile,
+              });
+
+              // Restore the original targets
+              this._renderer.setRenderTarget(prevCtx, prevCam);
+            }, pxR);
+          } else {
+            // Standard live render for moving things
+            e.render(this._renderer, totalElevPx, {
+              selectedId:   this._selectedId,
+              terrainCache: this.terrainCache,
+              mPerTile:     this._mPerTile,
+            });
+          }
+
+          if (altPx > 0 && e.showAltitudeLine && cam.zoom > 0.08) {
+            const geomR = e._geometricR ?? e.bboxRadius ?? 0.35;
+            const depth = frontDepth(e.tx, e.ty, cam.rotation, geomR);
+            this._renderer.submitWorldObject(depth, () => {
+              const ground = worldToScreen(e.tx + 0.5, e.ty + 0.5, groundElevPx, cam);
+              const airPos = worldToScreen(e.tx + 0.5, e.ty + 0.5, totalElevPx, cam);
+              this._renderer.drawLine(ground.x, ground.y, airPos.x, airPos.y, 'rgba(180,200,255,0.25)', 1);
+              this._renderer.drawCircle(ground.x, ground.y, 2, 'rgba(180,200,255,0.4)');
+            });
+          }
+        }
+
+      } else if (this.playerEntity?.visible) {
+        // subPixel path — only render the player
+        const terrainId    = this.terrainCache.get(this.playerEntity.tx, this.playerEntity.ty);
+        const groundH      = this.terrainRegistry.heights[terrainId] ?? 4;
         const groundElevPx = getElevOffset(groundH, cam.tilt, cam.zoom);
-        const altPx        = e.getAltitudePx?.(cam) ?? 0;
-        const totalElevPx  = groundElevPx + altPx;
-
-        e.render(this._renderer, totalElevPx, {
-          selectedId:      this._selectedId,
-          terrainCache:    this.terrainCache,
-          pGX, pGY,
-          mPerTile:        this._mPerTile,
-          featureResolver: this._featR,
+        const altPx        = this.playerEntity.getAltitudePx?.(cam) ?? 0;
+        this.playerEntity.render(this._renderer, groundElevPx + altPx, {
+          selectedId:   this._selectedId,
+          terrainCache: this.terrainCache,
+          mPerTile:     this._mPerTile,
         });
-
-        if (altPx > 0 && e.showAltitudeLine && cam.zoom > 0.08) {
-          const geomR = e._geometricR ?? e.bboxRadius ?? 0.35;
-          const depth = frontDepth(e.tx, e.ty, cam.rotation, geomR);
-          this._renderer.submitWorldObject(depth, () => {
-            const ground = worldToScreen(e.tx + 0.5, e.ty + 0.5, groundElevPx, cam);
-            const airPos = worldToScreen(e.tx + 0.5, e.ty + 0.5, totalElevPx, cam);
-            this._renderer.drawLine(ground.x, ground.y, airPos.x, airPos.y, 'rgba(180,200,255,0.25)', 1);
-            this._renderer.drawCircle(ground.x, ground.y, 2, 'rgba(180,200,255,0.4)');
-          });
-        }
       }
     }
 
-    // 10. Flush pipeline
+    // 11. Flush pipeline
     this._renderer.flush(this.weather);
 
     if (this.debugLayers.colliders) {
       this._renderer.drawDebugOverlay(
-        this.entities, cam, pGX, pGY,
-        this.terrainCache, this.terrainRegistry
+        this.entities, cam,
+        this.terrainCache, this.terrainRegistry,
       );
     }
 
-    // 11. HUD
+    // 12. HUD
     if (this.playerEntity) {
-      const geo = this.playerEntity.getGeo(this.geoCenter, this._mPerTile, this._mapW, this._mapH);
+      const geo = this._playerGeo();
       this.emit('hud', {
         lat:     geo.lat,
         lon:     geo.lon,
         zoom:    cam.zoom.toFixed(2),
         tilt:    cam.tilt.toFixed(2),
         terrain: this.terrainRegistry.names[
-          this.terrainCache.getLocal(
-            this.playerEntity.tx, this.playerEntity.ty,
-            pGX, pGY, this._mapW, this._mapH
-          )
+          this.terrainCache.get(this.playerEntity.tx, this.playerEntity.ty)
         ] ?? 'Unknown',
+        renderCount: this._renderTree?.size ?? this.entities.length,
       });
     }
   }
@@ -1111,22 +1280,35 @@ export class Engine extends EventEmitter {
   _handleClick({ x: cx, y: cy, button }) {
     if (button === 2) {
       const wPos = screenToWorld(cx, cy, this.camera);
-      const geo  = tileToGeo(wPos.x, wPos.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-      this.emit('map:rightclick', { lat: geo.lat, lon: geo.lon, screenX: cx, screenY: cy });
+      const geo  = this._playerGeo();   // approximate; good enough for context menu
+      // More accurate: compute geo from wPos directly using _geoFromGlobal
+      this.emit('map:rightclick', { screenX: cx, screenY: cy, globalTx: wPos.x, globalTy: wPos.y });
       return;
     }
 
-    let best = null, bestDist = Infinity;
-    const { x: pGX, y: pGY } = this._pGlobal();
+    const wClick = screenToWorld(cx, cy, this.camera);
+    const hw     = tileHalfWidth(this.camera.zoom, this.camera.tileW);
+    const pickRadiusTiles = hw > 0 ? (20 / hw) + 1.0 : 3.0;
 
-    for (const e of this.entities) {
-      const groundH = this.terrainRegistry.heights[
-        this.terrainCache.getLocal(e.tx, e.ty, pGX, pGY, this._mapW, this._mapH)
-      ] ?? 4;
-      const elev    = getElevOffset(groundH, this.camera.tilt, this.camera.zoom);
+    const candidates = this._renderTree
+      ? this._renderTree.queryRange({
+          x: wClick.x - pickRadiusTiles,
+          y: wClick.y - pickRadiusTiles,
+          w: pickRadiusTiles * 2,
+          h: pickRadiusTiles * 2,
+        })
+      : this.entities;
+
+    let best = null, bestDist = Infinity;
+    const thresh = 20 * this.camera.zoom;
+
+    for (const e of candidates) {
+      // CHUNKING: terrainCache.get() with global coords
+      const terrainId = this.terrainCache.get(e.tx, e.ty);
+      const groundH   = this.terrainRegistry.heights[terrainId] ?? 4;
+      const elev      = getElevOffset(groundH, this.camera.tilt, this.camera.zoom);
       const { x: sx, y: sy } = worldToScreen(e.tx + 0.5, e.ty + 0.5, elev + (e.elevOffset ?? 0), this.camera);
-      const dist    = Math.hypot(cx - sx, cy - sy);
-      const thresh  = 20 * this.camera.zoom;
+      const dist = Math.hypot(cx - sx, cy - sy);
       if (dist < thresh && dist < bestDist) { bestDist = dist; best = e; }
     }
 
@@ -1136,9 +1318,8 @@ export class Engine extends EventEmitter {
       this.emit('entity:click', { entity: best });
     } else {
       this._selectedId = null;
-      const wPos = screenToWorld(cx, cy, this.camera);
-      const geo  = tileToGeo(wPos.x, wPos.y, this.geoCenter, this._mPerTile, this._mapW, this._mapH);
-      this.emit('map:click', { lat: geo.lat, lon: geo.lon, screenX: cx, screenY: cy });
+      // Emit global tile coords; callers convert to geo if needed
+      this.emit('map:click', { globalTx: wClick.x, globalTy: wClick.y, screenX: cx, screenY: cy });
     }
   }
 }

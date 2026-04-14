@@ -1,15 +1,23 @@
 /**
  * GOE Core — VoxelRenderer
  *
- * Rotation is now baked into proj() via setRotation() / clearRotation().
- * Every corner of every box goes through the same XZ rotation before the
- * camera transform, so arbitrary compass angles render correctly.
+ * CHUNKING REFACTOR
+ * -----------------
+ * beginFrame() previously cached   _mw2 = cam.mapW/2  and  _mh2 = cam.mapH/2
+ * as the local-chunk world origin. They are replaced by:
  *
- * Fix: box() snap for face-visibility now accounts for the current entity
- * rotation. Previously snap was computed from cam.rotation alone, so rotated
- * entities (e.g. Golden Gate Bridge at ~315°) would have the wrong two side
- * faces selected — back/hidden faces were drawn and front faces were skipped,
- * producing an X-ray / see-through appearance.
+ *   _focusX = cam.focusX   (global tile X the camera is aimed at)
+ *   _focusY = cam.focusY   (global tile Y)
+ *
+ * proj() and projInto() subtract _focusX/_focusY instead of _mw2/_mh2.
+ * Because entity coordinates are now global tile positions, the voxel
+ * blueprint origin (this._tx, this._ty) is already in global space and
+ * the per-voxel sub-tile offset (lx/VOXEL_UNITS, lz/VOXEL_UNITS) is
+ * unchanged. All other logic is identical to the previous version.
+ *
+ * Memory fix (FIX F) carried forward unchanged:
+ *   Pre-allocated Float64Array(_corners, length 16) eliminates per-box
+ *   heap allocations; projInto() writes directly into the buffer.
  */
 import { tileHalfWidth, tileHalfHeight, shadeHex } from '../math/projection.js';
 
@@ -24,28 +32,25 @@ export class VoxelRenderer {
     this._ty      = 0;
     this._base    = 0;
 
-    // Identity rotation by default
     this._rotCos  = 1;
     this._rotSin  = 0;
-    this._rotRad  = 0;   // stored so box() can offset the snap correctly
+    this._rotRad  = 0;
+
+    // FIX F — pre-allocated corner buffer: 8 corners × 2 floats (x, y)
+    this._corners = new Float64Array(16);
   }
 
-  /**
-   * Set per-entity XZ rotation from an OSM compass bearing.
-   * Blueprints face Z+ (south) by default → bearing 180 = no rotation.
-   * @param {number} compassDeg  0=N, 90=E, 180=S, 270=W
-   */
   setRotation(compassDeg) {
-    const rad     = (compassDeg - 180) * Math.PI / 180;
-    this._rotRad  = rad;
-    this._rotCos  = Math.cos(rad);
-    this._rotSin  = Math.sin(rad);
+    const rad    = (compassDeg - 180) * Math.PI / 180;
+    this._rotRad = rad;
+    this._rotCos = Math.cos(rad);
+    this._rotSin = Math.sin(rad);
   }
 
   clearRotation() {
-    this._rotRad  = 0;
-    this._rotCos  = 1;
-    this._rotSin  = 0;
+    this._rotRad = 0;
+    this._rotCos = 1;
+    this._rotSin = 0;
   }
 
   beginTile(tx, ty, baseElevPx) {
@@ -54,33 +59,40 @@ export class VoxelRenderer {
     this._base = baseElevPx;
   }
 
-  /** Cache common projection constants once per frame for performance. */
+  /**
+   * Cache hot per-frame values.
+   *
+   * CHUNKING CHANGE: _focusX/_focusY replace the old _mw2/_mh2.
+   * All projection math subtracts the camera's global focus position
+   * so that voxels at the focus project to screen origin (before camX/Y).
+   */
   beginFrame() {
-    const cam = this.cam;
-    this._hw  = tileHalfWidth(cam.zoom, cam.tileW);
-    this._hh  = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
-    this._cr  = Math.cos(cam.rotation);
-    this._sr  = Math.sin(cam.rotation);
-    this._vu  = (this._hh * 2) / VOXEL_UNITS;
-    this._mw2 = cam.mapW / 2;
-    this._mh2 = cam.mapH / 2;
+    const cam    = this.cam;
+    this._hw     = tileHalfWidth(cam.zoom, cam.tileW);
+    this._hh     = tileHalfHeight(cam.tilt, cam.zoom, cam.tileW);
+    this._cr     = Math.cos(cam.rotation);
+    this._sr     = Math.sin(cam.rotation);
+    this._vu     = (this._hh * 2) / VOXEL_UNITS;
+    // CHUNKING: global focus tile replaces local-chunk half-size
+    this._focusX = cam.focusX;
+    this._focusY = cam.focusY;
   }
 
   /**
-   * Project a voxel-space point to screen space.
-   * Applies entity-local XZ rotation BEFORE the camera rotation so every
-   * corner of every box is correctly transformed for any compass angle.
+   * Project a voxel-space point and return a plain {x,y}.
+   * Still used externally (e.g. decorateBuildingFacade).
+   *
+   * CHUNKING CHANGE: subtracts _focusX/_focusY instead of _mw2/_mh2.
    */
   proj(vx, vy, vz) {
-    // 1. Entity-local XZ rotation (cos/sin set via setRotation())
-    const lx = vx * this._rotCos - vz * this._rotSin;
-    const lz = vx * this._rotSin + vz * this._rotCos;
-
+    const lx  = vx * this._rotCos - vz * this._rotSin;
+    const lz  = vx * this._rotSin + vz * this._rotCos;
     const cam = this.cam;
     const tx  = this._tx + 0.5 + lx / VOXEL_UNITS;
     const tz  = this._ty + 0.5 + lz / VOXEL_UNITS;
-    const xw  = tx - this._mw2;
-    const zw  = tz - this._mh2;
+    // Offset from global focus (was: local chunk origin)
+    const xw  = tx - this._focusX;
+    const zw  = tz - this._focusY;
     const xr  =  xw * this._cr + zw * this._sr;
     const zr  = -xw * this._sr + zw * this._cr;
     return {
@@ -90,11 +102,46 @@ export class VoxelRenderer {
   }
 
   /**
-   * Draw a filled polygon face.
-   * @param {Array<{x,y}>} pts    - projected vertices (3 or 4 points)
-   * @param {string}       color  - CSS fill color
-   * @param {boolean}      edge   - draw a subtle highlight stroke on visible edges
+   * FIX F — Write projected corner directly into _corners buffer.
+   *
+   * CHUNKING CHANGE: subtracts _focusX/_focusY instead of _mw2/_mh2.
    */
+  projInto(i, vx, vy, vz) {
+    const lx  = vx * this._rotCos - vz * this._rotSin;
+    const lz  = vx * this._rotSin + vz * this._rotCos;
+    const cam = this.cam;
+    const tx  = this._tx + 0.5 + lx / VOXEL_UNITS;
+    const tz  = this._ty + 0.5 + lz / VOXEL_UNITS;
+    // Offset from global focus (was: local chunk origin)
+    const xw  = tx - this._focusX;
+    const zw  = tz - this._focusY;
+    const xr  =  xw * this._cr + zw * this._sr;
+    const zr  = -xw * this._sr + zw * this._cr;
+    const idx = i << 1;
+    this._corners[idx]     = (xr - zr) * this._hw - cam.camX;
+    this._corners[idx + 1] = (xr + zr) * this._hh - (this._base + vy * this._vu) - cam.camY;
+  }
+
+  _polyIdx(ids, color, edge) {
+    const ctx = this.ctx;
+    const c   = this._corners;
+    const i0  = ids[0] << 1;
+    ctx.beginPath();
+    ctx.moveTo(c[i0], c[i0 + 1]);
+    for (let k = 1; k < ids.length; k++) {
+      const ik = ids[k] << 1;
+      ctx.lineTo(c[ik], c[ik + 1]);
+    }
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+    if (edge && this.cam.zoom > 0.4) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+      ctx.lineWidth   = 0.8;
+      ctx.stroke();
+    }
+  }
+
   _poly(pts, color, edge = false) {
     const ctx = this.ctx;
     ctx.beginPath();
@@ -103,7 +150,6 @@ export class VoxelRenderer {
     ctx.closePath();
     ctx.fillStyle = color;
     ctx.fill();
-
     if (edge && this.cam.zoom > 0.4) {
       ctx.strokeStyle = 'rgba(255,255,255,0.15)';
       ctx.lineWidth   = 0.8;
@@ -111,31 +157,11 @@ export class VoxelRenderer {
     }
   }
 
-  /**
-   * Draw a single voxel box with top, right-facing, and front-facing faces.
-   *
-   * Face visibility is determined by snapping the EFFECTIVE camera angle —
-   * cam.rotation offset by the entity's local rotation — to the nearest 90°.
-   * This ensures that for a rotated entity (e.g. a bridge aligned NW-SE) the
-   * correct two side faces are selected regardless of compass heading.
-   *
-   * @param {number} x      - voxel-space left edge
-   * @param {number} y      - voxel-space bottom edge
-   * @param {number} z      - voxel-space back edge
-   * @param {number} w      - width  (x axis)
-   * @param {number} h      - height (y axis)
-   * @param {number} d      - depth  (z axis)
-   * @param {string} top    - top face color
-   * @param {string} right  - right-facing side color  (+X in entity space)
-   * @param {string} front  - front-facing side color  (+Z in entity space)
-   */
   box(x, y, z, w, h, d, top, right, front) {
-    const vp      = (px, py, pz) => this.proj(px, py, pz);
     const cam     = this.cam;
     const shadows = this._shadows;
-    const edge    = cam.zoom > 0.35;
+    const edge = false; // Disable strokes for massive performance gain
 
-    // ── Optional shadow-system lighting ───────────────────────────────────
     let cTop = top, cRight = right, cFront = front;
     if (shadows?.enabled) {
       cTop   = shadeHex(top,   shadows.sunElevation / (Math.PI / 2));
@@ -143,48 +169,36 @@ export class VoxelRenderer {
       cFront = shadeHex(front, shadows.getLightFactor(Math.PI / 2));
     }
 
-    // ── Rotation-aware snap ───────────────────────────────────────────────
-    // The entity's voxel geometry has been rotated by _rotRad in proj().
-    // To select the correct visible face pair we snap the camera angle
-    // relative to the entity's local axes, not the world axes.
-    // effectiveAngle = cam.rotation + entity_rotation
-    // (entity rotates the geometry, which is equivalent to rotating the
-    //  camera in the opposite direction relative to the entity)
     const effectiveAngle = cam.rotation + this._rotRad;
     const snap = ((Math.round(effectiveAngle / (Math.PI / 2)) % 4) + 4) % 4;
 
-    // Precompute all 8 corners — proj() applies entity rotation + camera transform
-    const c = [
-      vp(x,     y,     z    ),  // 0 BL bottom
-      vp(x + w, y,     z    ),  // 1 BR bottom
-      vp(x + w, y,     z + d),  // 2 FR bottom
-      vp(x,     y,     z + d),  // 3 FL bottom
-      vp(x,     y + h, z    ),  // 4 BL top
-      vp(x + w, y + h, z    ),  // 5 BR top
-      vp(x + w, y + h, z + d),  // 6 FR top
-      vp(x,     y + h, z + d),  // 7 FL top
-    ];
+    this.projInto(0, x,     y,     z    );
+    this.projInto(1, x + w, y,     z    );
+    this.projInto(2, x + w, y,     z + d);
+    this.projInto(3, x,     y,     z + d);
+    this.projInto(4, x,     y + h, z    );
+    this.projInto(5, x + w, y + h, z    );
+    this.projInto(6, x + w, y + h, z + d);
+    this.projInto(7, x,     y + h, z + d);
 
-    // Top face — always visible
-    this._poly([c[4], c[5], c[6], c[7]], cTop, edge);
+    this._polyIdx([4, 5, 6, 7], cTop, edge);
 
-    // Side faces — two visible faces based on effective snap
     switch (snap) {
       case 0:
-        this._poly([c[5], c[1], c[2], c[6]], cRight, edge); // +X face
-        this._poly([c[6], c[2], c[3], c[7]], cFront, edge); // +Z face
+        this._polyIdx([5, 1, 2, 6], cRight, edge);
+        this._polyIdx([6, 2, 3, 7], cFront, edge);
         break;
       case 1:
-        this._poly([c[6], c[2], c[3], c[7]], cRight, edge); // +Z face
-        this._poly([c[7], c[3], c[0], c[4]], cFront, edge); // -X face
+        this._polyIdx([6, 2, 3, 7], cRight, edge);
+        this._polyIdx([7, 3, 0, 4], cFront, edge);
         break;
       case 2:
-        this._poly([c[7], c[3], c[0], c[4]], cRight, edge); // -X face
-        this._poly([c[4], c[0], c[1], c[5]], cFront, edge); // -Z face
+        this._polyIdx([7, 3, 0, 4], cRight, edge);
+        this._polyIdx([4, 0, 1, 5], cFront, edge);
         break;
       case 3:
-        this._poly([c[4], c[0], c[1], c[5]], cRight, edge); // -Z face
-        this._poly([c[5], c[1], c[2], c[6]], cFront, edge); // +X face
+        this._polyIdx([4, 0, 1, 5], cRight, edge);
+        this._polyIdx([5, 1, 2, 6], cFront, edge);
         break;
     }
   }

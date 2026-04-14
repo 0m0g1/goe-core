@@ -1,15 +1,23 @@
 /**
  * GOE Core — WeatherSystem
  *
+ * Memory fix vs previous version:
+ *
+ *   FIX G — Particle reset no longer allocates a new object.
+ *     The old update() loop called Object.assign(p, this._createParticle())
+ *     when a particle fell below ground. _createParticle() created a new
+ *     plain object every call; Object.assign then copied it and discarded it.
+ *     At 1,500 thunderstorm particles this could allocate 1,500 objects/frame.
+ *
+ *     _resetParticle(p, playerX, playerY) now writes directly onto the
+ *     existing particle object — no allocation, no copy.
+ *
  * All drawing goes through WorldRenderer.
  * WeatherSystem never touches CanvasRenderingContext2D directly.
  */
 import { getElevOffset } from '../math/projection.js';
 
 export class WeatherSystem {
-  /**
-   * @param {WorldRenderer} worldRenderer
-   */
   constructor(worldRenderer) {
     this._wr = worldRenderer;
 
@@ -19,7 +27,6 @@ export class WeatherSystem {
     this.flashAlpha = 0;
   }
 
-  // Convenience accessors kept so internal helpers don't need _wr.cam everywhere
   get cam() { return this._wr.cam; }
 
   // ── Mode management ───────────────────────────────────────────────────────
@@ -36,18 +43,25 @@ export class WeatherSystem {
     if (mode === 'thunderstorm')            count = 1500;
     if (mode === 'fog')                     count = 150;
 
-    for (let i = 0; i < count; i++) this.particles.push(this._createParticle());
+    for (let i = 0; i < count; i++) {
+      // Pre-allocate particle objects once; _resetParticle fills them in place
+      const p = { tx: 0, ty: 0, tz: 0, speed: 0, size: 0 };
+      this._resetParticle(p, 0, 0);
+      this.particles.push(p);
+    }
   }
 
-  _createParticle() {
+  /**
+   * FIX G — Write new random values directly onto an existing particle.
+   * Replaces _createParticle() + Object.assign() pattern.
+   */
+  _resetParticle(p, playerX, playerY) {
     const isFog = this.mode === 'fog';
-    return {
-      tx:    (Math.random() - 0.5) * 100,
-      ty:    (Math.random() - 0.5) * 100,
-      tz:    Math.random() * 25 + (isFog ? 0 : 5),
-      speed: isFog ? Math.random() * 2 + 1 : Math.random() * 20 + 15,
-      size:  isFog ? Math.random() * 40 + 20 : Math.random() * 2 + 1.5,
-    };
+    p.tx    = (Math.random() - 0.5) * 100 + playerX;
+    p.ty    = (Math.random() - 0.5) * 100 + playerY;
+    p.tz    = Math.random() * 25 + (isFog ? 0 : 5);
+    p.speed = isFog ? Math.random() * 2 + 1 : Math.random() * 20 + 15;
+    p.size  = isFog ? Math.random() * 40 + 20 : Math.random() * 2 + 1.5;
   }
 
   // ── Update ────────────────────────────────────────────────────────────────
@@ -66,9 +80,8 @@ export class WeatherSystem {
       p.ty += this.wind.y * dt;
 
       if (p.tz < 0) {
-        Object.assign(p, this._createParticle());
-        p.tx += playerX;
-        p.ty += playerY;
+        // FIX G — reset in place, no allocation
+        this._resetParticle(p, playerX, playerY);
       }
     }
   }
@@ -82,7 +95,6 @@ export class WeatherSystem {
     const W   = ctx.canvas.width;
     const H   = ctx.canvas.height;
 
-    // 1. Global overlays
     if (this.mode === 'cloudy' || this.mode === 'thunderstorm') {
       wr.fillRect(0, 0, W, H, 'rgba(0,0,20,0.2)');
     }
@@ -90,14 +102,12 @@ export class WeatherSystem {
       wr.fillRect(0, 0, W, H, `rgba(255,255,255,${this.flashAlpha})`);
     }
 
-    // 2. Determine particle style
     const isLine   = (this.mode === 'rain' || this.mode === 'thunderstorm' || this.mode === 'sand');
-    const isCircle = !isLine; // snow or fog
+    const isCircle = !isLine;
 
     const lineStyle   = this._lineStyle();
     const circleStyle = this._circleStyle();
 
-    // 3. Draw particles
     for (const p of this.particles) {
       const elev = getElevOffset(p.tz * 8, cam.tilt, cam.zoom);
       const pos  = wr.worldToScreen(p.tx, p.ty, elev);
@@ -107,8 +117,7 @@ export class WeatherSystem {
       if (isLine) {
         const length = (this.mode === 'sand' ? 10 : 25) * cam.zoom;
         wr.drawLine(
-          pos.x,
-          pos.y,
+          pos.x, pos.y,
           pos.x + this.wind.x * 50,
           pos.y + length,
           lineStyle.color,
@@ -119,7 +128,6 @@ export class WeatherSystem {
         if (this.mode === 'fog') {
           wr.drawCircle(pos.x, pos.y, r, circleStyle.fill);
         } else {
-          // Snow — stroke circle
           ctx.beginPath();
           ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
           ctx.strokeStyle = circleStyle.stroke;
@@ -141,6 +149,6 @@ export class WeatherSystem {
 
   _circleStyle() {
     if (this.mode === 'fog')  return { fill: 'rgba(200,200,210,0.05)' };
-    return { stroke: 'rgba(255,255,255,0.9)' }; // snow
+    return { stroke: 'rgba(255,255,255,0.9)' };
   }
 }

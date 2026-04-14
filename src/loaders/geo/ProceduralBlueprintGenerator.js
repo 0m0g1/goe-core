@@ -43,6 +43,10 @@
  *     as (entity.tx + dTileX, entity.ty + dTileY) where dTile is the geographic
  *     offset from the building centroid, keeping walls in the right place for
  *     any building anywhere on the map.
+ *
+ *   FIX 5 (performance) — Sub-pixel zoom cull: all renderFns early-exit when
+ *     tileHalfWidth(cam.zoom, cam.tileW) < 1.5 px. Nothing useful is visible
+ *     at that zoom level and blueprint/polygon projection work is pure waste.
  */
 
 import { PersistentCache }       from '../../core/PersistentCache.js';
@@ -55,13 +59,9 @@ import { TerrainType }           from '../../terrain/types.js';
 // ─── Constants ────────────────────────────────────────────────────────────────
 const VU = 8;   // voxel units per tile (matches engine convention)
 
-// Blueprint grid resolution: 1 VU cell per grid step.
-// A 20-m-wide building at 2 m/tile = 10 tiles = 80 VU cells wide.
-// We cap the grid at MAX_CELLS per axis to avoid huge allocations.
 const MAX_CELLS     = 128;
-const GRID_STEP_VU  = 1;     // 1 VU = 0.25 m at 2 m/tile
+const GRID_STEP_VU  = 1;
 
-// Minimum wall thickness in VU for structural boxes
 const WALL_VU       = 1;
 
 // ─── Building type classification ─────────────────────────────────────────────
@@ -212,6 +212,15 @@ function fhashN(str, n) {
   return fhash(str + '|' + n);
 }
 
+// ─── Integer cell packing (Fix 5) ────────────────────────────────────────────
+// Replaces string keys `${x},${y}` with a single packed integer.
+// Offset of 4096 supports footprints up to 4096 VU from origin in each axis.
+const CELL_PACK_STRIDE  = 8192;
+const CELL_PACK_OFFSET  = 4096;
+const packCell  = (x, y) => (y + CELL_PACK_OFFSET) * CELL_PACK_STRIDE + (x + CELL_PACK_OFFSET);
+const unpackCellX = p  => (p % CELL_PACK_STRIDE) - CELL_PACK_OFFSET;
+const unpackCellY = p  => Math.floor(p / CELL_PACK_STRIDE) - CELL_PACK_OFFSET;
+
 // ─── Footprint rasterisation ──────────────────────────────────────────────────
 function rasteriseFootprint(ringVU) {
   const cells = new Set();
@@ -237,7 +246,7 @@ function rasteriseFootprint(ringVU) {
     xs.sort((a, b) => a - b);
     for (let k = 0; k < xs.length - 1; k += 2) {
       for (let x = Math.ceil(xs[k]); x <= Math.floor(xs[k + 1]); x++) {
-        cells.add(`${x},${y}`);
+        cells.add(packCell(x, y));
       }
     }
   }
@@ -246,16 +255,15 @@ function rasteriseFootprint(ringVU) {
 
 function cellsBBox(cells) {
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const key of cells) {
-    const [x, y] = key.split(',').map(Number);
+  for (const packed of cells) {
+    const x = unpackCellX(packed);
+    const y = unpackCellY(packed);
     if (x < minX) minX = x; if (x > maxX) maxX = x;
     if (y < minY) minY = y; if (y > maxY) maxY = y;
   }
   return { minX, maxX, minY, maxY };
 }
 
-// Convert OSM ring [{lat,lon}] → tile-space coords relative to ring[0].
-// Latitude negated so tile-Y increases southward (matching rasteriser).
 function ringToTile(nodes, mPerTile) {
   if (!nodes.length) return [];
   const origin = nodes[0];
@@ -277,13 +285,14 @@ const DIRS = [
 
 function detectExposedFaces(cells) {
   const exposed = new Map();
-  for (const key of cells) {
-    const [x, y] = key.split(',').map(Number);
+  for (const packed of cells) {
+    const x = unpackCellX(packed);
+    const y = unpackCellY(packed);
     const faces = new Set();
     for (const { dx, dy, face } of DIRS) {
-      if (!cells.has(`${x + dx},${y + dy}`)) faces.add(face);
+      if (!cells.has(packCell(x + dx, y + dy))) faces.add(face);
     }
-    if (faces.size) exposed.set(key, faces);
+    if (faces.size) exposed.set(packed, faces);
   }
   return exposed;
 }
@@ -528,10 +537,8 @@ export function generateProceduralBlueprint(building, mPerTile) {
   const effectiveRing = ring ?? nodes ?? [];
   if (effectiveRing.length < 3) return null;
 
-  // Reject implausibly large footprints (campus/block scale)
   if (areaM2 > 10000) return null;
 
-  // Clamp height to something renderable
   const clampedHeightM = Math.min(heightM, 80);
 
   const rawType = (
@@ -546,10 +553,8 @@ export function generateProceduralBlueprint(building, mPerTile) {
   const wallVar  = Math.floor(fhashN(seed, 0) * palette.walls.length);
   const wallCols = palette.walls[wallVar];
 
-  // ── 1. Convert ring → tile-space coords (relative to ring[0]) ───────────
   const ringTile = ringToTile(effectiveRing, mPerTile);
 
-  // ── 2. Rasterise at 4× tile resolution so small buildings get enough cells
   const RASTER_SCALE = 4;
   const ringScaled = ringTile.map(p => ({ x: p.x * RASTER_SCALE, y: p.y * RASTER_SCALE }));
 
@@ -560,11 +565,6 @@ export function generateProceduralBlueprint(building, mPerTile) {
   const totalScaledW = bbox.maxX - bbox.minX + 1;
   const totalScaledD = bbox.maxY - bbox.minY + 1;
 
-  // FIX 1: Do NOT apply a MAX_TILES scale clamp.
-  // Each scaled-raster cell represents (1 / RASTER_SCALE) tiles.
-  // Converting to VU: cellSizeVU = (1 / RASTER_SCALE) * VU.
-  // Box dimensions are already correct once divided by RASTER_SCALE and
-  // multiplied by VU — no additional scale factor needed.
   const scale = 1;
 
   const heightVU = Math.max(VU, (clampedHeightM / mPerTile) * VU);
@@ -576,14 +576,14 @@ export function generateProceduralBlueprint(building, mPerTile) {
   const toVU = (scaledCoord, minScaled, offset) =>
     (scaledCoord - minScaled - offset) / RASTER_SCALE * VU;
 
-  const cellVU = (1 / RASTER_SCALE) * VU;  // VU width of one raster cell
+  const cellVU = (1 / RASTER_SCALE) * VU;
 
   const bpBoxes = [];
 
-  // ── 3. Wall columns (one horizontal run per row → one box) ───────────────
   const rowMap = new Map();
-  for (const key of cells) {
-    const [x, y] = key.split(',').map(Number);
+  for (const packed of cells) {
+    const x = unpackCellX(packed);
+    const y = unpackCellY(packed);
     if (!rowMap.has(y)) rowMap.set(y, []);
     rowMap.get(y).push(x);
   }
@@ -604,15 +604,15 @@ export function generateProceduralBlueprint(building, mPerTile) {
     }
   }
 
-  // ── 4. Exposed-face decoration (windows, cornices, base bands, door) ─────
   const exposed = detectExposedFaces(cells);
   const frontRuns = new Map();
   const backRuns  = new Map();
   const rightRuns = new Map();
   const leftRuns  = new Map();
 
-  for (const [key, faces] of exposed) {
-    const [x, y] = key.split(',').map(Number);
+  for (const [packed, faces] of exposed) {
+    const x = unpackCellX(packed);
+    const y = unpackCellY(packed);
     if (faces.has('front')) { if (!frontRuns.has(y)) frontRuns.set(y, []); frontRuns.get(y).push(x); }
     if (faces.has('back'))  { if (!backRuns.has(y))  backRuns.set(y,  []); backRuns.get(y).push(x);  }
     if (faces.has('right')) { if (!rightRuns.has(x)) rightRuns.set(x, []); rightRuns.get(x).push(y); }
@@ -644,8 +644,8 @@ export function generateProceduralBlueprint(building, mPerTile) {
       eachRun(sorted, (start, end) => {
         const len  = (end - start + 1) / RASTER_SCALE * VU;
         const wx   = getWX(coord, start);
-        const wz   = getWZ(coord, start);      // absolute blueprint Z for positioning
-        const wzf  = getWZface(coord, start);  // face-surface Z for window protrusion
+        const wz   = getWZ(coord, start);
+        const wzf  = getWZface(coord, start);
         bpBoxes.push(...windowsForWall(wx, wzf, len, 1.5, heightVU - 1, palette, faceDir, seed + coord));
         bpBoxes.push(...corniceForWall(wx, wzf, len, heightVU, palette, faceDir));
         bpBoxes.push(...baseForWall(wx, wzf, len, palette, faceDir));
@@ -679,9 +679,6 @@ export function generateProceduralBlueprint(building, mPerTile) {
     (x, start) => toVU(x,     bbox.minX, centroidScaledX) - cellVU * 0.5
   );
 
-  
-
-  // ── 5. Roof (per-row runs follow actual footprint shape) ─────────────────
   const roofStyle = selectRoofStyle(rawType, heightVU, areaM2, tags, seed);
 
   for (const [scaledY, xs] of rowMap) {
@@ -707,9 +704,7 @@ export function generateProceduralBlueprint(building, mPerTile) {
     }
   }
 
-  // ── 6. Chimneys (residential / historic only) ────────────────────────────
   if ((rawType === 'residential' || rawType === 'historic') && heightVU < 30) {
-    // Use the full bbox extents in VU space (centred at origin)
     const hw = (totalScaledW / 2) / RASTER_SCALE * VU;
     const hd = (totalScaledD / 2) / RASTER_SCALE * VU;
     bpBoxes.push(...chimneyStack(
@@ -736,6 +731,147 @@ export function blueprintCacheKey(building, mPerTile) {
   return `bp:${bType}:${h}:${fhash(sampled).toString(36).slice(0, 10)}`;
 }
 
+// ─── Module-level scratch buffer for ring projection (Fix 4) ─────────────────
+// Shared across all renderFn calls — eliminates per-frame Array.map allocations.
+// Supports up to 512 ring nodes (1024 floats for x,y pairs).
+const _screenScratch = new Float64Array(1024);
+
+/**
+ * Project entity._ring into _screenScratch and return the count of nodes
+ * written. worldToScreen still returns {x,y}; we write directly into the
+ * scratch buffer so no intermediate array or object survives past this call.
+ */
+function _projectRingIntoScratch(entity, elev, cam) {
+  const eLat = entity.latitude;
+  const eLon = entity.longitude;
+  const ep   = entity._mPerTile;
+  const mLon = 111320 * Math.cos(eLat * Math.PI / 180);
+  const mLat = 111320;
+  const ring = entity._ring;
+  const len  = Math.min(ring.length, 512);
+  for (let i = 0; i < len; i++) {
+    const n = ring[i];
+    const dTileX =  (n.lon - eLon) * mLon / ep;
+    const dTileY = -(n.lat - eLat) * mLat / ep;
+    const s = worldToScreen(entity.tx + dTileX, entity.ty + dTileY, elev, cam);
+    _screenScratch[i * 2]     = s.x;
+    _screenScratch[i * 2 + 1] = s.y;
+  }
+  return len;
+}
+
+// ─── Shared named renderFn for procedural blueprint entities (Fix 3) ──────────
+// A single function reference is stored on every entity; entity properties carry
+// all the data that closures previously captured, eliminating per-entity closures.
+function _procBlueprintRenderFn(wr, groundElevPx, extra, entity) {
+  const { cam } = wr;
+  const hw = tileHalfWidth(cam.zoom, cam.tileW);
+  if (hw < 1.5 || cam.tilt < 0.02) return;
+
+  const blueprint = entity._procBlueprint;
+  if (!blueprint?.length) return;
+
+  const elev  = groundElevPx + (entity.elevOffset ?? 0);
+  const geomR = entity._geometricR ?? 1;
+  const depth = frontDepth(entity.tx, entity.ty, cam.rotation, geomR);
+  const isoA  = Math.min(1, (cam.tilt - 0.02) / 0.14);
+
+  wr.submitShadow({
+    p:       { x: entity.tx, y: entity.ty },
+    elev,
+    r:       Math.min(entity._shadowR, geomR * VU * 0.5),
+    engineH: entity._heightVU,
+  });
+
+  wr.submitWorldObject(depth, () => {
+    wr.ctx.globalAlpha = isoA;
+    wr._voxel.beginTile(entity.tx, entity.ty, elev);
+    wr._voxel.setRotation(-180);
+    for (const p of blueprint) {
+      wr._voxel.box(
+        p.x, p.y, p.z,
+        p.w, p.h, p.d,
+        p.top, p.right ?? p.top, p.front ?? p.top,
+      );
+    }
+    wr._voxel.clearRotation();
+    wr.ctx.globalAlpha = 1;
+  });
+}
+
+// ─── Shared named renderFn for polygon-extrusion fallback entities (Fix 3) ────
+function _fallbackPolygonRenderFn(wr, groundElevPx, extra, entity) {
+  const { cam, ctx } = wr;
+  const hw = tileHalfWidth(cam.zoom, cam.tileW);
+  if (hw < 1.5 || cam.tilt < 0.02 || !entity._ring?.length) return;
+
+  const elev    = groundElevPx + (entity.elevOffset ?? 0);
+  const geomR   = entity._geometricR ?? 1;
+  const depth   = frontDepth(entity.tx, entity.ty, cam.rotation, geomR);
+  const hPx     = entity._heightTiles * hw * cam.tilt * 2;
+  const topColor   = entity._topColor;
+  const rightColor = entity._rightColor;
+  const leftColor  = entity._leftColor;
+  const shadowR    = entity._shadowR;
+
+  wr.submitShadow({
+    p: { x: entity.tx, y: entity.ty },
+    elev,
+    r: shadowR,
+    engineH: entity._heightTiles * VU,
+  });
+
+  wr.submitWorldObject(depth, () => {
+    // Fix 4: write into scratch buffer instead of allocating a new array
+    const len = _projectRingIntoScratch(entity, elev, cam);
+    if (len < 3) return;
+
+    if (hPx > 2) {
+      ctx.beginPath();
+      for (let i = 0; i < len; i++) {
+        const sx = _screenScratch[i * 2], sy = _screenScratch[i * 2 + 1];
+        i === 0 ? ctx.moveTo(sx + hPx * 0.5, sy + hPx * 0.25)
+                : ctx.lineTo(sx + hPx * 0.5, sy + hPx * 0.25);
+      }
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(0,0,0,0.30)';
+      ctx.fill();
+    }
+
+    if (hPx > 1) {
+      for (let i = 0; i < len - 1; i++) {
+        const ax = _screenScratch[i * 2],     ay = _screenScratch[i * 2 + 1];
+        const bx = _screenScratch[(i+1)*2],   by = _screenScratch[(i+1)*2 + 1];
+        const ex = bx - ax, ey = by - ay;
+        if (-ey <= 0) continue;
+        ctx.beginPath();
+        ctx.moveTo(ax,  ay);
+        ctx.lineTo(bx,  by);
+        ctx.lineTo(bx,  by  - hPx);
+        ctx.lineTo(ax,  ay  - hPx);
+        ctx.closePath();
+        ctx.fillStyle = Math.abs(Math.atan2(ey, ex)) < Math.PI / 2 ? rightColor : leftColor;
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+        ctx.lineWidth   = 0.5;
+        ctx.stroke();
+      }
+    }
+
+    ctx.beginPath();
+    for (let i = 0; i < len; i++) {
+      const sx = _screenScratch[i * 2], sy = _screenScratch[i * 2 + 1];
+      i === 0 ? ctx.moveTo(sx, sy - hPx) : ctx.lineTo(sx, sy - hPx);
+    }
+    ctx.closePath();
+    ctx.fillStyle   = topColor;
+    ctx.fill();
+    ctx.strokeStyle = rightColor;
+    ctx.lineWidth   = 0.7;
+    ctx.stroke();
+  });
+}
+
 // ─── ProceduralBlueprintGenerator (stateful, owns cache) ──────────────────────
 export class ProceduralBlueprintGenerator {
   constructor(options = {}) {
@@ -744,6 +880,16 @@ export class ProceduralBlueprintGenerator {
     this._memCache  = new Map();
     this._idbCache  = new PersistentCache('GOE_Blueprints', 'procedural_bp');
     this._pending   = new Map();
+  }
+
+  // Fix 4: bounded LRU write — evicts oldest entry when over limit
+  static _MEM_CACHE_MAX = 500;
+  _setMemCache(key, boxes) {
+    this._memCache.set(key, boxes);
+    if (this._memCache.size > ProceduralBlueprintGenerator._MEM_CACHE_MAX) {
+      const oldest = this._memCache.keys().next().value;
+      this._memCache.delete(oldest);
+    }
   }
 
   async getBlueprint(building, mPerTile) {
@@ -767,14 +913,14 @@ export class ProceduralBlueprintGenerator {
     try {
       const cached = await this._idbCache.get(key);
       if (cached?.boxes) {
-        this._memCache.set(key, cached.boxes);
+        this._setMemCache(key, cached.boxes);
         return cached.boxes;
       }
     } catch (_) {}
 
     const boxes = generateProceduralBlueprint(building, mPerTile);
     if (boxes) {
-      this._memCache.set(key, boxes);
+      this._setMemCache(key, boxes);
       try {
         await this._idbCache.set(key, { boxes, ts: Date.now() });
       } catch (e) {
@@ -803,8 +949,6 @@ export class ProceduralBlueprintGenerator {
     const halfB    = (building.obb?.halfB ?? halfA) / mPerTile;
     const geomR    = Math.hypot(halfA, halfB);
 
-    // FIX 2: Shadow radius — clamp against actual footprint area to avoid
-    // the 8× over-sized halo that resulted from halfA (tiles) * VU.
     const shadowR = Math.min(
       halfA * VU,
       Math.sqrt(Math.max(16, building.areaM2) / Math.PI) / mPerTile * VU
@@ -812,7 +956,6 @@ export class ProceduralBlueprintGenerator {
 
     const bp = blueprint;
 
-    // Centroid lat/lon for the renderFn projection (FIX 3)
     const centLat = building.centroid?.lat ?? (ring[0]?.lat ?? 0);
     const centLon = building.centroid?.lon ?? (ring[0]?.lon ?? 0);
 
@@ -836,46 +979,15 @@ export class ProceduralBlueprintGenerator {
       _mPerTile:      mPerTile,
       _bpKey:         null,
       _procBlueprint: bp,
-
-      renderFn(wr, groundElevPx, extra, entity) {
-        const { cam } = wr;
-        if (cam.tilt < 0.02) return;
-        const blueprint = entity._procBlueprint;
-        if (!blueprint?.length) return;
-
-        const elev  = groundElevPx + (entity.elevOffset ?? 0);
-        const depth = frontDepth(entity.tx, entity.ty, cam.rotation, entity._geometricR ?? geomR);
-        const isoA  = Math.min(1, (cam.tilt - 0.02) / 0.14);
-
-        wr.submitShadow({
-          p:       { x: entity.tx, y: entity.ty },
-          elev,
-          r:       Math.min(shadowR, (entity._geometricR ?? geomR) * VU * 0.5),
-          engineH: heightVU,
-        });
-
-        wr.submitWorldObject(depth, () => {
-          wr.ctx.globalAlpha = isoA;
-          wr._voxel.beginTile(entity.tx, entity.ty, elev);
-          wr._voxel.setRotation(-180);//(entity._facingAngle ?? 0);
-          for (const p of blueprint) {
-            wr._voxel.box(
-              p.x, p.y, p.z,
-              p.w, p.h, p.d,
-              p.top, p.right ?? p.top, p.front ?? p.top,
-            );
-          }
-          wr._voxel.clearRotation();
-          wr.ctx.globalAlpha = 1;
-        });
-      },
+      // Fix 3: data for shared renderFn — no closure needed
+      _shadowR:       shadowR,
+      _heightVU:      heightVU,
+      // Fix 3: shared named function — one reference for all entities
+      renderFn:       _procBlueprintRenderFn,
     };
   }
 
   // ── Polygon-extrusion fallback ─────────────────────────────────────────────
-  // FIX 3: renderFn now uses centroid-relative tile deltas instead of the
-  // broken lonToGlobalX / latToGlobalY reprojection that double-applied the
-  // map origin offset, placing walls in wrong positions for off-centre buildings.
   _fallbackPolygonDef(building, mPerTile, terrainRegistry, elevGrid) {
     const colorSet   = terrainRegistry?.colors?.['BUILDING'] ?? {};
     const topColor   = colorSet.top   ?? '#b0a090';
@@ -894,8 +1006,6 @@ export class ProceduralBlueprintGenerator {
 
     const centLat = building.centroid?.lat ?? (ring[0]?.lat ?? 0);
     const centLon = building.centroid?.lon ?? (ring[0]?.lon ?? 0);
-    const mLonScale = 111320 * Math.cos(centLat * Math.PI / 180);
-    const mLatScale = 111320;
 
     return {
       id:             `building_fb:${building.id ?? Math.random()}`,
@@ -912,89 +1022,14 @@ export class ProceduralBlueprintGenerator {
       _facingAngle:   building._facingAngle ?? 0,
       _ring:          ring,
       _mPerTile:      mPerTile,
-
-      renderFn(wr, groundElevPx, extra, entity) {
-        const { cam, ctx } = wr;
-        if (cam.tilt < 0.02 || !entity._ring?.length) return;
-
-        const elev  = groundElevPx + (entity.elevOffset ?? 0);
-        const depth = frontDepth(entity.tx, entity.ty, cam.rotation, entity._geometricR ?? geomR);
-        const hw    = tileHalfWidth(cam.zoom, cam.tileW);
-        const hPx   = heightTiles * hw * cam.tilt * 2;
-
-        wr.submitShadow({
-          p: { x: entity.tx, y: entity.ty },
-          elev,
-          r: shadowR,
-          engineH: heightTiles * VU,
-        });
-
-        wr.submitWorldObject(depth, () => {
-          // FIX 3: project each ring node as a centroid-relative tile offset.
-          // entity.latitude / entity.longitude is the building centroid (set above).
-          // entity.tx / entity.ty is where the centroid sits in tile space.
-          // So each node's screen position = worldToScreen(tx + dTileX, ty + dTileY).
-          const eLat = entity.latitude  ?? centLat;
-          const eLon = entity.longitude ?? centLon;
-          const mLon = 111320 * Math.cos(eLat * Math.PI / 180);
-          const mLat = 111320;
-          const ep   = entity._mPerTile ?? mPerTile;
-
-          const screenPts = entity._ring.map(n => {
-            const dTileX =  (n.lon - eLon) * mLon / ep;
-            const dTileY = -(n.lat - eLat) * mLat / ep;
-            return worldToScreen(entity.tx + dTileX, entity.ty + dTileY, elev, cam);
-          });
-
-          if (screenPts.length < 3) return;
-
-          // Drop shadow offset plane
-          if (hPx > 2) {
-            ctx.beginPath();
-            screenPts.forEach((p, i) =>
-              i === 0
-                ? ctx.moveTo(p.x + hPx * 0.5, p.y + hPx * 0.25)
-                : ctx.lineTo(p.x + hPx * 0.5, p.y + hPx * 0.25)
-            );
-            ctx.closePath();
-            ctx.fillStyle = 'rgba(0,0,0,0.30)';
-            ctx.fill();
-          }
-
-          // Walls
-          if (hPx > 1) {
-            for (let i = 0; i < screenPts.length - 1; i++) {
-              const a  = screenPts[i];
-              const b2 = screenPts[i + 1];
-              const ex = b2.x - a.x, ey = b2.y - a.y;
-              if (-ey <= 0) continue;
-              ctx.beginPath();
-              ctx.moveTo(a.x,  a.y);
-              ctx.lineTo(b2.x, b2.y);
-              ctx.lineTo(b2.x, b2.y - hPx);
-              ctx.lineTo(a.x,  a.y  - hPx);
-              ctx.closePath();
-              ctx.fillStyle = Math.abs(Math.atan2(ey, ex)) < Math.PI / 2 ? rightColor : leftColor;
-              ctx.fill();
-              ctx.strokeStyle = 'rgba(0,0,0,0.15)';
-              ctx.lineWidth   = 0.5;
-              ctx.stroke();
-            }
-          }
-
-          // Roof face
-          ctx.beginPath();
-          screenPts.forEach((p, i) =>
-            i === 0 ? ctx.moveTo(p.x, p.y - hPx) : ctx.lineTo(p.x, p.y - hPx)
-          );
-          ctx.closePath();
-          ctx.fillStyle   = topColor;
-          ctx.fill();
-          ctx.strokeStyle = rightColor;
-          ctx.lineWidth   = 0.7;
-          ctx.stroke();
-        });
-      },
+      // Fix 3: data for shared renderFn — stored on entity, not captured in closure
+      _topColor:      topColor,
+      _rightColor:    rightColor,
+      _leftColor:     leftColor,
+      _heightTiles:   heightTiles,
+      _shadowR:       shadowR,
+      // Fix 3: shared named function
+      renderFn:       _fallbackPolygonRenderFn,
     };
   }
 

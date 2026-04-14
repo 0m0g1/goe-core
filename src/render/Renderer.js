@@ -8,7 +8,7 @@
  */
 import { VoxelRenderer }  from './VoxelRenderer.js';
 import { ShadowSystem }   from './ShadowSystem.js';
-import { RenderPipeline } from '../core/RendererPipeline.js';
+import { RenderPipeline } from './RendererPipeline.js';
 import { shadeHex, worldToScreen, tileHalfWidth, getElevOffset } from '../math/projection.js';
 
 export class WorldRenderer {
@@ -234,6 +234,25 @@ export class WorldRenderer {
     }
 
     ctx.restore();
+  }
+
+  // Add this inside WorldRenderer
+  setRenderTarget(targetCtx, targetCam) {
+    this.ctx = targetCtx;
+    if (targetCam) this.cam = targetCam;
+
+    if (this._voxel) {
+      this._voxel.ctx = targetCtx;
+      if (targetCam) this._voxel.cam = targetCam;
+    }
+    if (this._shadows) {
+      this._shadows.ctx = targetCtx;
+      if (targetCam) this._shadows.cam = targetCam;
+    }
+    if (this._pipeline) {
+      this._pipeline.ctx = targetCtx;
+      if (targetCam) this._pipeline.cam = targetCam;
+    }
   }
 
   // ── Pipeline submission ───────────────────────────────────────────────────

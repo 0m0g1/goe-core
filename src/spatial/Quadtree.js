@@ -1,115 +1,126 @@
 // spatial/Quadtree.js
 class QuadtreeNode {
-    constructor(bounds, capacity) {
-        this.bounds = bounds;
-        this.capacity = capacity;
-        this.objects = [];
-        this.children = null;
-    }
-    isLeaf() { return this.children === null; }
-    subdivide() {
-        const { x, y, w, h } = this.bounds;
-        const hw = w / 2, hh = h / 2;
-        this.children = [
-            new QuadtreeNode({ x: x,      y: y,      w: hw, h: hh }, this.capacity),
-            new QuadtreeNode({ x: x + hw, y: y,      w: hw, h: hh }, this.capacity),
-            new QuadtreeNode({ x: x,      y: y + hh, w: hw, h: hh }, this.capacity),
-            new QuadtreeNode({ x: x + hw, y: y + hh, w: hw, h: hh }, this.capacity),
-        ];
-    }
+  constructor(bounds, capacity) {
+    this.bounds   = bounds;
+    this.capacity = capacity;
+    this.objects  = [];
+    this.children = null;
+  }
+  isLeaf() { return this.children === null; }
+  subdivide() {
+    const { x, y, w, h } = this.bounds;
+    const hw = w / 2, hh = h / 2;
+    this.children = [
+      new QuadtreeNode({ x,         y,         w: hw, h: hh }, this.capacity),
+      new QuadtreeNode({ x: x + hw, y,         w: hw, h: hh }, this.capacity),
+      new QuadtreeNode({ x,         y: y + hh, w: hw, h: hh }, this.capacity),
+      new QuadtreeNode({ x: x + hw, y: y + hh, w: hw, h: hh }, this.capacity),
+    ];
+  }
 }
 
 export class Quadtree {
-    constructor(bounds, capacity = 8) {
-        this.root = new QuadtreeNode(bounds, capacity);
+  constructor(bounds, capacity = 8) {
+    this._bounds   = bounds;
+    this._capacity = capacity;
+    this.root      = new QuadtreeNode(bounds, capacity);
+  }
+
+  // Iterative clear — no recursion, no stack overflow regardless of depth
+  clear() {
+    const stack = [this.root];
+    while (stack.length) {
+      const node = stack.pop();
+      node.objects.length = 0;
+      if (node.children) {
+        stack.push(...node.children);
+        node.children = null;
+      }
+    }
+  }
+
+  rebuild(objects) {
+    this.clear();
+    for (const obj of objects) this.insert(obj);
+  }
+
+  insert(object) {
+    this._insert(object, this.root, 0);
+  }
+
+  // MAX_DEPTH prevents infinite subdivision when objects share the same point
+  _insert(object, node, depth) {
+    if (depth > 32) {
+      // Too deep — just store here, don't subdivide further
+      node.objects.push(object);
+      return;
     }
 
-    clear() { this._clearNode(this.root); }
+    if (!this._contains(node.bounds, object)) return;
 
-    _clearNode(node) {
-        node.objects = [];
-        if (!node.isLeaf()) {
-            for (const child of node.children) this._clearNode(child);
-            node.children = null;
-        }
-    }
-
-    insert(object) { this._insert(object, this.root); }
-
-    _insert(object, node) {
-        if (!this._contains(node.bounds, object)) return;
-
-        if (node.isLeaf()) {
-            if (node.objects.length < node.capacity) {
-                node.objects.push(object);
-                return;
-            }
-
-            // Subdivide and redistribute existing objects
-            node.subdivide();
-            const existing = node.objects;
-            node.objects = [];                 // clear parent
-
-            for (const obj of existing) {
-                for (const child of node.children) {
-                    if (this._contains(child.bounds, obj)) {
-                        this._insert(obj, child);
-                        break;               // ✅ insert into FIRST containing child only
-                    }
-                }
-            }
-
-            // Insert the NEW object into the first containing child
-            for (const child of node.children) {
-                if (this._contains(child.bounds, object)) {
-                    this._insert(object, child);
-                    break;                   // ✅ once inserted, stop
-                }
-            }
-            return;                          // ✅ do NOT fall through to non‑leaf code
-        }
-
-        // Non‑leaf: insert into the first containing child
+    if (node.isLeaf()) {
+      if (node.objects.length < node.capacity) {
+        node.objects.push(object);
+        return;
+      }
+      // Subdivide and redistribute
+      node.subdivide();
+      const existing = node.objects;
+      node.objects = [];
+      for (const obj of existing) {
+        let placed = false;
         for (const child of node.children) {
-            if (this._contains(child.bounds, object)) {
-                this._insert(object, child);
-                break;                       // ✅ only one child
-            }
+          if (this._contains(child.bounds, obj)) {
+            this._insert(obj, child, depth + 1);
+            placed = true;
+            break;
+          }
         }
+        // Object sits exactly on a boundary — keep it at this node
+        if (!placed) node.objects.push(obj);
+      }
     }
 
-    queryRange(range, result = []) {
-        const seen = new Set();                         // ← dedup guard
-        this._query(this.root, range, seen);
-        for (const item of seen) result.push(item);
-        return result;
-    }
-
-    _query(node, range, seen) {
-        if (!this._intersects(node.bounds, range)) return;
-        for (const obj of node.objects) {
-            const r = obj.radius ?? 0;
-            if (obj.x + r >= range.x && obj.x - r <= range.x + range.w &&
-                obj.y + r >= range.y && obj.y - r <= range.y + range.h) {
-                seen.add(obj);                          // Set ignores duplicates
-            }
+    // Non-leaf: insert into first containing child, else keep at this node
+    if (!node.isLeaf()) {
+      let placed = false;
+      for (const child of node.children) {
+        if (this._contains(child.bounds, object)) {
+          this._insert(object, child, depth + 1);
+          placed = true;
+          break;
         }
-        if (!node.isLeaf()) {
-            for (const child of node.children) this._query(child, range, seen);
+      }
+      if (!placed) node.objects.push(object);
+    }
+  }
+
+  queryRange(range, result = []) {
+    const seen  = new Set();
+    const stack = [this.root];
+    while (stack.length) {
+      const node = stack.pop();
+      if (!this._intersects(node.bounds, range)) continue;
+      for (const obj of node.objects) {
+        const r = obj.radius ?? 0;
+        if (obj.x + r >= range.x && obj.x - r <= range.x + range.w &&
+            obj.y + r >= range.y && obj.y - r <= range.y + range.h) {
+          seen.add(obj);
         }
+      }
+      if (node.children) stack.push(...node.children);
     }
+    for (const item of seen) result.push(item);
+    return result;
+  }
 
-    rebuild(objects) {
-        this.clear();
-        for (const obj of objects) this.insert(obj);
-    }
+  _contains(rect, obj) {
+    return obj.x >= rect.x && obj.x <= rect.x + rect.w &&
+           obj.y >= rect.y && obj.y <= rect.y + rect.h;
+  }
 
-    _contains(rect, obj) {
-        return obj.x >= rect.x && obj.x <= rect.x + rect.w &&
-               obj.y >= rect.y && obj.y <= rect.y + rect.h;
-    }
-    _intersects(a, b) {
-        return !(a.x + a.w < b.x || b.x + b.w < a.x ||
-                 a.y + a.h < b.y || b.y + b.h < a.y);
-    }
+  _intersects(a, b) {
+    return !(a.x + a.w < b.x || b.x + b.w < a.x ||
+             a.y + a.h < b.y || b.y + b.h < a.y);
+  }
 }
