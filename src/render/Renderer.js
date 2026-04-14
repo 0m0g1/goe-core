@@ -279,4 +279,11 @@ export class WorldRenderer {
   worldToScreen(tx, ty, elevPx) {
     return worldToScreen(tx, ty, elevPx, this.cam);
   }
+
+  // Add to WorldRenderer
+  beginPipeline() {
+    this._voxel.beginFrame();
+    this._shadows.beginFrame();
+    this._pipeline.beginFrame();
+  }
 }

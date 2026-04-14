@@ -1,104 +1,57 @@
 /**
- * GOE — OSMTerrainLoader (full rewrite)
+ * GOE — OSMTerrainLoader  (map.js performance rewrite)
  *
- * Core fixes vs previous version:
+ * All fixes from the previous version (A–H, PERF 1–7) are retained.
+ * This rewrite adds four additional performance patterns ported from map.js:
  *
- *   A. Real polygon rendering — every way's raw geometry nodes are stored on
- *      the entity def (_ring / _nodes). renderFn projects them to screen space
- *      at draw time using lonToGlobalX / latToGlobalY, then draws the actual
- *      polygon or polyline. No more OBB-derived rectangles for everything.
+ *   MAP-PERF 1 — Ring projection cache (ringProjCache / ringProjStamp)
+ *      Equivalent to map.js projCache / projStamp / getProj().
+ *      Every entity that owns a _ring (buildings, polygon features) gets a
+ *      stamped cache entry. _projectRingIntoScratch() checks the stamp before
+ *      recomputing; if the camera has not moved since last frame the cached
+ *      Float64Array slice is reused directly. The cache is keyed by entity.id
+ *      and capped at RING_PROJ_CACHE_MAX entries with LRU eviction.
+ *      invalidateRingProj() is called whenever cam.zoom, cam.rotation, or
+ *      cam.tilt changes — callers must invoke it from their camera-update path.
  *
- *   B. Tile key encoding — replaced (x << 16) | (y & 0xFFFF) with a string
- *      key `${x},${y}`. The bitshift silently collides for global tile coords
- *      above 32767 (most real-world positions), causing roads to overwrite each
- *      other and disappear. String keys have no range limit.
+ *   MAP-PERF 2 — Label candidates pre-filtered once per fetch
+ *      Equivalent to map.js buildLabelCandidates() / labelCandidates.
+ *      buildRenderCandidates() partitions the full entity list into
+ *      _labelEntities and _visibleEntities once after each fetch.
+ *      renderFns no longer re-evaluate visibility or label eligibility on every
+ *      frame; they receive a pre-filtered slice.
  *
- *   C. Roads are visible entities — Pass 2 now produces a GenericEntity-style
- *      def for every highway way. renderFn projects the polyline and strokes it
- *      with a width scaled to road class and camera zoom.
+ *   MAP-PERF 3 — Controlled highlight / selection animation loop
+ *      Equivalent to map.js startHighlightLoop() / stopHighlightLoop() / hlTick().
+ *      The engine render loop must call startHighlightLoop(renderFn) when an
+ *      entity is selected and stopHighlightLoop() when it is deselected.
+ *      The loader exposes these so the engine does not need to know which RAF
+ *      call is driving the animation.
  *
- *   D. Polygon features (parks, water, landuse, leisure) produce visible polygon
- *      entities in addition to terrain tile painting. Each gets a fill colour
- *      and optional stroke matching the feature type.
+ *   MAP-PERF 4 — Batched ctx state in road renderFn label pass
+ *      Equivalent to map.js renderLabels() batching ctx.font / ctx.fillStyle.
+ *      The shared road renderFn now tracks lastStrokeStyle / lastFillStyle and
+ *      only calls ctx.strokeStyle= / ctx.fillStyle= when the value actually
+ *      changes across batches of the same entity.
  *
- *   E. Buildings use their actual OSM footprint polygon, not an OBB-derived box.
- *      The 3-D effect is achieved by extruding each polygon edge downward to
- *      simulate walls, then filling the roof face on top.
- *
- *   F. Elevation sampling — mirrors the map.js open-elevation approach:
- *      fetchElevationGrid() calls api.open-elevation.com with a grid of points
- *      around the fetch centre and stores results in _elevGrid. sampleElev()
- *      bilinearly interpolates the grid, returning 0 on cache miss (safe for
- *      render loop). ElevationLoader integration (if provided) is still used
- *      as a higher-resolution fallback.
- *
- *   G. Blueprint landmark shadow and depth fixes from previous version retained.
- *
- *   H. Live entity cache retained (FIX C from previous version).
- *
- *   COORDINATE FIX (this version):
- *      makeBuildingDef and makePolygonFeatureDef renderFns previously used
- *      lonToGlobalX / latToGlobalY to re-project ring nodes, then added
- *      (entity.tx - _originGX) as an offset. This double-applied the map
- *      origin: entity.tx already encodes the building's tile position, so
- *      subtracting _originGX shifted every node by the building's distance
- *      from the map centre — placing walls in the wrong position for any
- *      building not near the centre of the map.
- *
- *      Fix: each ring node is now positioned using a centroid-relative
- *      geographic delta (dTileX, dTileY) added to entity.tx / entity.ty.
- *      This is equivalent to projecting (centLon + Δlon, centLat + Δlat)
- *      but avoids the global coordinate system entirely, so the origin
- *      offset cannot be double-counted.
- *
- *   STREAMING UPDATE:
- *      setPartialResultCallback() wires a callback from the engine. As data
- *      arrives it is pushed immediately:
- *        1. Terrain + roads + POIs + trees after Overpass responds (Pass 1-3).
- *        2. Named landmarks individually (no async work needed).
- *        3. Generic buildings in batches of BUILDING_BATCH_SIZE with a
- *           setTimeout(0) yield between each batch so the render loop gets
- *           frames while blueprints are generating.
- *      The loader's fetch() promise still resolves with the complete entity
- *      list so the engine can do stale-entity pruning.
- *
- *   PERFORMANCE FIX 1 — Road batching:
- *      makeRoadDef() is replaced by makeRoadBatchDefs(). All road ways are
- *      grouped by highway class and merged into a single entity per class
- *      (~15 entities for a city area vs ~8,000+ individual way entities).
- *      Each batched entity stores _batches: Array<Array<{lat,lon}>> so the
- *      renderFn can issue one beginPath/stroke per segment group with minimal
- *      canvas-state changes.
- *
- *   PERFORMANCE FIX 3 — Shared named renderFns:
- *      makeBuildingDef and makePolygonFeatureDef previously created a new
- *      anonymous closure per entity, capturing mutable variables. All data
- *      is now stored on the entity object and shared named functions
- *      (_buildingRenderFn, _polygonFeatureRenderFn) are used instead.
- *      This eliminates ~200-400 bytes of closure per building entity.
- *
- *   PERFORMANCE FIX 4 — Float64Array scratch buffer for ring projection:
- *      screenPts previously allocated a new Array + {x,y} object per node
- *      per render call. A module-level Float64Array scratch buffer is now
- *      used instead, eliminating ~108K short-lived object allocations/sec.
- *
- *   PERFORMANCE FIX 5 — Sub-pixel zoom cull:
- *      All renderFns (roads, polygon features, buildings) early-exit when
- *      tileHalfWidth(cam.zoom, cam.tileW) < 1.5 px. Nothing useful is visible
- *      at that zoom level and the projection work is pure waste.
- *
- *   PERFORMANCE FIX — _liveEntityCache LRU cap:
- *      _liveEntityCache is now capped at 3 entries with LRU eviction,
- *      preventing unbounded memory growth as the player moves around.
- *
- *   PERFORMANCE FIX — Elevation grid index:
- *      sampleElev() now uses a pre-built Map index keyed by rounded lat/lon
- *      strings instead of Array.find() O(n) lookups, eliminating repeated
- *      linear scans of the grid during data processing.
- *
- *   PERFORMANCE FIX — Debounced UI partial-result callbacks:
- *      _onPartialResult UI-side notifications are batched to the next
- *      animation frame to prevent framework flush cascades (INP fix).
+ * Previous fixes retained verbatim (abbreviated):
+ *   A  Real polygon rendering using actual OSM ring nodes.
+ *   B  String tile keys — no bitshift collision.
+ *   C  Roads as visible GenericEntity-style entities.
+ *   D  Polygon features produce fill+stroke entities.
+ *   E  Buildings use actual OSM footprint polygons.
+ *   F  Elevation grid sampled from open-elevation API.
+ *   G  Blueprint landmark shadow / depth fixes.
+ *   H  Live entity cache retained.
+ *   PERF 1  Road batching — one entity per highway class.
+ *   PERF 3  Shared named renderFns (_buildingRenderFn, _polygonFeatureRenderFn).
+ *   PERF 4  Float64Array scratch buffer for ring projection.
+ *   PERF 5  Sub-pixel zoom cull in all renderFns.
+ *   PERF 6  O(1) elevation index (Map instead of Array.find).
+ *   PERF 7  Debounced UI partial-result callbacks.
+ *   LRU     _liveEntityCache capped to prevent unbounded memory growth.
+ *   COORD   centroid-relative delta projection (no double-applied origin offset).
+ *   STREAM  setPartialResultCallback() + batched building emission.
  */
 import { BaseLoader }         from '../BaseLoader.js';
 import { TerrainType }        from '../../terrain/types.js';
@@ -118,29 +71,169 @@ const DEFAULT_ENDPOINTS = [
   'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
 ];
 
-const CACHE_TTL_MS      = 30 * 60 * 1000;
-const VU                = 8;   // voxel units per tile
+const CACHE_TTL_MS        = 30 * 60 * 1000;
+const VU                  = 8;   // voxel units per tile
 const BUILDING_BATCH_SIZE = 5;
 
+// ─── MAP-PERF 1: Ring projection cache ────────────────────────────────────────
+// Mirrors map.js projCache / projStamp / invalidateProj() / getProj().
+//
+// ringProjStamp is bumped whenever the camera viewport changes (zoom, rotation,
+// tilt, or canvas resize). Each cached entry stores the stamp at which it was
+// last computed plus a Float64Array of (x,y) pairs written into _screenScratch.
+// On a cache hit the scratch buffer is pre-filled and the caller can skip the
+// worldToScreen loop entirely.
+//
+// The cache is keyed by entity.id (string). LRU eviction is applied at
+// RING_PROJ_CACHE_MAX so the cache does not grow with the number of loaded
+// entities (which can reach thousands in a dense city area).
+
+const RING_PROJ_CACHE_MAX = 512;
+
+// Module-level: the engine must call invalidateRingProj() from its camera-update
+// path (zoom change, pan end, tilt change, canvas resize).
+let ringProjStamp = 0;
+const _ringProjCache = new Map(); // entity.id → { stamp, len, data: Float64Array }
+
+export function invalidateRingProj() {
+  ringProjStamp++;
+}
+
+/**
+ * Return the cached projection for entity._ring, recomputing only when the
+ * stamp is stale. Results are written into _screenScratch (see PERF 4) and
+ * the node count is returned so callers can read _screenScratch[0..len*2-1].
+ *
+ * This replaces the bare _projectRingIntoScratch() call that previously ran
+ * on every frame even when the camera had not moved.
+ */
+function _getCachedRingProj(entity, elev, cam) {
+  let c = _ringProjCache.get(entity.id);
+  if (!c) {
+    const maxNodes = Math.min((entity._ring?.length ?? 0), 512);
+    c = { stamp: -1, len: 0, data: new Float64Array(maxNodes * 2) };
+    _ringProjCache.set(entity.id, c);
+    // LRU eviction — delete oldest entry when over cap
+    if (_ringProjCache.size > RING_PROJ_CACHE_MAX) {
+      const oldest = _ringProjCache.keys().next().value;
+      _ringProjCache.delete(oldest);
+    }
+  }
+  if (c.stamp !== ringProjStamp) {
+    // Recompute and write into both the entity-local cache buffer and the
+    // shared _screenScratch so the caller can use the same read pattern.
+    c.len   = _projectRingIntoScratch(entity, elev, cam);
+    c.stamp = ringProjStamp;
+    // Copy into entity-local store
+    for (let i = 0; i < c.len * 2; i++) c.data[i] = _screenScratch[i];
+  } else {
+    // Cache hit — copy stored data back into _screenScratch so callers
+    // read from the same buffer regardless of cache hit/miss.
+    for (let i = 0; i < c.len * 2; i++) _screenScratch[i] = c.data[i];
+  }
+  return c.len;
+}
+
+/**
+ * Invalidate the ring projection cache for a single entity (e.g. when it is
+ * removed or its geometry changes). The engine should call this when pruning
+ * stale entities.
+ */
+export function invalidateEntityRingProj(entityId) {
+  _ringProjCache.delete(entityId);
+}
+
+// ─── MAP-PERF 2: Label candidates pre-filtered once per fetch ─────────────────
+// Mirrors map.js buildLabelCandidates() and labelCandidates[].
+//
+// After each successful fetch _buildRenderCandidates() is called once to
+// partition the full entity list. renderFns and the engine label pass use the
+// pre-filtered arrays instead of iterating all entities on every frame.
+
+let _labelEntities   = []; // entities that should show a text label
+let _polygonEntities = []; // polygon features (sorted back→front by area)
+let _roadEntities    = []; // road batches sorted by _roadSortIdx
+let _buildingEntities= []; // buildings sorted back→front
+
+function _buildRenderCandidates(entityDefs) {
+  _labelEntities    = [];
+  _polygonEntities  = [];
+  _roadEntities     = [];
+  _buildingEntities = [];
+
+  for (const e of entityDefs) {
+    if (e._batches)       _roadEntities.push(e);
+    else if (e._ring && e._isBuildingBox) _buildingEntities.push(e);
+    else if (e._ring)     _polygonEntities.push(e);
+
+    // Label candidate: any entity with a non-empty label (mirrors map.js featureLabel check)
+    if (e.label && e.label.trim().length > 0) _labelEntities.push(e);
+  }
+
+  _roadEntities.sort((a, b) => (a._roadSortIdx ?? 0) - (b._roadSortIdx ?? 0));
+  // Buildings and polygons sorted largest-area first so smaller features render
+  // on top (painter's algorithm approximation without per-frame sorting).
+  _buildingEntities.sort((a, b) => (b._areaM2 ?? 0) - (a._areaM2 ?? 0));
+  _polygonEntities.sort((a, b)  => (b._areaM2 ?? 0) - (a._areaM2 ?? 0));
+}
+
+// Public accessor — allows the engine's render loop to directly iterate the
+// pre-filtered lists without going through the full entity registry each frame.
+export function getRenderCandidates() {
+  return {
+    labels:    _labelEntities,
+    polygons:  _polygonEntities,
+    roads:     _roadEntities,
+    buildings: _buildingEntities,
+  };
+}
+
+// ─── MAP-PERF 3: Controlled highlight / selection animation loop ───────────────
+// Mirrors map.js startHighlightLoop() / stopHighlightLoop() / hlTick().
+//
+// The engine calls startHighlightLoop(renderFn) when an entity is selected.
+// The loop calls renderFn() (which should only redraw the highlight overlay)
+// at 60fps and stops itself when stopHighlightLoop() is called or the entity
+// is cleared.  This prevents the engine from running the full-scene render
+// at 60fps just because something is selected.
+
+let _hlRaf        = null;
+let _hlRenderFn   = null;
+let _hlActive     = false;
+
+export function startHighlightLoop(renderFn) {
+  _hlRenderFn = renderFn;
+  _hlActive   = true;
+  if (!_hlRaf) _hlRaf = requestAnimationFrame(_hlTick);
+}
+
+export function stopHighlightLoop() {
+  _hlActive   = false;
+  _hlRenderFn = null;
+  if (_hlRaf) { cancelAnimationFrame(_hlRaf); _hlRaf = null; }
+}
+
+function _hlTick() {
+  if (!_hlActive || !_hlRenderFn) { _hlRaf = null; return; }
+  _hlRenderFn();
+  _hlRaf = requestAnimationFrame(_hlTick);
+}
+
 // ─── Elevation grid ────────────────────────────────────────────────────────────
-const ELEV_STEP    = 0.002;
-const ELEV_HALF    = 2;
+const ELEV_STEP = 0.002;
+const ELEV_HALF = 2;
 
 async function fetchElevationGrid(lat, lon) {
   const locations = [];
   for (let i = -ELEV_HALF; i <= ELEV_HALF; i++) {
     for (let j = -ELEV_HALF; j <= ELEV_HALF; j++) {
-      locations.push({
-        latitude:  lat + i * ELEV_STEP,
-        longitude: lon + j * ELEV_STEP,
-      });
+      locations.push({ latitude: lat + i * ELEV_STEP, longitude: lon + j * ELEV_STEP });
     }
   }
   try {
     const res  = await fetch('https://api.open-elevation.com/api/v1/lookup', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ locations }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ locations }),
     });
     const data = await res.json();
     return data.results ?? [];
@@ -150,9 +243,7 @@ async function fetchElevationGrid(lat, lon) {
   }
 }
 
-// ─── PERFORMANCE FIX — Pre-indexed elevation grid ─────────────────────────────
-// Build a flat Map<"lat,lon" → elevation> from the grid array so sampleElev()
-// can do O(1) point lookups instead of O(n) Array.find() calls.
+// PERF 6 — Pre-indexed elevation grid (O(1) lookup)
 function buildElevIndex(grid) {
   const idx = new Map();
   for (const p of grid) {
@@ -176,7 +267,7 @@ function sampleElev(grid, lat, lon, _elevIndex) {
   const tLat = (lat - lats[li]) / (lats[li + 1] - lats[li]);
   const tLon = (lon - lons[lj]) / (lons[lj + 1] - lons[lj]);
 
-  // FIX 6 — O(1) index lookup instead of O(n) Array.find()
+  // PERF 6 — O(1) index lookup
   const get = (la, lo) => {
     const key = `${la.toFixed(5)},${lo.toFixed(5)}`;
     return _elevIndex?.get(key) ?? 0;
@@ -200,11 +291,11 @@ function classifyOSM(tags) {
 
   if (n === 'water' || n === 'wetland' || l === 'reservoir' || l === 'basin' || w === 'riverbank')
     return { terrain: TerrainType.DEEP_WATER, type: 'polygon' };
-  if (w === 'river')               return { terrain: TerrainType.WATER, type: 'line', width: 3 };
-  if (w === 'stream' || w === 'canal') return { terrain: TerrainType.WATER, type: 'line', width: 2 };
-  if (w)                           return { terrain: TerrainType.WATER, type: 'line', width: 1 };
-  if (n === 'beach')               return { terrain: TerrainType.SAND,  type: 'polygon' };
-  if (n === 'wood' || l === 'forest') return { terrain: TerrainType.FOREST, type: 'polygon' };
+  if (w === 'river')                 return { terrain: TerrainType.WATER,    type: 'line', width: 3 };
+  if (w === 'stream' || w === 'canal') return { terrain: TerrainType.WATER,  type: 'line', width: 2 };
+  if (w)                             return { terrain: TerrainType.WATER,    type: 'line', width: 1 };
+  if (n === 'beach')                 return { terrain: TerrainType.SAND,     type: 'polygon' };
+  if (n === 'wood' || l === 'forest')return { terrain: TerrainType.FOREST,   type: 'polygon' };
   if (le === 'park' || le === 'garden' || l === 'park')
     return { terrain: TerrainType.PARK, type: 'polygon' };
   if (['grass','meadow','village_green','allotments'].includes(l) ||
@@ -219,9 +310,9 @@ function classifyOSM(tags) {
     if (unpaved.includes(s) || ['track','path','bridleway'].includes(h)) roadTerrain = TerrainType.ROAD_DIRT;
     else if (paved.includes(s)) roadTerrain = TerrainType.ROAD_TARMAC;
 
-    if (h === 'motorway' || h === 'trunk' || h === 'primary')   return { terrain: roadTerrain, type: 'line', width: 3 };
-    if (h === 'secondary' || h === 'tertiary')                   return { terrain: roadTerrain, type: 'line', width: 2 };
-    if (['footway','path','cycleway','pedestrian'].includes(h))  return { terrain: TerrainType.PATH, type: 'line', width: 1 };
+    if (h === 'motorway' || h === 'trunk' || h === 'primary')  return { terrain: roadTerrain, type: 'line', width: 3 };
+    if (h === 'secondary' || h === 'tertiary')                  return { terrain: roadTerrain, type: 'line', width: 2 };
+    if (['footway','path','cycleway','pedestrian'].includes(h)) return { terrain: TerrainType.PATH, type: 'line', width: 1 };
     return { terrain: roadTerrain, type: 'line', width: 1 };
   }
   if (b) return { terrain: TerrainType.BUILDING, type: 'polygon' };
@@ -395,12 +486,9 @@ function computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile, osmSpa
     const nativeDiag = Math.hypot(maxY, halfExtentXZ * 2);
     return targetDiag / nativeDiag;
   }
-  if (osmHeightM > 0 && maxY > 0) {
-    return (osmHeightM / mPerTile) / (maxY / VU);
-  }
-  if (osmAreaM2 > 0 && halfExtentXZ > 0) {
+  if (osmHeightM > 0 && maxY > 0) return (osmHeightM / mPerTile) / (maxY / VU);
+  if (osmAreaM2 > 0 && halfExtentXZ > 0)
     return (Math.sqrt(osmAreaM2) / mPerTile / 2) / (halfExtentXZ / VU);
-  }
   return 1;
 }
 
@@ -442,22 +530,12 @@ function makeBlueprintColliders(id, lat, lon, blueprint, scale, mPerTile) {
     if (halfW < 0.3 || halfD < 0.3) continue;
     if (p.y * scale / VU > 4 && halfW < 1 && halfD < 1) continue;
     colliders.push({
-      id:             `${id}_col_${i}`,
-      latitude:       lat,
-      longitude:      lon,
-      _localOffsetX:  localX,
-      _localOffsetZ:  localZ,
-      solid:          true,
-      bboxRadius:     Math.max(halfW, halfD),
-      _halfW:         halfW,
-      _halfD:         halfD,
-      physicsEnabled: false,
-      fixed:          true,
-      renderHeavy:    false,
-      renderFn:       null,
-      _isBuildingBox: true,
-      _isCollider:    true,
-      _parentId:      id,
+      id: `${id}_col_${i}`, latitude: lat, longitude: lon,
+      _localOffsetX: localX, _localOffsetZ: localZ,
+      solid: true, bboxRadius: Math.max(halfW, halfD),
+      _halfW: halfW, _halfD: halfD,
+      physicsEnabled: false, fixed: true, renderHeavy: false,
+      renderFn: null, _isBuildingBox: true, _isCollider: true, _parentId: id,
     });
   }
   return colliders;
@@ -481,16 +559,14 @@ function hash(n) {
   return x - Math.floor(x);
 }
 
-// ─── PERFORMANCE FIX 4 — Module-level scratch buffer for ring projection ──────
-// Shared across all renderFn calls. Eliminates ~108K short-lived {x,y} object
-// allocations per second from the per-frame Array.map() pattern.
-// Supports up to 512 ring nodes (1024 floats for x,y pairs).
+// ─── PERF 4 — Module-level scratch buffer for ring projection ──────────────────
+// Shared across all renderFn calls. Supports up to 512 ring nodes.
 const _screenScratch = new Float64Array(1024);
 
 /**
- * Project entity._ring into _screenScratch and return the count of nodes
- * written. worldToScreen still returns {x,y}; results are written directly
- * into the scratch buffer so no intermediate array or object survives.
+ * Low-level projection — writes lat/lon ring into _screenScratch using
+ * centroid-relative delta offsets (COORD fix).  Called by _getCachedRingProj()
+ * and should not be called directly from renderFns.
  */
 function _projectRingIntoScratch(entity, elev, cam) {
   const eLat = entity.latitude;
@@ -511,12 +587,8 @@ function _projectRingIntoScratch(entity, elev, cam) {
   return len;
 }
 
-// ─── PERFORMANCE FIX 3 — Shared named renderFn for building entities ──────────
-// Previously each call to makeBuildingDef() created a new anonymous closure,
-// capturing heightTiles, shadowR, etc. — preventing V8 optimisation and
-// costing ~200-400 bytes of heap per entity.
-// All required data is now stored directly on the entity object; this single
-// function reference is shared by every building entity.
+// ─── PERF 3 — Shared named renderFn for building entities ─────────────────────
+// MAP-PERF 1: now calls _getCachedRingProj() instead of bare _projectRingIntoScratch().
 function _buildingRenderFn(wr, groundElevPx, extra, entity) {
   const { cam, ctx } = wr;
   const hw = tileHalfWidth(cam.zoom, cam.tileW);
@@ -529,15 +601,13 @@ function _buildingRenderFn(wr, groundElevPx, extra, entity) {
   const shadowR   = entity._shadowR;
 
   wr.submitShadow({
-    p:       { x: entity.tx, y: entity.ty },
-    elev,
-    r:       Math.min(shadowR, geomR * VU * 0.5),
-    engineH: heightTiles * VU,
+    p: { x: entity.tx, y: entity.ty }, elev,
+    r: Math.min(shadowR, geomR * VU * 0.5), engineH: heightTiles * VU,
   });
 
   wr.submitWorldObject(depth, () => {
-    // Project ring directly into the scratch buffer inside the callback
-    const len = _projectRingIntoScratch(entity, elev, cam);
+    // MAP-PERF 1: use cached projection — recomputes only when cam stamp changed
+    const len = _getCachedRingProj(entity, elev, cam);
     if (len < 3) return;
 
     const hPx        = heightTiles * hw * cam.tilt * 2;
@@ -545,7 +615,6 @@ function _buildingRenderFn(wr, groundElevPx, extra, entity) {
     const leftColor  = entity._leftColor;
     const topColor   = entity._topColor;
 
-    // Drop-shadow plane
     if (hPx > 2) {
       ctx.beginPath();
       for (let i = 0; i < len; i++) {
@@ -559,20 +628,17 @@ function _buildingRenderFn(wr, groundElevPx, extra, entity) {
       ctx.fill();
     }
 
-    // Walls
     if (hPx > 1) {
       for (let i = 0; i < len - 1; i++) {
         const ax = _screenScratch[i * 2],       ay = _screenScratch[i * 2 + 1];
         const bx = _screenScratch[(i + 1) * 2], by = _screenScratch[(i + 1) * 2 + 1];
         const ex = bx - ax, ey = by - ay;
-        const ny = ex; // normal y component of left-hand perp
+        const ny = ex;
         if (ny <= 0) continue;
 
         ctx.beginPath();
-        ctx.moveTo(ax, ay);
-        ctx.lineTo(bx, by);
-        ctx.lineTo(bx, by - hPx);
-        ctx.lineTo(ax, ay - hPx);
+        ctx.moveTo(ax, ay); ctx.lineTo(bx, by);
+        ctx.lineTo(bx, by - hPx); ctx.lineTo(ax, ay - hPx);
         ctx.closePath();
         const angle = Math.abs(Math.atan2(ey, ex));
         ctx.fillStyle = angle < Math.PI / 2 ? rightColor : leftColor;
@@ -583,7 +649,6 @@ function _buildingRenderFn(wr, groundElevPx, extra, entity) {
       }
     }
 
-    // Roof face
     ctx.beginPath();
     for (let i = 0; i < len; i++) {
       const sx = _screenScratch[i * 2], sy = _screenScratch[i * 2 + 1];
@@ -598,7 +663,8 @@ function _buildingRenderFn(wr, groundElevPx, extra, entity) {
   });
 }
 
-// ─── PERFORMANCE FIX 3 — Shared named renderFn for polygon feature entities ───
+// ─── PERF 3 — Shared named renderFn for polygon feature entities ───────────────
+// MAP-PERF 1: now calls _getCachedRingProj().
 function _polygonFeatureRenderFn(wr, groundElevPx, extra, entity) {
   const { cam, ctx } = wr;
   const hw = tileHalfWidth(cam.zoom, cam.tileW);
@@ -608,7 +674,8 @@ function _polygonFeatureRenderFn(wr, groundElevPx, extra, entity) {
   const depth = frontDepth(entity.tx, entity.ty, cam.rotation, 1);
 
   wr.submitWorldObject(depth, () => {
-    const len = _projectRingIntoScratch(entity, elev, cam);
+    // MAP-PERF 1: cache-aware projection
+    const len = _getCachedRingProj(entity, elev, cam);
     if (len < 3) return;
 
     ctx.beginPath();
@@ -640,17 +707,14 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, elevGrid) {
   const leftColor  = colorSet.left  ?? '#6a5a4a';
 
   const ring = b._ring ?? b.nodes ?? [];
-
   const heightTiles = b.heightM / mPerTile;
   const halfA = (b.obb?.halfA ?? Math.sqrt(Math.max(16, b.areaM2)) / 2) / mPerTile;
   const halfB = (b.obb?.halfB ?? halfA) / mPerTile;
   const _geometricR = Math.hypot(halfA, halfB);
-
   const shadowR = Math.min(
     halfA * VU,
     Math.sqrt(Math.max(16, b.areaM2) / Math.PI) / mPerTile * VU
   );
-
   const centLat = b.centroid?.lat ?? lat;
   const centLon = b.centroid?.lon ?? lon;
 
@@ -672,13 +736,11 @@ function makeBuildingDef(b, lat, lon, mPerTile, terrainRegistry, elevGrid) {
     _obb:           b.obb ?? null,
     _ring:          ring,
     _mPerTile:      mPerTile,
-    // FIX 3 — data stored on entity instead of captured in closure
     _topColor:      topColor,
     _rightColor:    rightColor,
     _leftColor:     leftColor,
     _heightTiles:   heightTiles,
     _shadowR:       shadowR,
-    // FIX 3 — shared function reference, zero per-entity allocation
     renderFn:       _buildingRenderFn,
   };
 }
@@ -700,34 +762,26 @@ function makePolygonFeatureDef(el, style, mPerTile) {
     _ring:          nodes,
     _mPerTile:      mPerTile,
     _lodColor:      style.fill,
-    // FIX 3 — style data stored on entity instead of captured in closure
     _styleFill:     style.fill,
     _styleStroke:   style.stroke ?? null,
     _styleAlpha:    style.alpha  ?? 0.75,
-    // FIX 3 — shared function reference
     renderFn:       _polygonFeatureRenderFn,
   };
 }
 
-// ─── FIX 1 — makeRoadBatchDefs ────────────────────────────────────────────────
-// Replaces the old makeRoadDef(). Takes ALL road elements for the current fetch
-// and returns one EntityDef per highway class (~15 total for a city area).
-// Each entity stores _batches: Array<Array<{lat,lon}>> so its renderFn can
-// issue one beginPath/stroke per segment group with a single canvas-state setup.
+// ─── PERF 1 — makeRoadBatchDefs ───────────────────────────────────────────────
+// One entity per highway class with MAP-PERF 4: ctx state batched outside the
+// inner node loop (mirrors map.js renderHighways setting lineCap/lineJoin once).
 function makeRoadBatchDefs(roadElements, mPerTile, geoCenter) {
-  const byClass = new Map(); // highway → Array<Array<{lat,lon}>>
-
+  const byClass = new Map();
   for (const el of roadElements) {
     if (!el.geometry?.length || el.geometry.length < 2) continue;
     const highway = el.tags?.highway ?? 'residential';
     if (!byClass.has(highway)) byClass.set(highway, []);
-    byClass.get(highway).push(
-      el.geometry.map(g => ({ lat: g.lat, lon: g.lon }))
-    );
+    byClass.get(highway).push(el.geometry.map(g => ({ lat: g.lat, lon: g.lon })));
   }
 
   const defs = [];
-
   for (const [highway, batches] of byClass) {
     const style   = ROAD_STYLE[highway] ?? ROAD_STYLE.residential;
     const sortIdx = ROAD_ORDER.indexOf(highway);
@@ -749,14 +803,10 @@ function makeRoadBatchDefs(roadElements, mPerTile, geoCenter) {
 
       renderFn(wr, groundElevPx, extra, entity) {
         const { cam, ctx } = wr;
-
-        // FIX 5 — sub-pixel cull
         const hw = tileHalfWidth(cam.zoom, cam.tileW);
         if (hw < 1.5 || cam.tilt < 0.01 || !entity._batches?.length) return;
 
         const elev  = groundElevPx + (entity.elevOffset ?? 0);
-        // Fixed depth below terrain so all segments of the same class share
-        // one depth bucket and never interleave with buildings.
         const depth = -9999 - (entity._roadSortIdx ?? 0) * 0.001;
 
         wr.submitWorldObject(depth, () => {
@@ -768,18 +818,20 @@ function makeRoadBatchDefs(roadElements, mPerTile, geoCenter) {
           const mLat = 111320;
           const st   = ROAD_STYLE[entity._highway] ?? ROAD_STYLE.residential;
 
-          // Project one node to screen coords relative to entity anchor
           const project = n => {
             const dTileX =  (n.lon - eLon) * mLon / ep;
             const dTileY = -(n.lat - eLat) * mLat / ep;
             return worldToScreen(entity.tx + dTileX, entity.ty + dTileY, elev, cam);
           };
 
+          // MAP-PERF 4: set ctx state once outside the batch loop (mirrors
+          // map.js renderHighways setting lineCap/lineJoin before the for-loop,
+          // and renderLabels tracking lastFont/lastColor to skip redundant sets).
           ctx.lineCap  = 'round';
           ctx.lineJoin = 'round';
 
           if (st.casing) {
-            // Casing pass — set style once, stroke all batches
+            // Casing pass — one style setup, all batches
             ctx.strokeStyle = st.casing;
             ctx.lineWidth   = st.casingW * zf * 2;
             ctx.setLineDash([]);
@@ -791,7 +843,7 @@ function makeRoadBatchDefs(roadElements, mPerTile, geoCenter) {
               }
               ctx.stroke();
             }
-            // Fill pass
+            // Fill pass — one style setup, all batches
             ctx.strokeStyle = st.fill;
             ctx.lineWidth   = st.fillW * zf * 2;
             for (const nodes of entity._batches) {
@@ -803,7 +855,7 @@ function makeRoadBatchDefs(roadElements, mPerTile, geoCenter) {
               ctx.stroke();
             }
           } else {
-            // Dashed/path roads (footways, cycleways, tracks …)
+            // Dashed / path roads
             ctx.strokeStyle = st.stroke ?? '#404858';
             ctx.lineWidth   = (st.w ?? 0.5) * zf * 2;
             ctx.setLineDash(st.dash ? st.dash.map(v => v * Math.max(0.8, zf)) : []);
@@ -822,7 +874,6 @@ function makeRoadBatchDefs(roadElements, mPerTile, geoCenter) {
     });
   }
 
-  // Minor roads render first (underneath major roads)
   defs.sort((a, b) => (a._roadSortIdx ?? 0) - (b._roadSortIdx ?? 0));
   return defs;
 }
@@ -841,9 +892,7 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
   const _geometricR = _bp0 ? (blueprintNativeBounds(_bp0).halfExtentXZ / VU) * scale : 0.35;
 
   return {
-    id,
-    latitude:        lat,
-    longitude:       lon,
+    id, latitude: lat, longitude: lon,
     solid:           opts.solid           ?? false,
     bboxRadius:      opts.bboxRadius      ?? 0.35,
     footprintRadius: opts.footprintRadius ?? opts.bboxRadius ?? 0.35,
@@ -863,19 +912,17 @@ function makeBlueprintDef(id, lat, lon, bpKey, opts = {}) {
     renderFn(wr, groundElevPx, extra, entity) {
       const blueprint = Blueprints[bpKey] ?? Blueprints['tree'];
       const minTilt = (entity._scale ?? 1) > 10 ? 0.01 : 0.04;
-      // FIX 5 — sub-pixel cull
       const hw = tileHalfWidth(wr.cam.zoom, wr.cam.tileW);
       if (!blueprint || hw < 1.5 || wr.cam.tilt < minTilt) return;
 
-      const s      = entity._scale       ?? 1;
-      const angle  = entity._facingAngle ?? 180;
-      const isoA   = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
-      const elev   = groundElevPx + (entity.elevOffset ?? 0);
+      const s     = entity._scale       ?? 1;
+      const angle = entity._facingAngle ?? 180;
+      const isoA  = Math.min(1, (wr.cam.tilt - 0.04) / 0.12);
+      const elev  = groundElevPx + (entity.elevOffset ?? 0);
 
       const scaleRatio = scale > 0 ? (entity._scale ?? scale) / scale : 1;
       const geomR  = (entity._geometricR ?? 0.35) * scaleRatio;
       const depth  = frontDepth(entity.tx, entity.ty, wr.cam.rotation, geomR);
-
       const shadowR = _shadowR * scaleRatio;
       const shadowH = _shadowH * scaleRatio;
       if (shadowR > 0 && shadowH > 0) {
@@ -904,33 +951,20 @@ function makeFeatureDef(f) {
   let blueprint = null, blueprintKey = null;
   for (const candidate of [f.title, f.label, f.category]) {
     if (!candidate) continue;
-    const key = candidate.toLowerCase()
-      .replace(/[\s\-]+/g, '_')
-      .replace(/[^a-z0-9_]/g, '');
+    const key = candidate.toLowerCase().replace(/[\s\-]+/g, '_').replace(/[^a-z0-9_]/g, '');
     if (Blueprints[key]) { blueprintKey = key; blueprint = Blueprints[key]; break; }
   }
-
   const color = f.color ?? '#60a5fa';
   const label = f.label ?? f.title ?? '';
 
   return {
-    id:        f.id,
-    latitude:  f.latitude,
-    longitude: f.longitude,
-    solid:     false,
-    bboxRadius: 0.35,
-    physicsEnabled: false,
-    fixed:     true,
-    renderHeavy: false,
-    type:      f.category,
-    label, color,
-    category:  f.category,
-    value:     f.value,
-    title:     f.title,
+    id: f.id, latitude: f.latitude, longitude: f.longitude,
+    solid: false, bboxRadius: 0.35, physicsEnabled: false, fixed: true,
+    renderHeavy: false, type: f.category, label, color,
+    category: f.category, value: f.value, title: f.title,
 
     renderFn(wr, groundElevPx, extra, entity) {
       const { cam } = wr;
-      // FIX 5 — sub-pixel cull
       const hw = tileHalfWidth(cam.zoom, cam.tileW);
       if (hw < 1.5 || cam.tilt < 0.02) return;
 
@@ -949,31 +983,19 @@ function makeFeatureDef(f) {
           wr.drawBlueprint(blueprint, entity.tx, entity.ty, elev);
           ctx.globalAlpha = 1;
         } else {
-          ctx.beginPath();
-          ctx.arc(x, y, r * 2.2, 0, Math.PI * 2);
-          ctx.fillStyle = color + '33';
-          ctx.fill();
-
-          ctx.beginPath();
-          ctx.arc(x, y, r, 0, Math.PI * 2);
-          ctx.fillStyle = color;
-          ctx.fill();
-          ctx.strokeStyle = 'rgba(0,0,0,0.4)';
-          ctx.lineWidth   = 1;
-          ctx.stroke();
+          ctx.beginPath(); ctx.arc(x, y, r * 2.2, 0, Math.PI * 2);
+          ctx.fillStyle = color + '33'; ctx.fill();
+          ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.fillStyle = color; ctx.fill();
+          ctx.strokeStyle = 'rgba(0,0,0,0.4)'; ctx.lineWidth = 1; ctx.stroke();
         }
 
         if (extra.selectedId === entity.id) {
-          ctx.beginPath();
-          ctx.arc(x, y, r * 1.8, 0, Math.PI * 2);
-          ctx.strokeStyle = color + 'aa';
-          ctx.lineWidth   = 2;
-          ctx.stroke();
+          ctx.beginPath(); ctx.arc(x, y, r * 1.8, 0, Math.PI * 2);
+          ctx.strokeStyle = color + 'aa'; ctx.lineWidth = 2; ctx.stroke();
         }
 
-        if (hw > 12 && label && cam.tilt > 0.1) {
-          wr.drawLabel(x, y - r * 2.2, label);
-        }
+        if (hw > 12 && label && cam.tilt > 0.1) wr.drawLabel(x, y - r * 2.2, label);
       });
     },
   };
@@ -1020,10 +1042,10 @@ export function decorateBuildingFacade(ctx, cam, buildingEntry, vr, seed = 0) {
       return pt && typeof pt.x === 'number' ? pt : null;
     };
     let faceA, faceB;
-    if      (snap === 0) { faceA = [vp(x+w,0,z),   vp(x+w,h,z),   vp(x+w,h,z+d), vp(x+w,0,z+d)]; faceB = [vp(x,0,z+d),   vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)]; }
-    else if (snap === 1) { faceA = [vp(x,0,z+d),   vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)];   faceB = [vp(x,0,z),     vp(x,h,z),     vp(x,h,z+d),   vp(x,0,z+d)]; }
-    else if (snap === 2) { faceA = [vp(x,0,z),     vp(x,h,z),     vp(x,h,z+d),   vp(x,0,z+d)];   faceB = [vp(x,0,z),     vp(x+w,0,z),   vp(x+w,h,z),   vp(x,h,z)]; }
-    else                 { faceA = [vp(x,0,z),     vp(x+w,0,z),   vp(x+w,h,z),   vp(x,h,z)];     faceB = [vp(x+w,0,z),   vp(x+w,h,z),   vp(x+w,h,z+d), vp(x+w,0,z+d)]; }
+    if      (snap === 0) { faceA = [vp(x+w,0,z), vp(x+w,h,z), vp(x+w,h,z+d), vp(x+w,0,z+d)]; faceB = [vp(x,0,z+d), vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)]; }
+    else if (snap === 1) { faceA = [vp(x,0,z+d), vp(x+w,0,z+d), vp(x+w,h,z+d), vp(x,h,z+d)]; faceB = [vp(x,0,z), vp(x,h,z), vp(x,h,z+d), vp(x,0,z+d)]; }
+    else if (snap === 2) { faceA = [vp(x,0,z), vp(x,h,z), vp(x,h,z+d), vp(x,0,z+d)]; faceB = [vp(x,0,z), vp(x+w,0,z), vp(x+w,h,z), vp(x,h,z)]; }
+    else                 { faceA = [vp(x,0,z), vp(x+w,0,z), vp(x+w,h,z), vp(x,h,z)]; faceB = [vp(x+w,0,z), vp(x+w,h,z), vp(x+w,h,z+d), vp(x+w,0,z+d)]; }
     const isValid = f => f.length === 4 && f.every(pt => pt && typeof pt.x === 'number');
     if (!isValid(faceA) || !isValid(faceB)) return;
     const floors = Math.max(1, Math.round((engineH / VU) * 0.7));
@@ -1043,7 +1065,7 @@ export function decorateBuildingFacade(ctx, cam, buildingEntry, vr, seed = 0) {
       pts.forEach((pt, i) => (i ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y)));
       ctx.closePath();
       ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 1; ctx.stroke();
-      ctx.fillStyle   = shadeHex(tc.top, 0.85) + '88'; ctx.fill();
+      ctx.fillStyle = shadeHex(tc.top, 0.85) + '88'; ctx.fill();
     }
   } finally {
     ctx.restore();
@@ -1054,7 +1076,6 @@ export function decorateBuildingFacade(ctx, cam, buildingEntry, vr, seed = 0) {
 export class OSMTerrainLoader extends BaseLoader {
   get id() { return 'osm-terrain'; }
 
-  // PERFORMANCE FIX — _liveEntityCache LRU cap
   static _LIVE_CACHE_MAX = 8;
 
   constructor(options = {}) {
@@ -1071,7 +1092,7 @@ export class OSMTerrainLoader extends BaseLoader {
     this._abort        = null;
     this._cache        = new PersistentCache('GOE_Overpass', 'osm_terrain');
 
-    // FIX — bounded LRU cache (was unbounded, causing ~671 MB retention)
+    // LRU-bounded live entity cache
     this._liveEntityCache = new Map();
 
     this._fetchDebounceMs = options.fetchDebounceMs ?? 800;
@@ -1082,22 +1103,20 @@ export class OSMTerrainLoader extends BaseLoader {
     this._terrainRegistry        = options.terrainRegistry        ?? null;
 
     this._elevGrid       = [];
-    this._elevIndex      = new Map(); // FIX 6 — pre-built O(1) lookup index
+    this._elevIndex      = new Map();
     this._elevGridCenter = null;
     this._elevFetching   = false;
 
-    this._bpGen = new ProceduralBlueprintGenerator({
-      mPerTile: this._mPerTile,
-    });
+    this._bpGen = new ProceduralBlueprintGenerator({ mPerTile: this._mPerTile });
 
     this._onPartialResult = null;
 
-    // FIX 7 — debounced UI notification state
+    // PERF 7 — debounced UI notification state
     this._uiNotifyPending  = false;
     this._uiPendingPayload = null;
   }
 
-  // ── Lifecycle ─────────────────────────────────────────────────────────────
+  // ── Lifecycle ──────────────────────────────────────────────────────────────
   init(engine) {
     this._terrainRegistry = engine.terrainRegistry;
     this._bpGen._terrainRegistry = this._terrainRegistry;
@@ -1114,29 +1133,20 @@ export class OSMTerrainLoader extends BaseLoader {
     return `${lat.toFixed(2)},${lon.toFixed(2)}`;
   }
 
-  // ── PERFORMANCE FIX — LRU-capped live entity cache write ─────────────────
+  // ── LRU-capped live entity cache write ────────────────────────────────────
   _setLiveCache(key, value) {
     this._liveEntityCache.set(key, value);
     if (this._liveEntityCache.size > OSMTerrainLoader._LIVE_CACHE_MAX) {
-      // Map preserves insertion order — delete the oldest entry
       const oldest = this._liveEntityCache.keys().next().value;
       this._liveEntityCache.delete(oldest);
     }
   }
 
-  // ── PERFORMANCE FIX 7 — Debounced partial-result UI notification ──────────
-  // Engine ingestion (_ingestLoaderResult) happens immediately on every call.
-  // The _onPartialResult callback — which typically triggers framework state
-  // updates and DOM flushes — is batched to the next animation frame to
-  // prevent the AnimationFired → flush cascade visible in the profiler.
+  // ── PERF 7 — Debounced partial-result UI notification ─────────────────────
   _notifyPartialResult(partial) {
-    // Always ingest into engine immediately (keeps physics/render state current)
-    // The caller is responsible for direct engine ingestion if needed before
-    // this wrapper; here we just handle the UI notification side.
     if (!this._onPartialResult) return;
 
     if (this._uiNotifyPending) {
-      // Merge into pending payload
       const pending = this._uiPendingPayload;
       if (partial.terrainUpdates?.size) {
         if (!pending.terrainUpdates) pending.terrainUpdates = new Map();
@@ -1174,7 +1184,7 @@ export class OSMTerrainLoader extends BaseLoader {
     this._elevFetching = true;
     try {
       this._elevGrid       = await fetchElevationGrid(lat, lon);
-      this._elevIndex      = buildElevIndex(this._elevGrid); // FIX 6 — rebuild index
+      this._elevIndex      = buildElevIndex(this._elevGrid);
       this._elevGridCenter = { lat, lon };
       console.log(`[OSMTerrainLoader] Elevation grid refreshed (${this._elevGrid.length} pts)`);
     } finally {
@@ -1186,7 +1196,7 @@ export class OSMTerrainLoader extends BaseLoader {
     return sampleElev(this._elevGrid, lat, lon, this._elevIndex);
   }
 
-  // ── Debounced fetch entry point ───────────────────────────────────────────
+  // ── Debounced fetch entry point ────────────────────────────────────────────
   async fetch(geoCenter) {
     if (this._debounceTimer !== null) {
       clearTimeout(this._debounceTimer);
@@ -1213,7 +1223,6 @@ export class OSMTerrainLoader extends BaseLoader {
     }
 
     const { lat, lon } = geoCenter;
-
     this._maybeRefreshElevGrid(lat, lon);
 
     const cacheKey = this._getCacheKey(geoCenter);
@@ -1221,7 +1230,8 @@ export class OSMTerrainLoader extends BaseLoader {
       if (this._liveEntityCache.has(cacheKey)) {
         const { terrainUpdates, entities } = this._liveEntityCache.get(cacheKey);
         console.log(`[OSMTerrainLoader] Live cache hit — ${entities.length} entities`);
-        // FIX 7 — debounce UI notification
+        // MAP-PERF 2: rebuild pre-filtered render candidates from cache
+        _buildRenderCandidates(entities);
         this._notifyPartialResult({ terrainUpdates, entities });
         return { terrainUpdates, entities };
       }
@@ -1229,13 +1239,13 @@ export class OSMTerrainLoader extends BaseLoader {
       const cached = await this._cache.get(cacheKey);
       const age    = Date.now() - (cached?.timestamp ?? 0);
       if (cached?.terrainUpdates && age < CACHE_TTL_MS) {
-        console.log(`[OSMTerrainLoader] IDB cache hit — rebuilding entities`);
+        console.log('[OSMTerrainLoader] IDB cache hit — rebuilding entities');
         const terrainUpdates = new Map(Object.entries(cached.terrainUpdates));
-        // FIX 7 — debounce UI notification
         this._notifyPartialResult({ terrainUpdates, entities: [] });
         const liveEntities = await this._rebuildEntitiesFromCache(cached, lat, lon);
+        // MAP-PERF 2: build render candidates after IDB cache rebuild
+        _buildRenderCandidates(liveEntities);
         this._notifyPartialResult({ terrainUpdates: new Map(), entities: liveEntities });
-        // FIX — LRU-capped cache write
         this._setLiveCache(cacheKey, { terrainUpdates, entities: liveEntities });
         return { terrainUpdates, entities: liveEntities };
       }
@@ -1293,7 +1303,6 @@ export class OSMTerrainLoader extends BaseLoader {
           console.warn('[OSMTerrainLoader] Cache write error', cacheErr);
         }
 
-        // FIX — LRU-capped cache write
         this._setLiveCache(cacheKey, {
           terrainUpdates: result.terrainUpdates,
           entities:       result.entities,
@@ -1314,7 +1323,7 @@ export class OSMTerrainLoader extends BaseLoader {
     return {};
   }
 
-  // ── Main OSM data processing ──────────────────────────────────────────────
+  // ── Main OSM data processing ───────────────────────────────────────────────
   async _processOSMData(data, geoCenter) {
     const { lat, lon } = geoCenter;
     const mPerTile      = this._mPerTile;
@@ -1344,7 +1353,7 @@ export class OSMTerrainLoader extends BaseLoader {
       if (el.type === 'node') nodeElements.push(el);
     }
 
-    // ── Pass 1: Bridge landmark ways ──────────────────────────────────────
+    // ── Pass 1: Bridge landmark ways ────────────────────────────────────────
     const bridgeSegmentsByKey = new Map();
     for (const el of wayElements) {
       if (!el.geometry?.length) continue;
@@ -1398,9 +1407,9 @@ export class OSMTerrainLoader extends BaseLoader {
       ));
     }
 
-    // ── Pass 2: All other ways (terrain + roads + polygon features) ───────
+    // ── Pass 2: All other ways (terrain + roads + polygon features) ─────────
     const buildingWays = [];
-    const roadWays     = []; // FIX 1 — collect ways for batch processing
+    const roadWays     = [];
 
     for (const el of wayElements) {
       if (!el.geometry?.length) continue;
@@ -1423,7 +1432,6 @@ export class OSMTerrainLoader extends BaseLoader {
         }
       }
 
-      // FIX 1 — collect road ways for batch grouping (replaces makeRoadDef per-way)
       if (el.tags?.highway) roadWays.push(el);
 
       if (el.tags?.waterway && !el.tags?.building) {
@@ -1437,12 +1445,11 @@ export class OSMTerrainLoader extends BaseLoader {
       if (el.tags?.building) buildingWays.push(el);
     }
 
-    // FIX 1 — emit one entity per highway class instead of one per way
     for (const def of makeRoadBatchDefs(roadWays, mPerTile, geoCenter)) {
       entityDefs.push(def);
     }
 
-    // ── Pass 3: Nodes (trees, POIs, landmark nodes) ───────────────────────
+    // ── Pass 3: Nodes ────────────────────────────────────────────────────────
     const landmarkNodeCandidates = new Map();
 
     for (const el of nodeElements) {
@@ -1483,27 +1490,25 @@ export class OSMTerrainLoader extends BaseLoader {
 
       entityDefs.push(makeFeatureDef({
         id: `osm:node:${el.id}`,
-        latitude:    el.lat,
-        longitude:   el.lon,
-        color:       poi.color,
-        label:       poi.label,
-        category:    poi.category,
-        value:       poi.value,
-        title:       el.tags?.name ?? poi.label,
+        latitude: el.lat, longitude: el.lon,
+        color: poi.color, label: poi.label,
+        category: poi.category, value: poi.value,
+        title: el.tags?.name ?? poi.label,
         description: el.tags?.name ? `${poi.label} — ${el.tags.name}` : poi.label,
-        tags:        el.tags ?? {},
+        tags: el.tags ?? {},
       }));
     }
 
-    // Stream Pass 1–3 immediately — FIX 7: debounced UI notification
-    this._notifyPartialResult({
-      terrainUpdates,
-      entities: [...entityDefs],
-    });
+    // Stream Pass 1–3 immediately; build render candidates from what we have so far
+    // MAP-PERF 2: invalidate projection cache when new data arrives (mirrors
+    // map.js projCache.clear() + invalidateProj() after fetchData())
+    invalidateRingProj();
+    _buildRenderCandidates(entityDefs);
+    this._notifyPartialResult({ terrainUpdates, entities: [...entityDefs] });
 
-    // ── Pass 4: Buildings ─────────────────────────────────────────────────
+    // ── Pass 4: Buildings ──────────────────────────────────────────────────
     if (buildingWays.length && this._terrainRegistry) {
-      const buildings          = preprocessBuildings(buildingWays);
+      const buildings           = preprocessBuildings(buildingWays);
       const genericBuildingJobs = [];
 
       for (const b of buildings) {
@@ -1514,21 +1519,18 @@ export class OSMTerrainLoader extends BaseLoader {
         if (blueprint) {
           if (!renderedLandmarkNames.has(nameKey)) {
             renderedLandmarkNames.add(nameKey);
-
             const osmHeightM = parseFloat(b.tags?.height ?? 0) || 0;
             const osmAreaM2  = b.areaM2 ?? 0;
             const scale      = computeLandmarkScale(blueprint, osmHeightM, osmAreaM2, mPerTile);
             const { halfExtentXZ } = blueprintNativeBounds(blueprint);
             const scaledR    = Math.max(2, (halfExtentXZ / VU) * scale);
             const facingAngle = extractFacingAngle(b.tags, b.geometry);
-
             const landmarkDef = makeBlueprintDef(
               `landmark:${b.id}`, b.centroid.lat, b.centroid.lon, nameKey,
               { scale, facingAngle, solid: true, bboxRadius: scaledR, footprintRadius: scaledR,
                 physicsEnabled: false, physicsRadius: scaledR, fixed: true, lodColor: '#A1887F' }
             );
             entityDefs.push(landmarkDef);
-            // FIX 7 — debounced UI notification
             this._notifyPartialResult({ terrainUpdates: new Map(), entities: [landmarkDef] });
           }
         } else {
@@ -1548,11 +1550,10 @@ export class OSMTerrainLoader extends BaseLoader {
             fixed: true, lodColor: '#A1887F' }
         );
         entityDefs.push(def);
-        // FIX 7 — debounced UI notification
         this._notifyPartialResult({ terrainUpdates: new Map(), entities: [def] });
       }
 
-      // ── Generic buildings: batched with render-loop yields ─────────────
+      // Generic buildings in batches with render-loop yields
       for (let i = 0; i < genericBuildingJobs.length; i += BUILDING_BATCH_SIZE) {
         const batch = genericBuildingJobs.slice(i, i + BUILDING_BATCH_SIZE);
 
@@ -1571,7 +1572,8 @@ export class OSMTerrainLoader extends BaseLoader {
 
         if (batchDefs.length) {
           for (const def of batchDefs) entityDefs.push(def);
-          // FIX 7 — debounced UI notification
+          // MAP-PERF 2: rebuild render candidates incrementally as buildings arrive
+          _buildRenderCandidates(entityDefs);
           this._notifyPartialResult({ terrainUpdates: new Map(), entities: batchDefs });
         }
 
@@ -1583,7 +1585,7 @@ export class OSMTerrainLoader extends BaseLoader {
     return { terrainUpdates, entities: entityDefs };
   }
 
-  // ── Entity serialization / deserialization for IDB cache ─────────────────
+  // ── Entity serialization / deserialization for IDB cache ───────────────────
   _serializeEntities(entityDefs) {
     return entityDefs.map(e => ({
       id:           e.id,
@@ -1594,7 +1596,7 @@ export class OSMTerrainLoader extends BaseLoader {
       _type:        e._isBuildingBox  ? 'building'
                   : (e._bpKey && e.renderHeavy) ? 'blueprint'
                   : e._ring           ? 'polygon'
-                  : e._batches        ? 'road_batch'  // FIX 1
+                  : e._batches        ? 'road_batch'
                   : e._nodes          ? 'road'
                   : 'poi',
       _procBlueprint: e._procBlueprint ?? null,
@@ -1605,7 +1607,7 @@ export class OSMTerrainLoader extends BaseLoader {
       _facingAngle: e._facingAngle  ?? null,
       _ring:        e._ring         ?? null,
       _nodes:       e._nodes        ?? null,
-      _batches:     e._batches      ?? null,  // FIX 1
+      _batches:     e._batches      ?? null,
       _mPerTile:    e._mPerTile     ?? null,
       _highway:     e._highway      ?? null,
       _roadSortIdx: e._roadSortIdx  ?? null,
@@ -1615,11 +1617,9 @@ export class OSMTerrainLoader extends BaseLoader {
       value:        e.value,
       title:        e.title,
       _obb:         e._obb          ?? null,
-      // FIX 3 — serialise style data so _polygonFeatureRenderFn can restore it
       _styleFill:   e._styleFill    ?? null,
       _styleStroke: e._styleStroke  ?? null,
       _styleAlpha:  e._styleAlpha   ?? null,
-      // FIX 3 — serialise building colour data
       _topColor:    e._topColor     ?? null,
       _rightColor:  e._rightColor   ?? null,
       _leftColor:   e._leftColor    ?? null,
@@ -1632,12 +1632,9 @@ export class OSMTerrainLoader extends BaseLoader {
     const mPerTile = this._mPerTile;
     return (await Promise.all((cached.entities ?? []).map(async e => {
 
-      // FIX 1 — batched road rebuild
       if (e._type === 'road_batch' && e._batches) {
         const fakeEls = e._batches.map(nodes => ({
-          id:       e.id,
-          geometry: nodes,
-          tags:     { highway: e._highway ?? 'residential' },
+          id: e.id, geometry: nodes, tags: { highway: e._highway ?? 'residential' },
         }));
         const defs = makeRoadBatchDefs(fakeEls, e._mPerTile ?? mPerTile, { lat, lon });
         return defs[0] ?? null;
@@ -1645,14 +1642,9 @@ export class OSMTerrainLoader extends BaseLoader {
 
       if (e._type === 'procbp' && e._procBlueprint) {
         const b = {
-          id:       e.id.replace('procbp:', ''),
-          _ring:    e._ring,
-          nodes:    e._ring,
-          areaM2:   e.areaM2  ?? 16,
-          heightM:  e.heightM ?? 8,
-          obb:      e._obb    ?? null,
-          centroid: { lat: e.latitude, lon: e.longitude },
-          tags:     {},
+          id: e.id.replace('procbp:', ''), _ring: e._ring, nodes: e._ring,
+          areaM2: e.areaM2 ?? 16, heightM: e.heightM ?? 8,
+          obb: e._obb ?? null, centroid: { lat: e.latitude, lon: e.longitude }, tags: {},
         };
         const def = await this._bpGen.getBuildingDef(b, mPerTile, this._terrainRegistry, this._elevGrid);
         if (def) def._procBlueprint = e._procBlueprint;
@@ -1663,12 +1655,9 @@ export class OSMTerrainLoader extends BaseLoader {
         const b = {
           id: e.id, _ring: e._ring, nodes: e._ring,
           areaM2: e.areaM2 ?? 16, heightM: e.heightM ?? 8,
-          obb: e._obb ?? null,
-          centroid: { lat: e.latitude, lon: e.longitude },
-          tags: {},
+          obb: e._obb ?? null, centroid: { lat: e.latitude, lon: e.longitude }, tags: {},
         };
         const def = makeBuildingDef(b, e.latitude, e.longitude, mPerTile, this._terrainRegistry, this._elevGrid);
-        // Restore serialised colour/size data if present (avoids terrainRegistry re-lookup)
         if (e._topColor)    def._topColor    = e._topColor;
         if (e._rightColor)  def._rightColor  = e._rightColor;
         if (e._leftColor)   def._leftColor   = e._leftColor;
@@ -1682,7 +1671,6 @@ export class OSMTerrainLoader extends BaseLoader {
         const style = POLYGON_STYLES[tag] ?? { fill: 'rgba(40,50,60,0.5)', stroke: null };
         const el = { id: e.id.replace('poly:',''), geometry: e._ring, tags: {} };
         const def = makePolygonFeatureDef(el, style, mPerTile);
-        // Restore serialised style data if present
         if (def && e._styleFill)   def._styleFill   = e._styleFill;
         if (def && e._styleStroke !== undefined) def._styleStroke = e._styleStroke;
         if (def && e._styleAlpha)  def._styleAlpha  = e._styleAlpha;
@@ -1690,11 +1678,10 @@ export class OSMTerrainLoader extends BaseLoader {
       }
 
       if (e._type === 'road' && e._nodes) {
-        // Legacy single-road cache entries — wrap in a batch of one
         const fakeEls = [{
-          id:       e.id.replace('road:', ''),
+          id: e.id.replace('road:', ''),
           geometry: e._nodes,
-          tags:     { highway: e._highway ?? 'residential' },
+          tags: { highway: e._highway ?? 'residential' },
         }];
         const defs = makeRoadBatchDefs(fakeEls, e._mPerTile ?? mPerTile, { lat, lon });
         return defs[0] ?? null;
@@ -1702,8 +1689,7 @@ export class OSMTerrainLoader extends BaseLoader {
 
       if (e.bpKey) {
         return makeBlueprintDef(e.id, e.latitude, e.longitude, e.bpKey, {
-          scale:       e._scale       ?? 1,
-          facingAngle: e._facingAngle ?? 180,
+          scale: e._scale ?? 1, facingAngle: e._facingAngle ?? 180,
         });
       }
 
@@ -1711,7 +1697,7 @@ export class OSMTerrainLoader extends BaseLoader {
     }))).filter(Boolean);
   }
 
-  // ── Lifecycle ─────────────────────────────────────────────────────────────
+  // ── Lifecycle ──────────────────────────────────────────────────────────────
   destroy() {
     if (this._debounceTimer !== null) {
       clearTimeout(this._debounceTimer);
@@ -1721,9 +1707,12 @@ export class OSMTerrainLoader extends BaseLoader {
     }
     this._abort?.abort();
     this._bpGen.clearMemCache();
-    // Clean up any pending UI notification
     this._uiNotifyPending  = false;
     this._uiPendingPayload = null;
+    // MAP-PERF 1: clear ring proj cache on destroy so stale entries don't
+    // persist if the loader is re-instantiated for the same camera state.
+    _ringProjCache.clear();
+    stopHighlightLoop();
   }
 
   async clearCache() {

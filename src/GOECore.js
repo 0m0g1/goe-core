@@ -40,7 +40,7 @@
  */
 
 export { Entity, ENTITY_TYPES } from './core/Entity.js'
-export { Engine } from './Engine.js';
+export { Engine } from './Engine_.js';
 export { Camera } from './core/Camera.js';
 export { InputManager } from './core/InputManager.js';
 export { TerrainCache } from './terrain/TerrainCache.js';
@@ -60,7 +60,7 @@ export * from './math/geo.js';
 
 // ─── DEFAULT EXPORT: Convenience factory ─────────────────────────────────────
 
-import { Engine }  from './Engine.js';
+import { Engine }  from './Engine_.js';
 
 /**
  * Create and optionally immediately mount a GOECore engine.
