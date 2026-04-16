@@ -1,14 +1,44 @@
 /**
  * GOE Core — OSMLayerRenderer
- * * Optimized for sharpness and memory efficiency.
+ * * MAP-PERF 6: Vertex Grid Projection & Hoisted Math
+ * -------------------------------------------------
+ * 1. Hoisted Math: Inline projection math (lon2x, etc.) moved to module level 
+ * to avoid re-allocating functions on every single frame.
+ * 2. Vertex Grid Projection: Instead of projecting 3 corners independently for 
+ * EVERY tile (executing complex trig 3x per tile), we project a shared grid 
+ * of vertices once. Adjacent tiles reuse the same projected corners, 
+ * cutting the heavy projection math by ~60-66%.
  */
 import {
   worldToScreen, tileHalfWidth, tileHalfHeight, screenToWorld,
 } from '../math/projection.js';
 import { geoToTile, tileToGeo } from '../math/geo.js';
 
-// ─── Bounded LRU tile image cache ────────────────────────────────────────────
+// ─── Module-Level Math Helpers ───────────────────────────────────────────────
+// Hoisted out of the draw loop to prevent garbage collection churn.
+const D2R = Math.PI / 180;
+const R2D = 180 / Math.PI;
 
+function lon2x(lon, n) { 
+  return (lon + 180) / 360 * n; 
+}
+
+function lat2y(lat, n) {
+  const l = lat * D2R;
+  return (1 - Math.log(Math.tan(l) + 1 / Math.cos(l)) / Math.PI) / 2 * n;
+}
+
+function tile2lon(x, n) { 
+  return x / n * 360 - 180; 
+}
+
+function tile2lat(y, n) {
+  const l = Math.PI - 2 * Math.PI * y / n;
+  return R2D * Math.atan(0.5 * (Math.exp(l) - Math.exp(-l)));
+}
+
+
+// ─── Bounded LRU tile image cache ────────────────────────────────────────────
 const TILE_CACHE_MAX = 256;
 const TILE_CACHE = new Map();
 
@@ -19,6 +49,7 @@ function getSlippyTile(z, x, y, urlFn) {
   const key = `${z}/${ix}/${iy}`;
 
   if (TILE_CACHE.has(key)) {
+    // Fast LRU bump
     const obj = TILE_CACHE.get(key);
     TILE_CACHE.delete(key);
     TILE_CACHE.set(key, obj);
@@ -52,13 +83,16 @@ export class OSMLayerRenderer {
   /**
    * @param {WorldRenderer} worldRenderer
    * @param {(z:number,x:number,y:number)=>string} urlFn
-   * @param {number} [maxTiles=256] - Increased default to support high-res screens
+   * @param {number} [maxTiles=256]
    */
   constructor(worldRenderer, urlFn, maxTiles = 256) {
     this._wr = worldRenderer;
     this.urlFn = urlFn;
     this.maxTiles = maxTiles;
     this._currentOsmZoom = undefined;
+    
+    // Pre-allocated array to avoid creating a new one every frame
+    this._vertexGrid = []; 
   }
 
   get ctx() { return this._wr.ctx; }
@@ -71,16 +105,13 @@ export class OSMLayerRenderer {
     const dpr = window.devicePixelRatio || 1;
 
     // 1. Calculate OSM zoom level
-    // We use Math.ceil and a small bias (+0.1) to ensure we jump to the higher-res 
-    // tile earlier. We also factor in DPR so Retina screens don't look blurry.
     const zoomBias = dpr > 1 ? 0.5 : 0.1;
     let osmZ = Math.ceil(
-      Math.log2(250468 * cam.zoom * Math.cos(geoCenter.lat * Math.PI / 180)) + zoomBias
+      Math.log2(250468 * cam.zoom * Math.cos(geoCenter.lat * D2R)) + zoomBias
     );
     osmZ = Math.max(0, Math.min(19, osmZ));
 
     this._currentOsmZoom = osmZ;
-    const numTiles = Math.pow(2, osmZ);
 
     // 2. Get viewport boundaries in Geo coordinates
     const corners = [
@@ -97,56 +128,63 @@ export class OSMLayerRenderer {
     const minLon = Math.min(...lons);
     const maxLon = Math.max(...lons);
 
-    const lon2x = (lon, z) => (lon + 180) / 360 * Math.pow(2, z);
-    const lat2y = (lat, z) => {
-      const l = lat * Math.PI / 180;
-      return (1 - Math.log(Math.tan(l) + 1 / Math.cos(l)) / Math.PI) / 2 * Math.pow(2, z);
-    };
-
     let z = osmZ;
-    let minX = Math.floor(lon2x(minLon, z));
-    let maxX = Math.floor(lon2x(maxLon, z));
-    let minY = Math.floor(lat2y(maxLat, z));
-    let maxY = Math.floor(lat2y(minLat, z));
+    let n = Math.pow(2, z);
+    let minX = Math.floor(lon2x(minLon, n));
+    let maxX = Math.floor(lon2x(maxLon, n));
+    let minY = Math.floor(lat2y(maxLat, n));
+    let maxY = Math.floor(lat2y(minLat, n));
 
     // 3. Safety cap: Drop zoom only if we exceed maxTiles
     while ((maxX - minX + 1) * (maxY - minY + 1) > this.maxTiles && z > 0) {
       z--;
-      minX = Math.floor(lon2x(minLon, z));
-      maxX = Math.floor(lon2x(maxLon, z));
-      minY = Math.floor(lat2y(maxLat, z));
-      maxY = Math.floor(lat2y(minLat, z));
+      n = Math.pow(2, z);
+      minX = Math.floor(lon2x(minLon, n));
+      maxX = Math.floor(lon2x(maxLon, n));
+      minY = Math.floor(lat2y(maxLat, n));
+      maxY = Math.floor(lat2y(minLat, n));
     }
 
-    const tile2lon = (x, zoom) => x / Math.pow(2, zoom) * 360 - 180;
-    const tile2lat = (y, zoom) => {
-      const n = Math.PI - 2 * Math.PI * y / Math.pow(2, zoom);
-      return 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
-    };
-
-    // 4. Render tiles
-    // We disable image smoothing if we want that "pixel-perfect" crispness 
-    // when slightly upscaling, but keeping it on is usually better for maps.
     this.ctx.imageSmoothingEnabled = true;
     this.ctx.imageSmoothingQuality = 'high';
 
+    // 4. MAP-PERF 6: Generate the shared Vertex Grid
+    // We calculate the corners ONCE into a flat array. 
+    // +2 ensures we have enough points to define the bottom and right edges of the tiles.
+    const yCount = (maxY - minY + 2); 
+    this._vertexGrid.length = 0; // Clear without reallocating
+
+    for (let x = minX; x <= maxX + 1; x++) {
+      for (let y = minY; y <= maxY + 1; y++) {
+        // Compute continuous longitude to prevent snapping across the antimeridian
+        const lon = tile2lon(x, n);
+        const lat = tile2lat(y, n);
+
+        const wTile = geoToTile(lat, lon, geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
+        const pt = worldToScreen(wTile.x, wTile.y, 0, cam);
+        
+        this._vertexGrid.push(pt);
+      }
+    }
+
+    // Helper to extract a vertex from the flat 1D array
+    const getVert = (vx, vy) => this._vertexGrid[(vx - minX) * yCount + (vy - minY)];
+
+    // 5. Render tiles using the pre-calculated vertex grid
     for (let x = minX; x <= maxX; x++) {
       for (let y = minY; y <= maxY; y++) {
-        const nAtZ = Math.pow(2, z);
-        if (y < 0 || y >= nAtZ) continue;
+        if (y < 0 || y >= n) continue;
 
         // Wrapped X for continuous panning
-        const worldX = ((x % nAtZ) + nAtZ) % nAtZ;
+        const worldX = ((x % n) + n) % n;
         const tile = getSlippyTile(z, worldX, y, urlFn);
+        
         if (!tile.loaded) continue;
 
-        const tNw = geoToTile(tile2lat(y, z),     tile2lon(x, z),     geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
-        const tNe = geoToTile(tile2lat(y, z),     tile2lon(x + 1, z), geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
-        const tSw = geoToTile(tile2lat(y + 1, z), tile2lon(x, z),     geoCenter, cam.mPerTile, cam.mapW, cam.mapH);
-
-        const p1 = worldToScreen(tNw.x, tNw.y, 0, cam);
-        const p2 = worldToScreen(tNe.x, tNe.y, 0, cam);
-        const p4 = worldToScreen(tSw.x, tSw.y, 0, cam);
+        // Grab corners instantly from the pre-calculated grid
+        const p1 = getVert(x, y);         // North-West
+        const p2 = getVert(x + 1, y);     // North-East
+        const p4 = getVert(x, y + 1);     // South-West
 
         // Render with a 0.5px overlap to prevent sub-pixel gaps (seams)
         wr.drawTransformedImage(

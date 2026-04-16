@@ -140,7 +140,9 @@
 </script>
 
 <script type="module">
-    import { Engine, OSMTerrainLoader, BioLoader, ElevationLoader, ElevationFormat, WeatherLoader, AviationLoader, Entity, ENTITY_TYPES, worldToScreen } from './src/GOECore.js';
+    // OSMTerrainLoader is commented out — replaced by the lightweight OSMTerrainTileLoader
+    // which produces only terrain/floor tiles (terrainUpdates Map) with no entity/renderFn overhead.
+    import { Engine, /* OSMTerrainLoader, */  OSMTerrainTileLoader, BioLoader, ElevationLoader, ElevationFormat, WeatherLoader, AviationLoader, Entity, ENTITY_TYPES, worldToScreen } from './src/GOECore.js';
     import Vector2D from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/vector2d.js';
 
     // --- PERFORMANCE CONFIGURATION ---
@@ -207,7 +209,7 @@
     const categoryColorMap = { war:'#ef4444', politics:'#f59e0b', science:'#06b6d4', art:'#a78bfa', religion:'#f97316', sport:'#22c55e', npc:'#fbbf24' };
     function getEventColor(ev) { const cat = (ev.category || '').toLowerCase(); for(let k in categoryColorMap) if(cat.includes(k)) return categoryColorMap[k]; return '#90caf9'; }
 
-    // --- Engine Initialization with reduced memory footprint ---
+    // --- Engine Initialization ---
     const canvas = document.getElementById('game-canvas');
     const engine = new Engine({
         geoCenter: { lat: 51.5074, lon: -0.1278 },
@@ -219,9 +221,17 @@
     });
     window.engine = engine;
 
-    // --- Loaders with reduced radius ---
-    const terrainLoader = new OSMTerrainLoader({ mPerTile: 2, mapW: MAP_W, mapH: MAP_H, fetchRadiusM: FETCH_RADIUS_M });
+    // --- Loaders ---
+    // OSMTerrainLoader removed — OSMTerrainTileLoader only writes terrainUpdates (floor tiles),
+    // no entities, no buildings, no roads, no blueprints, no elevation API calls.
+    const terrainLoader = new OSMTerrainTileLoader({
+        mPerTile:        2,
+        fetchRadiusM:    FETCH_RADIUS_M,
+        fetchDebounceMs: 800,
+    });
     engine.use(terrainLoader);
+
+    // The following loaders are unchanged
     engine.use(new BioLoader({ limit: 50, fetchRadiusM: 800 }));
     engine.use(new WeatherLoader('b69650bacdb53e8000e14a735bb53035'));
     engine.use(new AviationLoader());
@@ -230,66 +240,19 @@
     const elevationLoader = new ElevationLoader((z,x,y)=>`https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`, ElevationFormat.TERRARIUM, 2);
     engine.setElevationLoader(elevationLoader);
 
-    // --- 🔧 MONKEY-PATCH: Add LRU eviction to loader caches (temporary fix until source files are updated) ---
-    // 1. OSMTerrainLoader._liveEntityCache (max 3 entries)
-    const originalSetLive = terrainLoader._liveEntityCache?.set?.bind(terrainLoader._liveEntityCache);
-    if (terrainLoader._liveEntityCache) {
-        const MAX_LIVE_CACHE = 3;
-        terrainLoader._liveEntityCache._max = MAX_LIVE_CACHE;
-        const originalSet = terrainLoader._liveEntityCache.set;
-        terrainLoader._liveEntityCache.set = function(key, value) {
-            if (this.size >= MAX_LIVE_CACHE && !this.has(key)) {
-                const oldest = this.keys().next().value;
-                this.delete(oldest);
-            }
-            return originalSet.call(this, key, value);
-        };
-        console.log('[MonkeyPatch] Added LRU (max 3) to terrainLoader._liveEntityCache');
-    }
+    // --- Monkey-patches removed ---
+    // OSMTerrainTileLoader has no _liveEntityCache or _bpGen/_memCache to patch —
+    // those were OSMTerrainLoader internals that no longer exist in the tile-only loader.
 
-    // 2. ProceduralBlueprintGenerator._memCache (max 500) – we need to access the generator instance.
-    // The generator is inside the terrainLoader. We'll patch it after engine mounts.
-    setTimeout(() => {
-        const bpGen = terrainLoader?._bpGen;
-        if (bpGen && bpGen._memCache) {
-            const MAX_MEM_CACHE = 500;
-            const originalSetMem = bpGen._memCache.set;
-            bpGen._memCache.set = function(key, value) {
-                if (this.size >= MAX_MEM_CACHE && !this.has(key)) {
-                    const oldest = this.keys().next().value;
-                    this.delete(oldest);
-                }
-                return originalSetMem.call(this, key, value);
-            };
-            console.log('[MonkeyPatch] Added LRU (max 500) to blueprint generator _memCache');
-        }
-    }, 100);
-
-    // --- Debounced UI updates for partial results (prevents INP spikes) ---
-    let uiUpdatePending = false;
-    let pendingEntityCount = 0;
-    terrainLoader.setPartialResultCallback((partial) => {
-        // Engine ingestion is immediate (no change)
-        engine._ingestLoaderResult(partial);
-        // UI update is batched to next frame
-        if (partial.entities?.length) pendingEntityCount += partial.entities.length;
-        if (!uiUpdatePending) {
-            uiUpdatePending = true;
-            requestAnimationFrame(() => {
-                uiUpdatePending = false;
-                // Optional: update a UI counter (if you add one)
-                // console.log(`[UI] Received ${pendingEntityCount} entities`);
-                pendingEntityCount = 0;
-            });
-        }
-    });
+    // --- Partial result callback removed ---
+    // OSMTerrainTileLoader does not emit partial results or entities;
+    // it resolves once with { terrainUpdates } so no streaming callback is needed.
 
     engine.mount(canvas);
 
-    // --- Periodic cleanup of distant terrain tiles (optional) ---
+    // --- Periodic cleanup of distant terrain tiles (unchanged) ---
     setInterval(() => {
         if (engine._tileCache && engine._tileCache.length > 8000) {
-            // Keep only tiles within 60 tiles of player
             const px = engine.playerEntity?.tx ?? 0;
             const py = engine.playerEntity?.ty ?? 0;
             engine._tileCache = engine._tileCache.filter(t => Math.abs(t.tx - px) < 60 && Math.abs(t.ty - py) < 60);
@@ -391,7 +354,7 @@
     engine.on('map:click', () => { dialogueBox.style.display = 'none'; document.getElementById('event-card').style.display = 'none'; });
     document.getElementById('close-game-btn').addEventListener('click', () => { minigameModal.style.display = 'none'; minigameFrame.src = 'about:blank'; });
 
-    // --- Debug overlay & Cache (unchanged) ---
+    // --- Debug overlay & Cache ---
     const debugBtn = document.getElementById('toggle-debug-overlay-btn'), debugBadge = document.getElementById('debug-overlay-badge');
     debugBtn.addEventListener('click', () => {
         engine.toggleLayer('colliders');
@@ -401,7 +364,7 @@
         debugBadge.style.display = on ? 'inline-block' : 'none';
     });
     document.getElementById('clear-cache-btn').addEventListener('click', async () => { await terrainLoader?.clearCache(); alert('🗑️ Cache cleared. Reloading...'); location.reload(); });
-    
+
     // --- HUD updates ---
     engine.on('hud', ({ lat, lon, zoom, tilt, terrain }) => {
         const zoomNum = Number(zoom);
@@ -415,6 +378,7 @@
         if(tiltNum < 0.1) badge.style.color = '#4f8ac9';
         else if(tiltNum > 0.9) badge.style.color = '#e5cf86';
         else badge.style.color = '#be9e5a';
+        // Entity count now only reflects BioLoader, AviationLoader, events — not OSM entities
         const stats = `Entities: ${engine.entities.length}<br>Blueprints: ${engine.entities.filter(e=>e._bpKey).length}`;
         document.getElementById('debug-stats').innerHTML = stats;
     });

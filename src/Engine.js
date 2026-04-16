@@ -825,6 +825,9 @@ export class Engine extends EventEmitter {
     );
 
     fetches.forEach(p => p.then(result => {
+
+      this._ingestLoaderResult(result);
+      
       if (result?.entities) {
         for (const def of result.entities) {
           if (def?.id) this._fetchFreshIds.add(def.id);
@@ -1093,10 +1096,10 @@ export class Engine extends EventEmitter {
     const focusX   = cam.focusX;
     const focusY   = cam.focusY;
     const overAlpha  = Math.max(0, Math.min(1, (cam.zoom - 0.02) / 0.015));
-    const terrainHW  = tileHalfWidth(cam.zoom, cam.tileW);
+    const terrainHW = tileHalfWidth(cam.zoom, cam.tileW ?? 64);
 
     if (overAlpha > 0 && this.debugLayers.overpass && terrainHW >= 2) {
-      const lod = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
+      const lod = 1; // = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
 
       if (lod > 1) {
         // CHUNKING: pass focusX/Y (global) instead of pGX/pGY (local origin)
@@ -1131,6 +1134,11 @@ export class Engine extends EventEmitter {
             }
           }
           this._tileCache.length = writeIdx;
+          if (this._pendingTerrainUpdates?.size) {
+            this._tileR.markLayerDirty();       // content changed
+          } else {
+            this._tileR._layerBitmapDirty = true; // projection only
+          }
         }
 
         // CHUNKING: pass focusX/Y instead of pGX/pGY
@@ -1162,11 +1170,18 @@ export class Engine extends EventEmitter {
           visibleEntities.push(this.playerEntity);
         }
 
-        // FIX 4 — cache terrain lookup for visible entities only
-        // CHUNKING: terrainCache.get(tx, ty) with global coords directly
+        const frameId = this._frameId = (this._frameId ?? 0) + 1;
         for (const e of visibleEntities) {
           if (!e.visible) continue;
-          e._cachedTerrainId = this.terrainCache.get(e.tx, e.ty);
+          if (e._terrainCacheFrame === frameId) continue; // already looked up this frame
+          // Only re-lookup if entity moved or cache is stale
+          if (e._cachedTerrainId === undefined ||
+              e._lastTerrainTx !== e.tx || e._lastTerrainTy !== e.ty) {
+            e._cachedTerrainId  = this.terrainCache.get(e.tx, e.ty);
+            e._lastTerrainTx    = e.tx;
+            e._lastTerrainTy    = e.ty;
+          }
+          e._terrainCacheFrame = frameId;
         }
 
         for (const e of visibleEntities) {

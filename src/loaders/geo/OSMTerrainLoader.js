@@ -291,11 +291,15 @@ function classifyOSM(tags) {
 
   if (n === 'water' || n === 'wetland' || l === 'reservoir' || l === 'basin' || w === 'riverbank')
     return { terrain: TerrainType.DEEP_WATER, type: 'polygon' };
-  if (w === 'river')                 return { terrain: TerrainType.WATER,    type: 'line', width: 3 };
-  if (w === 'stream' || w === 'canal') return { terrain: TerrainType.WATER,  type: 'line', width: 2 };
-  if (w)                             return { terrain: TerrainType.WATER,    type: 'line', width: 1 };
-  if (n === 'beach')                 return { terrain: TerrainType.SAND,     type: 'polygon' };
-  if (n === 'wood' || l === 'forest')return { terrain: TerrainType.FOREST,   type: 'polygon' };
+  if (n === 'strait')
+    return (tags.area === 'yes')
+      ? { terrain: TerrainType.DEEP_WATER, type: 'polygon' }
+      : { terrain: TerrainType.DEEP_WATER, type: 'line', width: 6 };
+  if (w === 'river')                   return { terrain: TerrainType.WATER,    type: 'line', width: 3 };
+  if (w === 'stream' || w === 'canal') return { terrain: TerrainType.WATER,    type: 'line', width: 2 };
+  if (w)                               return { terrain: TerrainType.WATER,    type: 'line', width: 1 };
+  if (n === 'beach')                   return { terrain: TerrainType.SAND,     type: 'polygon' };
+  if (n === 'wood' || l === 'forest')  return { terrain: TerrainType.FOREST,   type: 'polygon' };
   if (le === 'park' || le === 'garden' || l === 'park')
     return { terrain: TerrainType.PARK, type: 'polygon' };
   if (['grass','meadow','village_green','allotments'].includes(l) ||
@@ -325,6 +329,7 @@ function classifyOSM(tags) {
 const POLYGON_STYLES = {
   water:    { fill: 'rgba(22,46,72,0.82)',   stroke: '#1a3850', alpha: 0.9 },
   wetland:  { fill: 'rgba(26,46,56,0.72)',   stroke: null },
+  strait:   { fill: 'rgba(18,38,64,0.88)',   stroke: '#1a3850', alpha: 0.92 },
   wood:     { fill: 'rgba(20,32,24,0.80)',   stroke: null },
   forest:   { fill: 'rgba(20,32,24,0.80)',   stroke: null },
   scrub:    { fill: 'rgba(24,34,24,0.70)',   stroke: null },
@@ -1257,23 +1262,25 @@ export class OSMTerrainLoader extends BaseLoader {
     const r = this._fetchRadiusM;
     const around = `(around:${r},${lat},${lon})`;
     const q = `[out:json][timeout:60];(
-      way["natural"~"^(water|wetland|beach|wood|grassland|heath|scrub|sand|bare_rock|meadow)$"]${around};
-      way["landuse"~"^(reservoir|basin|grass|meadow|village_green|allotments|forest|park|commercial|residential|retail|industrial|cemetery|construction|farmland)$"]${around};
-      way["leisure"~"^(park|garden|pitch|playground|swimming_pool|nature_reserve)$"]${around};
-      way["waterway"~"^(river|stream|canal|drain|ditch|riverbank)$"]${around};
-      way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|pedestrian|living_street|footway|cycleway|path|track|steps|bridleway)$"]${around};
-      way["building"]${around};
-      way["bridge"="yes"]["name"]${around};
-      way["man_made"="bridge"]["name"]${around};
-      node["amenity"]${around};
-      node["shop"]${around};
-      node["tourism"]${around};
-      node["historic"]${around};
-      node["leisure"]${around};
-      node["office"]${around};
-      node["natural"~"^(peak|spring|cave_entrance)$"]${around};
-      node["natural"="tree"]${around};
-    );out geom qt;`;
+          way["natural"~"^(water|wetland|beach|wood|grassland|heath|scrub|sand|bare_rock|meadow|strait)$"]${around};
+          way["natural"="strait"]${around};
+          node["natural"="strait"]${around};
+          way["landuse"~"^(reservoir|basin|grass|meadow|village_green|allotments|forest|park|commercial|residential|retail|industrial|cemetery|construction|farmland)$"]${around};
+          way["leisure"~"^(park|garden|pitch|playground|swimming_pool|nature_reserve)$"]${around};
+          way["waterway"~"^(river|stream|canal|drain|ditch|riverbank)$"]${around};
+          way["highway"~"^(motorway|trunk|primary|secondary|tertiary|residential|service|unclassified|pedestrian|living_street|footway|cycleway|path|track|steps|bridleway)$"]${around};
+          way["building"]${around};
+          way["bridge"="yes"]["name"]${around};
+          way["man_made"="bridge"]["name"]${around};
+          node["amenity"]${around};
+          node["shop"]${around};
+          node["tourism"]${around};
+          node["historic"]${around};
+          node["leisure"]${around};
+          node["office"]${around};
+          node["natural"~"^(peak|spring|cave_entrance)$"]${around};
+          node["natural"="tree"]${around};
+        );out geom qt;`;
 
     for (let attempt = 0; attempt < this._endpoints.length; attempt++) {
       const ctrl    = new AbortController();
@@ -1424,7 +1431,7 @@ export class OSMTerrainLoader extends BaseLoader {
       else                        rasterizeLine(terrainUpdates, pts, cls.terrain, cls.width);
 
       if (cls.type === 'polygon' && !el.tags?.building) {
-        const tag   = el.tags?.natural ?? el.tags?.landuse ?? el.tags?.leisure ?? el.tags?.waterway;
+        const tag = el.tags?.natural ?? el.tags?.landuse ?? el.tags?.leisure ?? el.tags?.waterway;
         const style = tag ? POLYGON_STYLES[tag] : null;
         if (style) {
           const def = makePolygonFeatureDef(el, style, mPerTile);
@@ -1434,6 +1441,7 @@ export class OSMTerrainLoader extends BaseLoader {
 
       if (el.tags?.highway) roadWays.push(el);
 
+      // Water ways (linear) — unchanged
       if (el.tags?.waterway && !el.tags?.building) {
         const style = POLYGON_STYLES['water'];
         if (cls.type === 'polygon') {

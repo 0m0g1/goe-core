@@ -85,7 +85,12 @@ export class TerrainCache {
    * @param {number} keepRadius  tile radius to keep (e.g. 600 tiles = 1.2km at 2m/tile)
    */
   evictDistant(pGX, pGY, keepRadius = 600) {
-    if (this._data.size <= 200_000) return; // under limit, nothing to do
+    if (this._data.size <= 200_000) return;
+
+    // Don't evict more than once per 2 seconds — the scan is expensive
+    const now = Date.now();
+    if (this._lastEvict && now - this._lastEvict < 2000) return;
+    this._lastEvict = now;
 
     const r2 = keepRadius * keepRadius;
     for (const key of this._data.keys()) {
