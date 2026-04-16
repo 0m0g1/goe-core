@@ -264,8 +264,8 @@ export class TileRenderer {
   _needsRebake(focusX, focusY) {
     if (this._bakeDirty)                                              return true;
     if (this._lastFocusX === null)                                    return true;
-    if (Math.abs(focusX - this._lastFocusX) > 1 ||
-        Math.abs(focusY - this._lastFocusY) > 1)                     return true;
+    if (Math.abs(focusX - this._lastFocusX) > 8 ||   // was > 1
+        Math.abs(focusY - this._lastFocusY) > 8) return true;
     if (Math.abs(this.cam.tilt - (this._lastTilt ?? -1)) > 0.01)     return true;
     if (this._shadows?.enabled) {
       if (Math.abs((this._shadows.sunAngle     ?? 0) - this._lastSunAngle) > 0.1)  return true;
@@ -495,12 +495,33 @@ export class TileRenderer {
 
     buf.sort((a, b) => a._depth - b._depth);
 
-    for (const t of buf) {
-      const isHighlight = (t.tx === floorPX && t.ty === floorPY);
-      if (isHighlight || needGrid) {
-        if (!t._quad) t._quad = topFaceQuad(t.tx, t.ty, 0, cam);
-        if (isHighlight) this._drawHighlight(t);
-        if (needGrid)    this._drawGrid(t);
+    if (needGrid || buf.some(t => t.tx === floorPX && t.ty === floorPY)) {
+      const ctx = this.ctx;
+      
+      // Batch all grid lines into one path — single stroke() call
+      if (needGrid) {
+        ctx.beginPath();
+        ctx.strokeStyle = `rgba(0,0,0,${(1 - cam.tilt / 0.35) * 0.15})`;
+        ctx.lineWidth   = 0.5;
+        for (const t of buf) {
+          if (!t._quad) t._quad = topFaceQuad(t.tx, t.ty, 0, cam);
+          const q = t._quad;
+          ctx.moveTo(q[0].x, q[0].y);
+          ctx.lineTo(q[1].x, q[1].y);
+          ctx.lineTo(q[2].x, q[2].y);
+          ctx.lineTo(q[3].x, q[3].y);
+          ctx.closePath();
+        }
+        ctx.stroke(); // ONE stroke call instead of one per tile
+      }
+
+      // Player highlight — separate single fill call
+      for (const t of buf) {
+        if (t.tx === floorPX && t.ty === floorPY) {
+          if (!t._quad) t._quad = topFaceQuad(t.tx, t.ty, 0, cam);
+          this._drawHighlight(t);
+          break;
+        }
       }
     }
   }

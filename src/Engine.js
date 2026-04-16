@@ -1147,6 +1147,7 @@ export class Engine extends EventEmitter {
           this.playerEntity?.tx ?? 0,
           this.playerEntity?.ty ?? 0,
           this.terrainCache, focusX, focusY,
+          this._cameraAnimating || this.playerEntity?.isMoving,
         );
       }
     }

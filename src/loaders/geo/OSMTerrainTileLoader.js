@@ -186,7 +186,14 @@ export class OSMTerrainTileLoader extends BaseLoader {
       const age    = Date.now() - (cached?.timestamp ?? 0);
       if (cached?.terrainUpdates && age < CACHE_TTL_MS) {
         console.log('[OSMTerrainTileLoader] IDB cache hit');
-        return { terrainUpdates: new Map(Object.entries(cached.terrainUpdates)) };
+        
+        // 1. Rebuild the map
+        const terrainUpdates = new Map(Object.entries(cached.terrainUpdates));
+        
+        // 2. PUSH IT TO THE ENGINE
+        this._notifyPartialResult({ terrainUpdates }); 
+        
+        return { terrainUpdates };
       }
     } catch (err) {
       console.warn('[OSMTerrainTileLoader] Cache read error', err);
@@ -210,7 +217,7 @@ export class OSMTerrainTileLoader extends BaseLoader {
       const ctrl    = new AbortController();
       const timeout = setTimeout(() => ctrl.abort(), 14000);
 
-      try {
+    try {
         const res = await fetch(
           `${this._endpoint}?data=${encodeURIComponent(q)}`,
           { signal: ctrl.signal }
@@ -230,6 +237,9 @@ export class OSMTerrainTileLoader extends BaseLoader {
         } catch (cacheErr) {
           console.warn('[OSMTerrainTileLoader] Cache write error', cacheErr);
         }
+
+        // PUSH IT TO THE ENGINE BEFORE RETURNING
+        this._notifyPartialResult({ terrainUpdates });
 
         return { terrainUpdates };
 
