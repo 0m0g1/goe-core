@@ -143,7 +143,7 @@
     // OSMTerrainLoader is commented out — replaced by the lightweight OSMTerrainTileLoader
     // which produces only terrain/floor tiles (terrainUpdates Map) with no entity/renderFn overhead.
     import { Engine, /* OSMTerrainLoader, */ OSMEntityLoader,  OSMTerrainTileLoader, BioLoader, ElevationLoader, TerracedElevation, ElevationFormat, WeatherLoader, AviationLoader, Entity, ENTITY_TYPES, worldToScreen } from './src/GOECore.js';
-    import { Vector2D } from 'yaphe-engine';
+    import Vector2D from 'yaphe-engine';
 
     // --- PERFORMANCE CONFIGURATION ---
     // Reduced map size from 400x400 to 200x200 → 4× fewer terrain tiles
