@@ -1,6 +1,6 @@
 {
   "name": "@0m0g1/goe-core",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Vanilla-JS isometric / flat-map hybrid engine",
   "type": "module",
   "main": "./src/GOECore.js",
