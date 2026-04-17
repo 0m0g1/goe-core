@@ -28,6 +28,6 @@
   },
   "homepage": "https://github.com/0m0g1/goe-core#readme",
   "dependencies": {
-    "yaphe-engine": "^1.0.6"
+    "yaphe-engine": "^1.0.7"
   }
 }
