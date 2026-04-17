@@ -375,6 +375,12 @@ export class WorldRenderer {
     this._voxel.beginTile(tx, ty, elevPx);
   }
 
+  // FIX A: batch bracketing for entity render() implementations that call
+  // box() directly (outside drawBlueprint). Wrap your box() sequence with:
+  //   wr.beginBatch();  ... wr.box(...); ...  wr.flushBatch();
+  beginBatch() { this._voxel.beginBatch(); }
+  flushBatch() { this._voxel.flushBatch(); }
+
   box(x, y, z, w, h, d, top, right, front) {
     this._voxel.box(x, y, z, w, h, d, top, right, front);
   }
@@ -382,23 +388,30 @@ export class WorldRenderer {
   drawBlueprintRotated(blueprint, tx, ty, elevPx, angleDeg, colorOverride = null) {
     this._voxel.beginTile(tx, ty, elevPx);
     this._voxel.setRotation(angleDeg ?? 180);
+    // FIX A: wrap all boxes in a batch so consecutive same-color faces share
+    // one compound path and flush in a single fill() call per color run.
+    this._voxel.beginBatch();
     for (const p of blueprint) {
       const top   = colorOverride ? colorOverride                : p.top;
       const right = colorOverride ? shadeHex(colorOverride, 0.7) : p.right ?? p.top;
       const front = colorOverride ? shadeHex(colorOverride, 0.4) : p.front ?? p.top;
       this._voxel.box(p.x, p.y, p.z, p.w, p.h, p.d, top, right, front);
     }
+    this._voxel.flushBatch();
     this._voxel.clearRotation();
   }
 
   drawBlueprint(blueprint, tx, ty, elevPx, colorOverride = null) {
     this._voxel.beginTile(tx, ty, elevPx);
+    // FIX A: same batching for unrotated blueprints.
+    this._voxel.beginBatch();
     for (const p of blueprint) {
       const top   = colorOverride ? colorOverride                : p.top;
       const right = colorOverride ? shadeHex(colorOverride, 0.7) : p.right ?? p.top;
       const front = colorOverride ? shadeHex(colorOverride, 0.4) : p.front ?? p.top;
       this._voxel.box(p.x, p.y, p.z, p.w, p.h, p.d, top, right, front);
     }
+    this._voxel.flushBatch();
   }
 
   // ══════════════════════════════════════════════════════════════════════════

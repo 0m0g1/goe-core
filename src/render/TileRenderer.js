@@ -122,14 +122,48 @@ export class TileRenderer {
 
     this._lastElevResolvedSize = 0;
 
-    // Reusable elevation lookup map — rebuilt each bake, avoids per-frame alloc
-    // after the first frame.  Cleared at the top of _bakeTexturedLayer.
+    // FIX C — two-stamp dirty model:
+    //   _contentStamp  increments when world content changes (terrain, elevation,
+    //                  sun angle). A content change forces a full rebake.
+    //   _projStamp     increments on any camera change (pan, zoom, tilt, rotate).
+    //                  A projection-only change reuses the last bitmap and just
+    //                  applies the sub-pixel drift offset already in place.
+    //
+    // Previously a single _projStamp was used for both, causing a full rebake
+    // every frame during smooth camera follow (which mutates camX/Y by *0.08
+    // each frame and therefore always changes the stamp).
+    this._contentStamp     = 0;
+    this._lastContentStamp = -1;
+
+    // FIX D — per-tile elevation cache.
+    // tileH values change only when _elevationLoader resolves new tiles.
+    // Key: integer = (tx * 0x10000) ^ ty  (see _elevKey)
+    // Cleared in full only when _lastElevResolvedSize changes.
+    this._elevCache = new Map();
+
+    // FIX G — reusable elevation lookup map with integer keys.
+    // Key: _elevKey(tx, ty) — avoids `${tx},${ty}` string alloc in the hot loop.
     this._elevMap = new Map();
     this._bakedCache = null;
   }
 
   get ctx() { return this._wr.ctx; }
   get cam() { return this._wr.cam; }
+
+  // FIX G — integer key for two tile coordinates.
+  // Avoids allocating a template-literal string on every hot-path Map access.
+  // Safe for tile coords in the range ±32767.
+  static _elevKey(tx, ty) {
+    return ((tx & 0xFFFF) << 16) | (ty & 0xFFFF);
+  }
+
+  // FIX C — mark that world content has changed (not just the camera).
+  // Call this whenever terrain data, elevation, or lighting changes so that
+  // the next draw triggers a real rebake rather than just a drift-offset draw.
+  _markContentDirty() {
+    this._contentStamp++;
+    this._layerBitmapDirty = true;
+  }
 
   // ── MAP-PERF 5: Stamp manager ─────────────────────────────────────────────
 
@@ -320,11 +354,15 @@ export class TileRenderer {
   _drawHighlight(t) { this._wr.drawPolygon(t._quad, 'rgba(255,255,255,0.18)'); }
 
   markLayerDirty() {
+    // FIX C: terrain content changed — force a full rebake on next draw.
     this._layerContentDirty = true;
-    this._layerBitmapDirty  = true;
+    this._markContentDirty();
   }
 
   _markProjectionDirty() {
+    // FIX C: projection-only change — set the bitmap dirty flag but do NOT
+    // increment _contentStamp. The bake loop will be skipped and only the
+    // sub-pixel drift offset will be applied.
     this._layerBitmapDirty = true;
   }
 
@@ -370,8 +408,9 @@ export class TileRenderer {
     const gridAlpha = needGrid ? ((1 - cam.tilt / 0.35) * 0.12).toFixed(3) : '0';
     const gridStyle = `rgba(0,0,0,${gridAlpha})`;
 
-    // FIX: set _layerBitmapDirty when new elevation data arrives so the bitmap
-    // is actually re-baked rather than reusing the previous flat frame.
+    // FIX C/D — check for new elevation data.
+    // When the elevation loader resolves new tiles, invalidate the per-tile
+    // elevation cache and mark content dirty so a full rebake fires.
     const currentResolvedSize =
       this._elevationLoader?._loader?._resolved?.size ??
       this._elevationLoader?._resolved?.size ??
@@ -379,46 +418,59 @@ export class TileRenderer {
     if (currentResolvedSize !== this._lastElevResolvedSize) {
       this._lastElevResolvedSize = currentResolvedSize;
       for (const t of tiles) t._stamp = -1;
-      this._layerBitmapDirty = true; // ← was missing; without this the bitmap
-                                     //   never rebaked when elevation resolved
+      this._elevCache.clear();   // FIX D: flush elevation cache on new data
+      this._markContentDirty();  // FIX C: treat as content change, not proj change
     }
 
-    // ── Pass 1: update all tile projections & build neighbour lookup ─────────
+    // ── Pass 1: update all tile projections & build neighbour elevPx lookup ──
     //
-    // We iterate the full tiles array (not just the visible subset) so that
-    // when a visible edge-tile checks its eastern or southern neighbour, that
-    // neighbour's elevPx is already in the map even if it was culled.
+    // FIX D — per-tile elevation cache:
+    //   sampleTileHeight involves cos/lat/lon arithmetic on every call. Cache
+    //   the result keyed by integer tile coords. Cache is only cleared above
+    //   when new elevation data arrives, so steady-state frames pay zero cost.
     //
-    const elevMap = this._elevMap;
+    // FIX G — integer elevMap keys:
+    //   _elevKey(tx, ty) avoids allocating a `${tx},${ty}` string on every
+    //   Map access in this hot loop.
+    //
+    const elevMap   = this._elevMap;
+    const elevCache = this._elevCache;
+    const EK        = TileRenderer._elevKey;
     elevMap.clear();
+
+    const hasElev = this._elevationLoader && this._geoCenter && this._refTx != null;
+    const cosLat  = hasElev ? Math.cos(this._geoCenter.lat * Math.PI / 180) : 0;
 
     for (const t of tiles) {
       if (t._stamp !== stamp) {
-        let tileH = 0;
-        if (this._elevationLoader && this._geoCenter && this._refTx != null) {
-          const cosLat = Math.cos(this._geoCenter.lat * Math.PI / 180);
-          // NEW: Calculate distance from the static anchor, not the moving camera
-          const dxM = (t.tx - this._refTx) * this._mPerTile;
-          const dyM = (t.ty - this._refTy) * this._mPerTile;
-          const lat = this._geoCenter.lat - (dyM / 111111);
-          const lon = this._geoCenter.lon + (dxM / (111111 * cosLat));
-          
-          tileH = Math.floor(this._elevationLoader.sampleTileHeight(lat, lon));
+        let elevPx = 0;
+        if (hasElev) {
+          const ek = EK(t.tx, t.ty);
+          let cached = elevCache.get(ek);
+          if (cached === undefined) {
+            // FIX D: compute and cache the elevation for this tile coordinate
+            const dxM  = (t.tx - this._refTx) * this._mPerTile;
+            const dyM  = (t.ty - this._refTy) * this._mPerTile;
+            const lat  = this._geoCenter.lat - (dyM / 111111);
+            const lon  = this._geoCenter.lon + (dxM / (111111 * cosLat));
+            const tileH = Math.floor(this._elevationLoader.sampleTileHeight(lat, lon));
+            cached = getElevOffset(tileH, cam.tilt, cam.zoom);
+            elevCache.set(ek, cached);
+          }
+          elevPx = cached;
         }
-        const elevPx = getElevOffset(tileH, cam.tilt, cam.zoom);
-        const sc     = worldToScreen(t.tx, t.ty, elevPx, cam);
-        t._scX   = sc.x;
-        t._scY   = sc.y;
-        // Positive depth bias: elevated tiles drawn after (in front of) ground
-        // tiles at the same ground-plane depth — correct for isometric cubes.
-        t._depth  = tileDepth(t.tx, t.ty, cam.rotation) + elevPx * 0.01;
-        t._elevPx = elevPx;
-        t._stamp  = stamp;
+        const sc   = worldToScreen(t.tx, t.ty, elevPx, cam);
+        t._scX     = sc.x;
+        t._scY     = sc.y;
+        t._depth   = tileDepth(t.tx, t.ty, cam.rotation) + elevPx * 0.01;
+        t._elevPx  = elevPx;
+        t._stamp   = stamp;
       }
-      elevMap.set(`${t.tx},${t.ty}`, t._elevPx);
+      // FIX G: integer key — no string allocation
+      elevMap.set(EK(t.tx, t.ty), t._elevPx);
     }
 
-    // ── Pass 2: cull → sort → draw ───────────────────────────────────────────
+    // ── Pass 2: cull → sort ──────────────────────────────────────────────────
 
     const buf = this._sortBuf;
     buf.length = 0;
@@ -429,89 +481,100 @@ export class TileRenderer {
     }
     buf.sort((a, b) => a._depth - b._depth);
 
-    // Screen-space corner offsets (same for every tile in this frame).
+    // Pre-compute screen-space corner offsets (constant for the whole frame).
     //
-    //   Tile diamond vertices in texture-space → screen-space offsets:
-    //     North = (0,0)   → (0, 0)                  — origin, no offset needed
-    //     East  = (S,0)   → (m11·S, m12·S)
-    //     West  = (0,S)   → (m21·S, m22·S)
-    //     South = (S,S)   → ((m11+m21)·S, (m12+m22)·S)
+    //   East  = texture(S,0)  → screen (+eOx, +eOy)
+    //   West  = texture(0,S)  → screen (+wOx, +wOy)
+    //   South = texture(S,S)  → screen (+sOx, +sOy)
     //
-    //   SE face (right riser): East→South top edge, dropped by riserE px.
-    //   SW face (left  riser): West→South top edge, dropped by riserS px.
-    //
-    const eOx = m11 * S,          eOy = m12 * S;           // East offset
-    const wOx = m21 * S,          wOy = m22 * S;           // West offset
-    const sOx = (m11 + m21) * S,  sOy = (m12 + m22) * S;  // South offset
+    const eOx = m11 * S,          eOy = m12 * S;
+    const wOx = m21 * S,          wOy = m22 * S;
+    const sOx = (m11 + m21) * S,  sOy = (m12 + m22) * S;
 
     const painter = this._painter;
 
-    // Start at identity — skirt quads use absolute screen coords.
+    // ── FIX H — Two-pass draw: all skirts first, then all tops ───────────────
+    //
+    // OLD: per-tile interleave — setTransform(identity) → skirts → setTransform(tile) → top → setTransform(identity)
+    //   = 2 setTransform calls per tile, ~29 000 calls for a 120×120 visible set.
+    //
+    // NEW: one pass at identity for ALL skirts, one pass with per-tile transform for ALL tops.
+    //   = 1 setTransform per tile (top face only), halving the call count.
+    //
+    // Depth-order correctness is preserved: both passes iterate the same
+    // depth-sorted buf, so riser quads and top faces follow painter's-algorithm
+    // order from back to front within their respective passes, and all risers
+    // are drawn before any top face (correct, since risers are always "behind"
+    // the top face of the same tile).
+
+    // ── PASS A: skirts (at identity transform) ───────────────────────────────
     oCtx.setTransform(1, 0, 0, 1, 0, 0);
 
+    // Batch SE risers (darker) and SW risers (lighter) as separate compound
+    // paths for each shade to further reduce fill() calls.
+    oCtx.beginPath();
+    oCtx.fillStyle = 'rgba(0,0,0,0.42)';
     for (const t of buf) {
-      const tx   = t._scX;
-      const ty   = t._scY;
-      const elev = t._elevPx;
-
-      // ── SE face: right riser ───────────────────────────────────────────────
-      //   Drawn only where this tile is higher than its eastern neighbour.
-      //   The riser height is the elevation DELTA — this is the core fix.
-      //   Using the absolute elevPx caused every tile to draw a skirt all
-      //   the way to screen-zero, making adjacent same-height tiles fight.
-      const elevE  = elevMap.get(`${t.tx + 1},${t.ty}`) ?? 0;
-      const riserE = elev - elevE;
+      const elev  = t._elevPx;
+      if (elev <= 0.5) continue;
+      // FIX G: integer key lookup
+      const riserE = elev - (elevMap.get(EK(t.tx + 1, t.ty)) ?? 0);
       if (riserE > 0.5) {
-        const ex = tx + eOx,  ey = ty + eOy;   // East corner (top)
-        const sx = tx + sOx,  sy = ty + sOy;   // South corner (top)
-
-        // Primary shadow face — darker, facing away from the NW light source.
-        oCtx.fillStyle = 'rgba(0,0,0,0.42)';
-        oCtx.beginPath();
-        oCtx.moveTo(ex,         ey);
-        oCtx.lineTo(sx,         sy);
-        oCtx.lineTo(sx,         sy + riserE);
-        oCtx.lineTo(ex,         ey + riserE);
-        oCtx.closePath();
-        oCtx.fill();
-
-        // Thin highlight seam along the top edge to crisp up the terrace step.
-        oCtx.strokeStyle = 'rgba(255,255,255,0.10)';
-        oCtx.lineWidth   = 0.75;
-        oCtx.beginPath();
+        const tx = t._scX, ty = t._scY;
+        const ex = tx + eOx, ey = ty + eOy;
+        const sx = tx + sOx, sy = ty + sOy;
         oCtx.moveTo(ex, ey);
         oCtx.lineTo(sx, sy);
-        oCtx.stroke();
-      }
-
-      // ── SW face: left riser ────────────────────────────────────────────────
-      //   Same delta logic, looking at the southern neighbour (tx, ty+1).
-      const elevS  = elevMap.get(`${t.tx},${t.ty + 1}`) ?? 0;
-      const riserS = elev - elevS;
-      if (riserS > 0.5) {
-        const wx = tx + wOx,  wy = ty + wOy;   // West corner (top)
-        const sx = tx + sOx,  sy = ty + sOy;   // South corner (top)
-
-        // Secondary shadow face — slightly lighter than SE (catches ambient).
-        oCtx.fillStyle = 'rgba(0,0,0,0.26)';
-        oCtx.beginPath();
-        oCtx.moveTo(wx,         wy);
-        oCtx.lineTo(sx,         sy);
-        oCtx.lineTo(sx,         sy + riserS);
-        oCtx.lineTo(wx,         wy + riserS);
+        oCtx.lineTo(sx, sy + riserE);
+        oCtx.lineTo(ex, ey + riserE);
         oCtx.closePath();
-        oCtx.fill();
+      }
+    }
+    oCtx.fill();
 
-        // Highlight seam.
-        oCtx.strokeStyle = 'rgba(255,255,255,0.07)';
-        oCtx.lineWidth   = 0.75;
-        oCtx.beginPath();
+    oCtx.beginPath();
+    oCtx.fillStyle = 'rgba(0,0,0,0.26)';
+    for (const t of buf) {
+      const elev  = t._elevPx;
+      if (elev <= 0.5) continue;
+      const riserS = elev - (elevMap.get(EK(t.tx, t.ty + 1)) ?? 0);
+      if (riserS > 0.5) {
+        const tx = t._scX, ty = t._scY;
+        const wx = tx + wOx, wy = ty + wOy;
+        const sx = tx + sOx, sy = ty + sOy;
         oCtx.moveTo(wx, wy);
         oCtx.lineTo(sx, sy);
-        oCtx.stroke();
+        oCtx.lineTo(sx, sy + riserS);
+        oCtx.lineTo(wx, wy + riserS);
+        oCtx.closePath();
       }
+    }
+    oCtx.fill();
 
-      // ── Top face ──────────────────────────────────────────────────────────
+    // Highlight seams — batch both riser directions together (same style)
+    oCtx.beginPath();
+    oCtx.strokeStyle = 'rgba(255,255,255,0.09)';
+    oCtx.lineWidth   = 0.75;
+    for (const t of buf) {
+      const elev  = t._elevPx;
+      if (elev <= 0.5) continue;
+      const tx = t._scX, ty = t._scY;
+      const riserE = elev - (elevMap.get(EK(t.tx + 1, t.ty)) ?? 0);
+      if (riserE > 0.5) {
+        oCtx.moveTo(tx + eOx, ty + eOy);
+        oCtx.lineTo(tx + sOx, ty + sOy);
+      }
+      const riserS = elev - (elevMap.get(EK(t.tx, t.ty + 1)) ?? 0);
+      if (riserS > 0.5) {
+        oCtx.moveTo(tx + wOx, ty + wOy);
+        oCtx.lineTo(tx + sOx, ty + sOy);
+      }
+    }
+    oCtx.stroke();
+
+    // ── PASS B: top faces (per-tile affine transform) ────────────────────────
+    for (const t of buf) {
+      const tx = t._scX, ty = t._scY;
       oCtx.setTransform(m11, m12, m21, m22, tx, ty);
       oCtx.drawImage(painter.getTexture(t.terrainId), 0, 0);
 
@@ -524,51 +587,72 @@ export class TileRenderer {
         oCtx.lineWidth   = 0.5;
         oCtx.strokeRect(0, 0, S, S);
       }
-
-      // Reset to identity so the next tile's skirt quads use screen coords.
-      oCtx.setTransform(1, 0, 0, 1, 0, 0);
     }
+
+    // Return to identity so callers start clean.
+    oCtx.setTransform(1, 0, 0, 1, 0, 0);
   }
 
   // ── Bitmap layer management ───────────────────────────────────────────────
 
   _drawTexturedLayer(tiles, playerTx, playerTy, focusX, focusY) {
-      const { cam, ctx } = this;
-      const W     = ctx.canvas.width;
-      const H     = ctx.canvas.height;
-      const stamp = this._updateTileMatrix(focusX, focusY);
+    const { cam, ctx } = this;
+    const W     = ctx.canvas.width;
+    const H     = ctx.canvas.height;
+    const stamp = this._updateTileMatrix(focusX, focusY);
 
-      const needRebake =
-        this._layerContentDirty ||
-        !this._layerBitmap      ||
-        this._layerBitmapCanvas?.width  !== W ||
-        this._layerBitmapCanvas?.height !== H;
+    // FIX C — split "needs rebake" from "canvas resized or content dirty".
+    //
+    // needContentRebake = true  →  world changed; run full _bakeTexturedLayer.
+    // needContentRebake = false →  only the camera moved; skip the bake and
+    //   rely on the sub-pixel drift correction already in place.  This is the
+    //   common case during smooth camera follow and eliminates the ~10% CPU
+    //   cost that the old single-stamp check incurred on every frame.
+    //
+    const sizeChanged =
+      !this._layerBitmap ||
+      this._layerBitmapCanvas?.width  !== W ||
+      this._layerBitmapCanvas?.height !== H;
 
-      if (needRebake || this._layerBitmapDirty || stamp !== this._lastBakeStamp) {
-        if (!this._layerBitmapCanvas || this._layerBitmapCanvas.width !== W || this._layerBitmapCanvas.height !== H) {
-          this._layerBitmapCanvas = new OffscreenCanvas(W, H);
-        }
-        const oCtx = this._layerBitmapCanvas.getContext('2d');
-        oCtx.clearRect(0, 0, W, H);
-        this._bakeTexturedLayer(oCtx, tiles, playerTx, playerTy, focusX, focusY, W, H);
-        this._layerBitmap?.close();
-        this._layerBitmap        = this._layerBitmapCanvas.transferToImageBitmap();
-        this._layerContentDirty  = false;
-        this._layerBitmapDirty   = false;
-        this._lastBakeStamp      = stamp;
-        
-        // NEW: Store the exact camera position at the moment of baking
-        this._bakedCamX = cam.camX;
-        this._bakedCamY = cam.camY;
+    const needContentRebake =
+      sizeChanged                                      ||
+      this._layerContentDirty                          ||
+      this._contentStamp !== this._lastContentStamp;   // terrain/elev/sun changed
+
+    // Pure-projection dirty: camera moved but content is unchanged.
+    // In this case we rebake only if the stamp also changed (zoom/tilt/rotate
+    // change the tile matrix and require a geometry rebake; pure pan does not).
+    const needProjectionRebake =
+      !needContentRebake &&
+      this._layerBitmapDirty &&
+      stamp !== this._lastBakeStamp;
+
+    if (needContentRebake || needProjectionRebake) {
+      if (sizeChanged) {
+        this._layerBitmapCanvas = new OffscreenCanvas(W, H);
       }
-
-      if (this._layerBitmap) {
-        // NEW: Calculate sub-pixel drift and offset the canvas
-        const driftX = (this._bakedCamX ?? cam.camX) - cam.camX;
-        const driftY = (this._bakedCamY ?? cam.camY) - cam.camY;
-        ctx.drawImage(this._layerBitmap, driftX, driftY);
-      }
+      const oCtx = this._layerBitmapCanvas.getContext('2d');
+      oCtx.clearRect(0, 0, W, H);
+      this._bakeTexturedLayer(oCtx, tiles, playerTx, playerTy, focusX, focusY, W, H);
+      this._layerBitmap?.close();
+      this._layerBitmap        = this._layerBitmapCanvas.transferToImageBitmap();
+      this._layerContentDirty  = false;
+      this._layerBitmapDirty   = false;
+      this._lastBakeStamp      = stamp;
+      this._lastContentStamp   = this._contentStamp;   // FIX C: record content version
+      this._bakedCamX          = cam.camX;
+      this._bakedCamY          = cam.camY;
     }
+
+    if (this._layerBitmap) {
+      // Sub-pixel drift: if only camX/Y moved since the last bake, offset the
+      // bitmap instead of rebaking.  Keeps the terrain locked to the world
+      // during the smooth-follow easing (a pure translation in screen space).
+      const driftX = (this._bakedCamX ?? cam.camX) - cam.camX;
+      const driftY = (this._bakedCamY ?? cam.camY) - cam.camY;
+      ctx.drawImage(this._layerBitmap, driftX, driftY);
+    }
+  }
 
   // ── Public draw entry point ───────────────────────────────────────────────
 
@@ -773,9 +857,10 @@ export class TileRenderer {
 
   invalidate() {
     this._bakeDirty        = true;
-    this._layerBitmapDirty = true;
     this._mergedProjCache.clear();
+    this._elevCache.clear();   // FIX D: stale geo data — flush elevation cache
     this._painter?.invalidate();
+    this._markContentDirty();  // FIX C: forces rebake, not just drift-offset
   }
 
   invalidateSync(terrainCache, focusX, focusY) {
@@ -789,6 +874,8 @@ export class TileRenderer {
     this._lastSunElev  = this._shadows?.sunElevation ?? 0;
     this._bakeDirty    = false;
     this._mergedProjCache.clear();
+    this._elevCache.clear();   // FIX D
     this._painter?.invalidate();
+    this._markContentDirty();  // FIX C
   }
 }

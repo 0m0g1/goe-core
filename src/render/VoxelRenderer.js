@@ -122,6 +122,71 @@ export class VoxelRenderer {
     this._corners[idx + 1] = (xr + zr) * this._hh - (this._base + vy * this._vu) - cam.camY;
   }
 
+  // FIX A — Batched compound-path accumulator.
+  // Faces sharing the same fillStyle are collected into one open beginPath()
+  // and flushed with a single fill() only when the color changes or
+  // flushBatch() is called explicitly at the end of a tile.
+  //
+  // Usage contract:
+  //   • Call beginBatch() once before drawing a blueprint.
+  //   • Replace every _polyIdx call with _polyIdxBatched.
+  //   • Call flushBatch() after the last face of the blueprint.
+  //
+  // The edge-stroke path is uncommon (zoom > 0.4 only) and is kept as an
+  // immediate stroke after each face so it doesn't need its own batching.
+
+  beginBatch() {
+    this._batchColor = null;
+    this._batchOpen  = false;
+  }
+
+  _polyIdxBatched(ids, color, edge) {
+    const ctx = this.ctx;
+    const c   = this._corners;
+
+    // Flush previous batch if color changed
+    if (this._batchColor !== color) {
+      if (this._batchOpen) {
+        ctx.fillStyle = this._batchColor;
+        ctx.fill();
+        this._batchOpen = false;
+      }
+      this._batchColor = color;
+      ctx.beginPath();
+      this._batchOpen = true;
+    }
+
+    const i0 = ids[0] << 1;
+    ctx.moveTo(c[i0], c[i0 + 1]);
+    for (let k = 1; k < ids.length; k++) {
+      const ik = ids[k] << 1;
+      ctx.lineTo(c[ik], c[ik + 1]);
+    }
+    ctx.closePath();   // subpath closed; next moveTo starts a new subpath
+
+    if (edge && this.cam.zoom > 0.4) {
+      // Stroke must be immediate (needs its own path state)
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+      ctx.lineWidth   = 0.8;
+      ctx.stroke();
+      ctx.beginPath();    // restart batch path after the stroke
+      this._batchOpen = true;
+    }
+  }
+
+  flushBatch() {
+    if (this._batchOpen && this._batchColor !== null) {
+      this.ctx.fillStyle = this._batchColor;
+      this.ctx.fill();
+    }
+    this._batchOpen  = false;
+    this._batchColor = null;
+  }
+
+  // Legacy immediate-mode path — kept for the public proj() / _poly() callers
+  // (decorateBuildingFacade etc.) that are not on the hot box() path.
   _polyIdx(ids, color, edge) {
     const ctx = this.ctx;
     const c   = this._corners;
@@ -181,24 +246,25 @@ export class VoxelRenderer {
     this.projInto(6, x + w, y + h, z + d);
     this.projInto(7, x,     y + h, z + d);
 
-    this._polyIdx([4, 5, 6, 7], cTop, edge);
+    // FIX A: use batched variant — consecutive same-color faces share one path.
+    this._polyIdxBatched([4, 5, 6, 7], cTop, edge);
 
     switch (snap) {
       case 0:
-        this._polyIdx([5, 1, 2, 6], cRight, edge);
-        this._polyIdx([6, 2, 3, 7], cFront, edge);
+        this._polyIdxBatched([5, 1, 2, 6], cRight, edge);
+        this._polyIdxBatched([6, 2, 3, 7], cFront, edge);
         break;
       case 1:
-        this._polyIdx([6, 2, 3, 7], cRight, edge);
-        this._polyIdx([7, 3, 0, 4], cFront, edge);
+        this._polyIdxBatched([6, 2, 3, 7], cRight, edge);
+        this._polyIdxBatched([7, 3, 0, 4], cFront, edge);
         break;
       case 2:
-        this._polyIdx([7, 3, 0, 4], cRight, edge);
-        this._polyIdx([4, 0, 1, 5], cFront, edge);
+        this._polyIdxBatched([7, 3, 0, 4], cRight, edge);
+        this._polyIdxBatched([4, 0, 1, 5], cFront, edge);
         break;
       case 3:
-        this._polyIdx([4, 0, 1, 5], cRight, edge);
-        this._polyIdx([5, 1, 2, 6], cFront, edge);
+        this._polyIdxBatched([4, 0, 1, 5], cRight, edge);
+        this._polyIdxBatched([5, 1, 2, 6], cFront, edge);
         break;
     }
   }

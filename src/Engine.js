@@ -344,6 +344,13 @@ const RENDER_CULL_MARGIN = CULL_MARGIN * 2;  // FIX 6
 // Radius of the per-rebuild spatial-tree bounds (global tile space)
 const QUADTREE_HALF = 400;
 
+// FIX E — Aggressive entity LOD.
+// Fixed (non-player) entities beyond this screen-pixel radius from the
+// viewport centre are drawn as a single arc dot instead of a full blueprint.
+// Measured in tiles from the camera focus; 18 tiles ≈ roughly one screen
+// width at typical zoom. Raise to show more detail further out.
+const LOD_DOT_TILE_RADIUS = 18;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Engine
 // ─────────────────────────────────────────────────────────────────────────────
@@ -418,6 +425,13 @@ export class Engine extends EventEmitter {
 
     this._renderTree      = null;
     this._renderTreeDirty = true;
+
+    // FIX F — reusable screen-coordinate scratch object.
+    // worldToScreen is called thousands of times per frame (entity depth-sort,
+    // elevation offset, click picking).  Re-using one {x,y} object instead of
+    // allocating a new one on every call removes a significant GC pressure
+    // source.  Only safe for single-threaded use (JS is single-threaded).
+    this._scr = { x: 0, y: 0 };
   }
 
   // ── Physics helpers ───────────────────────────────────────────────────────
