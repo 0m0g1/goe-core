@@ -98,8 +98,8 @@ import {
   geoToTile, tileToGeo, lonToGlobalX, latToGlobalY,
 } from './math/geo.js';
 import { WeatherSystem } from './render/WeatherSystem.js';
-import PhysiscsWorld2d from 'yaphe-engine';
-import Particle2D from 'yaphe-engine'
+import { PhysiscsWorld2d } from 'yaphe-engine';
+import { Particle2D } from 'yaphe-engine'
 import { Entity }     from './core/Entity.js';
 import { Quadtree }   from './spatial/Quadtree.js';
 import { RenderTree } from './spatial/RenderTree.js';
