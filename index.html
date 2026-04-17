@@ -142,7 +142,7 @@
 <script type="module">
     // OSMTerrainLoader is commented out — replaced by the lightweight OSMTerrainTileLoader
     // which produces only terrain/floor tiles (terrainUpdates Map) with no entity/renderFn overhead.
-    import { Engine, /* OSMTerrainLoader, */  OSMTerrainTileLoader, BioLoader, ElevationLoader, ElevationFormat, WeatherLoader, AviationLoader, Entity, ENTITY_TYPES, worldToScreen } from './src/GOECore.js';
+    import { Engine, /* OSMTerrainLoader, */ OSMEntityLoader,  OSMTerrainTileLoader, BioLoader, ElevationLoader, TerracedElevation, ElevationFormat, WeatherLoader, AviationLoader, Entity, ENTITY_TYPES, worldToScreen } from './src/GOECore.js';
     import Vector2D from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/vector2d.js';
 
     // --- PERFORMANCE CONFIGURATION ---
@@ -154,16 +154,22 @@
 
     // --- COMBINED LOCATIONS ---
     const unifiedLocations = [
-        { name: "🗼 Paris - Eiffel Tower", lat: 48.8584, lon: 2.2945 },
-        { name: "🏫 Alliance High School (Kenya)", lat: -1.259944,  lon: 36.667270 },
-        { name: "🗽 New York - Times Square", lat: 40.7580, lon: -73.9855 },
-        { name: "🇬🇧 London - Trafalgar Square", lat: 51.5074, lon: -0.1278 },
-        { name: "🇯🇵 Tokyo - Shibuya", lat: 35.6587, lon: 139.7456 },
-        { name: "🇩🇪 Berlin - Alexanderplatz", lat: 52.5200, lon: 13.4050 },
-        { name: "🏺 Great Pyramid of Giza", lat: 29.9792, lon: 31.1342 },
-        { name: "🏛️ Paris - Arc de Triomphe", lat: 48.8738, lon: 2.2950 },
-        { name: "🎡 London - Big Ben", lat: 51.5007, lon: -0.1246 },
-        { name: "🌉 San Francisco - Golden Gate", lat: 37.8199, lon: -122.4783 }
+        { name: "🗼 Paris - Eiffel Tower",          lat: 48.8584,   lon: 2.2945    },
+        { name: "🏫 Alliance High School (Kenya)",   lat: -1.259944, lon: 36.667270 },
+        { name: "🗽 New York - Times Square",        lat: 40.7580,   lon: -73.9855  },
+        { name: "🇬🇧 London - Trafalgar Square",    lat: 51.5074,   lon: -0.1278   },
+        { name: "🇯🇵 Tokyo - Shibuya",              lat: 35.6587,   lon: 139.7456  },
+        { name: "🇩🇪 Berlin - Alexanderplatz",      lat: 52.5200,   lon: 13.4050   },
+        { name: "🏺 Great Pyramid of Giza",          lat: 29.9792,   lon: 31.1342   },
+        { name: "🏛️ Paris - Arc de Triomphe",       lat: 48.8738,   lon: 2.2950    },
+        { name: "🎡 London - Big Ben",               lat: 51.5007,   lon: -0.1246   },
+        { name: "🌉 San Francisco - Golden Gate",    lat: 37.8199,   lon: -122.4783 },
+
+        // ── Great for TerracedElevation testing ────────────────────────────────
+        { name: "🏜️ Grand Canyon South Rim",        lat: 36.0527,   lon: -112.1535 }, // ~1500m drop nearby
+        { name: "🏔️ Mount Fuji",                    lat: 35.3606,   lon: 138.7274  }, // clean conical rise
+        { name: "🇨🇭 Matterhorn (Zermatt)",         lat: 45.9763,   lon: 7.6586    }, // alpine sharp relief
+        { name: "🇳🇵 Everest Base Camp",            lat: 28.0026,   lon: 86.8528   }, // extreme high elevation
     ];
 
     // --- Ball Physics Entity ---
@@ -231,6 +237,13 @@
     });
     engine.use(terrainLoader);
 
+    const entityLoader = new OSMEntityLoader({
+        mPerTile:        2,
+        fetchRadiusM:    800,
+        fetchDebounceMs: 800,
+    });
+    engine.use(entityLoader);
+
     // The following loaders are unchanged
     engine.use(new BioLoader({ limit: 50, fetchRadiusM: 800 }));
     engine.use(new WeatherLoader('b69650bacdb53e8000e14a735bb53035'));
@@ -238,7 +251,13 @@
     engine.use({ id: 'events', init(){}, destroy(){}, async fetch(){ return { entities: historicalEvents.map(ev => ({ id: ev.id, latitude: ev.latitude, longitude: ev.longitude, color: getEventColor(ev), label: ev.title, data: ev })) }; } });
 
     const elevationLoader = new ElevationLoader((z,x,y)=>`https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`, ElevationFormat.TERRARIUM, 2);
-    engine.setElevationLoader(elevationLoader);
+
+    const terracedLoader = new TerracedElevation(elevationLoader, {
+        stepH:    10,       // one terrace every 20 metres
+        snapMode: 'floor',  // tile sits on the step *below* the raw sample
+    });
+
+    engine.setElevationLoader(terracedLoader);
 
     // --- Monkey-patches removed ---
     // OSMTerrainTileLoader has no _liveEntityCache or _bpGen/_memCache to patch —

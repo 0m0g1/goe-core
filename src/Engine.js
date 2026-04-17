@@ -581,7 +581,13 @@ export class Engine extends EventEmitter {
     this._renderer = new WorldRenderer(this._ctx, cam, { shadow: this._shadowOpts });
     this._patchVoxelRenderer(this._renderer._voxel);
 
-    this._tileR    = new TileRenderer(this._renderer, this.terrainRegistry);
+    this._tileR = new TileRenderer(this._renderer, this.terrainRegistry);
+    this._tileR.setElevationLoader(this._elevation);
+    if (this._elevation) {
+    this._elevation.prefetch(this.geoCenter);
+  }
+    this._tileR.setMPerTile(this._mPerTile);
+    this._tileR.setGeoCenter(this.geoCenter);
     this._osmLayer = new OSMLayerRenderer(this._renderer, this._tileURLFn);
     this._patchOSMLayerRenderer(this._osmLayer);
 
@@ -757,6 +763,7 @@ export class Engine extends EventEmitter {
     this._spatialDirty    = true;
     this._renderTreeDirty = true;
     this._tileCacheState  = null;
+    this._tileR?.invalidate(); 
 
     this._centreCameraOnPlayer();
     this._doFetch(this.geoCenter);
@@ -794,10 +801,12 @@ export class Engine extends EventEmitter {
 
   _playerElev() {
     if (!this.playerEntity) return 0;
-    // CHUNKING: derive geo from global tile position
     const geo   = this._playerGeo();
     const elevM = this._elevation?.sampleElevation(geo.lat, geo.lon) ?? 0;
-    return getElevOffset(this._elevation?.toTileHeight(elevM) ?? 4, this.camera.tilt, this.camera.zoom);
+    
+    // NEW: Floor the height so the player snaps to the terrace visually
+    const tileH = Math.floor(this._elevation?.toTileHeight(elevM) ?? 4);
+    return getElevOffset(tileH, this.camera.tilt, this.camera.zoom);
   }
 
   // ── FETCH ─────────────────────────────────────────────────────────────────
@@ -878,7 +887,7 @@ export class Engine extends EventEmitter {
 
     if (result.terrainUpdates?.size) {
       this.terrainCache.merge(result.terrainUpdates);
-      // CHUNKING: evict around player's global tile position
+      this._tileR?.markLayerDirty();
       if (this.playerEntity) {
         this.terrainCache.evictDistant(this.playerEntity.tx, this.playerEntity.ty, 600);
       }
@@ -986,6 +995,8 @@ export class Engine extends EventEmitter {
       );
       if (geoD > REFETCH_GEO_DIST) {
         this.geoCenter = playerGeo;
+        // NEW: Pass the player's exact integer tile coordinate as the static anchor
+        this._tileR.setGeoCenter(this.geoCenter, Math.floor(this.playerEntity.tx), Math.floor(this.playerEntity.ty));
         this._doFetch(this.geoCenter);
         this.emit('center:changed', this.geoCenter);
       }
@@ -1099,7 +1110,7 @@ export class Engine extends EventEmitter {
     const terrainHW = tileHalfWidth(cam.zoom, cam.tileW ?? 64);
 
     if (overAlpha > 0 && this.debugLayers.overpass && terrainHW >= 2) {
-      const lod = 1; // = cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
+      const lod = 1; // cam.zoom > 0.25 ? 1 : cam.zoom > 0.10 ? 2 : 4;
 
       if (lod > 1) {
         // CHUNKING: pass focusX/Y (global) instead of pGX/pGY (local origin)
@@ -1147,7 +1158,7 @@ export class Engine extends EventEmitter {
           this.playerEntity?.tx ?? 0,
           this.playerEntity?.ty ?? 0,
           this.terrainCache, focusX, focusY,
-          this._cameraAnimating || this.playerEntity?.isMoving,
+          // this._cameraAnimating || this.playerEntity?.isMoving,
         );
       }
     }

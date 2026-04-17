@@ -230,6 +230,12 @@ export class ElevationLoader {
     // Use _getResolved so frequent lookups promote hot tiles and keep them
     // from being evicted by background prefetch traffic.
     const id  = this._getResolved(key);
+
+    if (!id) {
+      console.warn('[ELEV] cache miss — key:', key, 'lat:', lat.toFixed(5), 'lon:', lon.toFixed(5), 'resolved size:', this._resolved.size);
+      return 0;
+    }
+
     if (!id) return 0;
 
     const px    = Math.min(255, Math.floor((x - tileX) * 256));

@@ -50,10 +50,12 @@ export { TileRenderer }    from './render/TileRenderer.js';
 export { OSMLayerRenderer } from './render/OSMLayerRenderer.js';
 export { BaseLoader, OSMTileURL, CartoDarkURL, ESRISatelliteURL, patternURL } from './loaders/BaseLoader.js';
 export { OSMTerrainLoader } from './loaders/geo/OSMTerrainLoader.js';
+export { OSMEntityLoader } from './loaders/geo/OSMEntityLoader.js';
 export { BioLoader } from './loaders/geo/BioLoader.js';
 export { OSMTerrainTileLoader } from './loaders/geo/OSMTerrainTileLoader.js'
 export { WeatherLoader } from './loaders/geo/WeatherLoader.js';
 export { ElevationLoader, ElevationFormat } from './loaders/geo/ElevationLoader.js';
+export { TerracedElevation }  from './loaders/geo/TerracedElevation.js';
 export { AviationLoader } from './loaders/geo/AviationLoader.js';
 export { EventEmitter } from './core/EventEmitter.js';
 export * from './math/projection.js';
