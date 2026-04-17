@@ -1,8 +1,13 @@
 {
   "name": "goe-core",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "version": "0.1.0",
+  "description": "Vanilla-JS isometric / flat-map hybrid engine",
+  "type": "module",
+  "main": "./src/GOECore.js",
+  "module": "./src/GOECore.js",
+  "exports": {
+    ".": "./src/GOECore.js"
+  },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -10,10 +15,9 @@
     "type": "git",
     "url": "git+https://github.com/0m0g1/goe-core.git"
   },
-  "keywords": [],
+  "keywords": ["gis", "isometric", "engine", "maps"],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "bugs": {
     "url": "https://github.com/0m0g1/goe-core/issues"
   },
