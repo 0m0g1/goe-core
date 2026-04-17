@@ -98,9 +98,8 @@ import {
   geoToTile, tileToGeo, lonToGlobalX, latToGlobalY,
 } from './math/geo.js';
 import { WeatherSystem } from './render/WeatherSystem.js';
-
-import PhysicsWorld2D from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/physicsworld2d.js';
-import Particle2D     from 'https://esm.sh/yaphe-engine@1.0.5/src/modules/2d/particle2d.js';
+import { PhysiscsWorld2d  } from 'yaphe-engine'
+import { Particle2D  } from 'yaphe-engine'
 import { Entity }     from './core/Entity.js';
 import { Quadtree }   from './spatial/Quadtree.js';
 import { RenderTree } from './spatial/RenderTree.js';

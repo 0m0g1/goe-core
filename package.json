@@ -1,5 +1,5 @@
 {
-  "name": "goe-core",
+  "name": "@0m0g1/goe-core",
   "version": "0.1.0",
   "description": "Vanilla-JS isometric / flat-map hybrid engine",
   "type": "module",
@@ -15,11 +15,19 @@
     "type": "git",
     "url": "git+https://github.com/0m0g1/goe-core.git"
   },
-  "keywords": ["gis", "isometric", "engine", "maps"],
+  "keywords": [
+    "gis",
+    "isometric",
+    "engine",
+    "maps"
+  ],
   "author": "",
   "license": "ISC",
   "bugs": {
     "url": "https://github.com/0m0g1/goe-core/issues"
   },
-  "homepage": "https://github.com/0m0g1/goe-core#readme"
+  "homepage": "https://github.com/0m0g1/goe-core#readme",
+  "dependencies": {
+    "yaphe-engine": "^1.0.5"
+  }
 }
